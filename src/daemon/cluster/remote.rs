@@ -593,19 +593,22 @@ fn undo(sh: &Arc<Shared>, c: &Cluster, id: &str, give_back: Option<String>) {
     sh.kick();
 }
 
-/// When the daemon starts: other machines' jobs that were starting here and don't start again
-/// (no record of how far their start got, or their workspace is gone) go back to their owners.
+/// When the daemon starts: other machines' jobs that were starting here and don't start again go
+/// back to their owners: those with no record of how far their start got, or whose workspace is
+/// gone, and those claimed but not granted yet (no outbox: what this machine holds of the job is
+/// its queue entry, without the command and environment the grant brings).
 pub(super) fn give_back_starting(
     st: &mut State,
     cs: &mut CState,
     unpins: &mut Vec<(RepoRef, JobId)>,
 ) {
     let me = st.node.clone();
+    let now = now();
     let ids: Vec<JobId> = st
         .jobs
         .values()
         .filter(|j| owner_of(&j.id) != me && j.state == JobState::Starting)
-        .filter(|j| !st.runs.contains_key(&j.id))
+        .filter(|j| !st.runs.contains_key(&j.id) || !cs.outbox.contains_key(&j.id))
         .map(|j| j.id.clone())
         .collect();
     for id in ids {
@@ -615,8 +618,27 @@ pub(super) fn give_back_starting(
         if let Err(e) = st.store.delete_job(&id) {
             st.log.log(format!("store: {e:#}"));
         }
-        st.runs.remove(&id);
+        if st.runs.remove(&id).is_some() {
+            st.log.log(format!(
+                "{id}: was claimed from {} and not granted yet",
+                owner_of(&id)
+            ));
+        }
         st.save_run(&id);
+        // A workspace of its own was never seeded: removed as a seeding one with no job in it is
+        // ([`crate::daemon::runner::adopt`]). One it was pinned to is free again.
+        if let Some(w) = &j.workspace
+            && !st.ws_busy(w)
+            && let Some(ws) = st.workspaces.get_mut(w)
+            && ws.state == WorkspaceState::Running
+        {
+            ws.state = if ws.held_until > now {
+                WorkspaceState::Held
+            } else {
+                WorkspaceState::Idle
+            };
+            st.save_ws(w);
+        }
         if let Some(l) = &j.lease {
             cs.givebacks.push(GiveBack {
                 owner: owner_of(&id).to_string(),

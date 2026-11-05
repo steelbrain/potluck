@@ -2172,6 +2172,80 @@ mod tests {
         d.stop();
     }
 
+    /// Another machine's job claimed here, its grant not come yet, when the daemon stopped: the
+    /// next daemon hands it back, never starting it from what it holds (the queue's entry, without
+    /// the command the grant brings). The workspace it was pinned to is free again.
+    #[test]
+    fn another_machines_job_claimed_but_not_granted_is_handed_back_at_a_restart() {
+        use crate::daemon::state::{Phase, Run, run_key};
+        use crate::types::{JobState, WorkspaceRecord, WorkspaceState};
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            home: dir.path().join("home"),
+            config: dir.path().join("node.toml"),
+        };
+        std::fs::create_dir_all(&paths.home).unwrap();
+        {
+            // What a daemon killed while its claim of b-1 was on its way leaves: the reservation
+            // of the queue's entry (no command), and no outbox.
+            let mut store = crate::store::Store::open(&paths.db()).unwrap();
+            let mut j = job_on("b-1", JobState::Starting, "lone", "t1");
+            j.spec.cmd.clear();
+            j.spec.workspace = Some("lone-w1".into());
+            j.workspace = Some("lone-w1".into());
+            store.put_job(&j).unwrap();
+            store
+                .put_workspace(&WorkspaceRecord {
+                    id: "lone-w1".into(),
+                    node: "lone".into(),
+                    repo_id: "proj-1234abcd".into(),
+                    commit: "0".repeat(40),
+                    branch: None,
+                    path: paths.home.join("workspaces/lone-w1"),
+                    state: WorkspaceState::Running,
+                    created_at: now(),
+                    last_used_at: now(),
+                    held_until: 0,
+                    pending: 0,
+                    size_bytes: None,
+                    advanced_by: None,
+                })
+                .unwrap();
+            let run = Run {
+                phase: Phase::Starting,
+                ..Default::default()
+            };
+            store
+                .put_kv(&run_key("b-1"), &serde_json::to_string(&run).unwrap())
+                .unwrap();
+        }
+        let d = lone_daemon(dir.path());
+        let sh = d.shared.clone();
+        let log = std::fs::read_to_string(sh.paths.daemon_log()).unwrap();
+        assert!(
+            log.contains("b-1: was claimed from b and not granted yet\n"),
+            "{log}"
+        );
+        assert!(
+            log.contains("b-1: was starting for b; handed back\n"),
+            "{log}"
+        );
+        assert!(!log.contains("starting again"), "{log}");
+        assert!(!log.contains("did not start"), "{log}");
+        {
+            let st = sh.lock();
+            assert!(!st.jobs.contains_key("b-1") && !st.runs.contains_key("b-1"));
+            assert_eq!(st.workspaces["lone-w1"].state, WorkspaceState::Idle);
+        }
+        let back = sh.cluster().unwrap().cs().givebacks.clone();
+        assert_eq!(back.len(), 1, "{back:?}");
+        assert_eq!(
+            (back[0].job.as_str(), back[0].token.as_str()),
+            ("b-1", "t1")
+        );
+        d.stop();
+    }
+
     /// The nonce of a signed dispatch is taken once: a second dispatch with it is refused, after a
     /// restart too, until it is a day old (its signing time is refused by then anyway).
     #[test]

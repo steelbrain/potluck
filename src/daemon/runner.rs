@@ -242,7 +242,8 @@ pub(crate) fn restore(
                             ..run
                         }
                     } else {
-                        log.log(format!("{}: was starting; starting again", job.id));
+                        // Said when it starts again ([`adopt`]): another machine's job may go
+                        // back to its owner first.
                         Run {
                             phase: Phase::Starting,
                             new_workspace: run.new_workspace,
@@ -422,7 +423,12 @@ pub(crate) fn adopt(sh: &Arc<Shared>) {
         for (id, run) in &st.runs {
             match run.phase {
                 Phase::Finishing => finishing.push(id.clone()),
-                Phase::Starting => starting.push(id.clone()),
+                Phase::Starting => {
+                    if run.resumed && !run.find_again {
+                        st.log.log(format!("{id}: was starting; starting again"));
+                    }
+                    starting.push(id.clone());
+                }
                 Phase::Running => {}
             }
         }
