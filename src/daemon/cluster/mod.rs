@@ -2282,6 +2282,109 @@ mod tests {
         d.stop();
     }
 
+    /// `potluck user init`'s signature of a job dispatched before users is kept only when it is
+    /// of this machine's own job that hasn't ended and no user signed, by a user's key, over the
+    /// job's spec as it stands, for this machine, now, with a nonce not taken before (nor by a
+    /// dispatch after); and only in a cluster with users.
+    #[test]
+    fn a_job_dispatched_before_users_is_signed_only_as_it_stands() {
+        use crate::daemon::server::{sign_job, sign_jobs, take_nonce};
+        use crate::proto::JobSignature;
+        use crate::types::{JobSpec, JobState};
+        let dir = tempfile::tempdir().unwrap();
+        let d = lone_daemon(dir.path());
+        let sh = d.shared.clone();
+        let key = crate::mesh::user::UserKey::load_or_create(&dir.path().join("user.key"))
+            .unwrap()
+            .0;
+        let t = now();
+        let sig = |id: &str, spec: &JobSpec, at: Millis| JobSignature {
+            job: id.into(),
+            auth: crate::jobauth::sign(spec, &key, at).auth.unwrap(),
+        };
+        // The jobs are made and signed with the state locked throughout: the daemon's loop
+        // doesn't start or end them meanwhile.
+        let mut guard = sh.lock();
+        let st = &mut *guard;
+        let mut specs = BTreeMap::new();
+        for (id, state, on) in [
+            // Queued for a machine there is none of.
+            ("lone-1", JobState::Queued, "elsewhere"),
+            ("lone-2", JobState::Running, "lone"),
+            ("lone-3", JobState::Succeeded, "lone"),
+            ("b-1", JobState::Running, "lone"),
+        ] {
+            let mut j = job_on(id, state, on, "t");
+            if state == JobState::Queued {
+                (j.node, j.lease) = (None, None);
+            }
+            // As its owner holds it: its ids salted.
+            j.spec = crate::jobauth::owned(peer::owner_of(id), &j.spec, false);
+            specs.insert(id, j.spec.clone());
+            st.jobs.insert(id.into(), j);
+            st.save_job(id);
+        }
+        let one = sig("lone-1", &specs["lone-1"], t);
+        let refused = |st: &mut State, s: &JobSignature, by_user: bool| {
+            sign_job(st, s, by_user, t).unwrap_err()
+        };
+        assert!(refused(st, &one, false).contains("which is no user of this cluster"));
+        sign_job(st, &one, true, t).unwrap();
+        assert_eq!(st.jobs["lone-1"].spec.auth.as_ref(), Some(&one.auth));
+        assert_eq!(
+            crate::jobauth::open(&one.auth).unwrap(),
+            specs["lone-1"],
+            "the spec as it stood"
+        );
+        assert_eq!(refused(st, &one, true), "a user signed it already");
+        // Its nonce is taken: for another job, and for a dispatch.
+        let mut again = sig("lone-2", &specs["lone-2"], t);
+        again.auth =
+            crate::jobauth::sign_with_nonce(&specs["lone-2"], &key, one.auth.nonce.clone(), t)
+                .auth
+                .unwrap();
+        assert!(refused(st, &again, true).contains("nonce was taken here before"));
+        assert!(take_nonce(st, &one.auth.nonce, t).is_err());
+        // Over another spec, for another machine, long ago.
+        let mut changed = specs["lone-2"].clone();
+        changed.cmd = vec!["rm".into(), "-rf".into(), "/".into()];
+        let e = refused(st, &sig("lone-2", &changed, t), true);
+        assert_eq!(e, "its cmd is not what its signature covers");
+        let unsalted = job_on("lone-2", JobState::Running, "lone", "t").spec;
+        let e = refused(st, &sig("lone-2", &unsalted, t), true);
+        assert_eq!(e, "its repo is not what its signature covers");
+        let elsewhere = JobSpec {
+            submitted_from: "msi".into(),
+            ..specs["lone-2"].clone()
+        };
+        let e = refused(st, &sig("lone-2", &elsewhere, t), true);
+        assert_eq!(e, "its submitted_from is not what its signature covers");
+        let old = sig("lone-2", &specs["lone-2"], t - 11 * 60_000);
+        assert!(refused(st, &old, true).contains("more than 10m from this machine's clock"));
+        assert!(st.jobs["lone-2"].spec.auth.is_none());
+        // Not one that ended, nor another machine's, nor one there is none of.
+        let e = refused(st, &sig("lone-3", &specs["lone-3"], t), true);
+        assert_eq!(e, "it has ended (succeeded)");
+        let e = refused(st, &sig("b-1", &specs["b-1"], t), true);
+        assert_eq!(e, "it is b's job, not lone's");
+        let e = refused(st, &sig("lone-9", &specs["lone-2"], t), true);
+        assert!(e.contains("lone has no job lone-9"), "{e}");
+        // As it stands, running, it is signed.
+        sign_job(st, &sig("lone-2", &specs["lone-2"], t), true, t).unwrap();
+        assert!(st.jobs["lone-2"].spec.auth.is_some());
+        drop(guard);
+        // Without users, none is.
+        let three = sig("lone-1", &specs["lone-1"], t);
+        let e = sign_jobs(&sh, &[three]).unwrap_err();
+        assert!(e.contains("this cluster has no users yet"), "{e}");
+        // Kept in the store.
+        d.stop();
+        let d = lone_daemon(dir.path());
+        let kept = d.shared.lock().store.job("lone-1").unwrap().unwrap();
+        assert_eq!(kept.spec.auth.as_ref(), Some(&one.auth));
+        d.stop();
+    }
+
     #[test]
     fn kept_files_stop_counting_when_their_run_is_no_longer_the_runners() {
         use crate::proto::{Response, ServerResponse, write_msg};

@@ -199,7 +199,7 @@ between members and what happens when one is lost.
 | `pair`, `pair --finish REPLY` | Ask to join a cluster, and finish joining. |
 | `admit [--pool POOL] REQUEST` | Admit a machine and print the reply; with users, signed with this command line's user key, into POOL. |
 | `remove NODE` | Remove a machine from the cluster; with users, signed with this command line's user key. |
-| `user init [--name NAME]` | Make this command line's user key the cluster's first user and sign every member in with it. |
+| `user init [--name NAME]` | Make this command line's user key the cluster's first user and sign every member in with it, and the jobs this machine queued before it. |
 | `user add NAME KEY`, `user remove NAME`, `user list` | Add, remove or list the users. |
 | `user key` | Print this command line's public user key, making the key first if there is none. |
 | `self-update [--here]` | Update this machine to the latest release, through the daemon or (`--here`) from this process; the other members follow. |

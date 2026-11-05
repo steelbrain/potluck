@@ -1925,6 +1925,7 @@ fn after_user_init_only_what_users_sign_admits_and_removes() {
     let out = a.cli_ok(&["user", "init", "--name", "owner"]);
     assert_eq!(out["user"], "owner", "{out}");
     assert_eq!(out["members"], serde_json::json!(["a", "b", "c"]), "{out}");
+    assert_eq!(out["signed_jobs"], serde_json::json!([]), "{out}");
     assert!(out["warning"].is_null(), "a founded the cluster: {out}");
     assert_eq!(
         std::path::PathBuf::from(out["file"].as_str().unwrap()),
@@ -5580,6 +5581,100 @@ fn after_user_init_jobs_are_signed_and_checked_where_they_run() {
         (JobState::Succeeded, Some("c")),
         "{j:#?}"
     );
+}
+
+/// Two jobs a dispatched before `user init`, unsigned, that only b runs: one running on b, one
+/// queued behind it. `user init` on a signs both, each as a holds it (its ids salted already), and
+/// says so; b then claims and runs the queued one, its grant checked. Nothing is left to sign, and
+/// the request that signs is answered only on the machine itself.
+#[test]
+fn user_init_signs_the_jobs_queued_before_it() {
+    use potluck::proto::{JobSignature, RequestAuth};
+    let w = World::new();
+    let a = w.node("a").start();
+    let b = w.node("b").start();
+    pair(&a, &b);
+    let busy = a.dispatch(&["--on", "node=b", "--exclusive", "--", "sleep", "60"]);
+    a.running_on(&busy, "b");
+    let waits = a.dispatch(&["--on", "node=b", "--", "sh", "-c", "echo on $POTLUCK_NODE"]);
+    let before = a.get(&waits);
+    assert_eq!(before.state, JobState::Queued);
+    assert!(before.spec.auth.is_none());
+    assert!(potluck::types::is_owned_repo_id(&before.spec.repo.id));
+    // In words, how many; the daemon logs which.
+    let out = Command::new(BIN)
+        .args(["user", "init", "--name", "owner"])
+        .current_dir(&a.repo)
+        .env("POTLUCK_HOME", &a.paths.home)
+        .env("POTLUCK_CONFIG", &a.paths.config)
+        .env_remove("POTLUCK_USER_KEY")
+        .output()
+        .unwrap();
+    let (stdout, stderr) = (
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert_eq!(
+        stdout,
+        "owner is the cluster's first user; signed in its members: a, b; signed 2 jobs a dispatched before it that haven't ended\n",
+        "{stderr}"
+    );
+    assert!(!stderr.contains("not signed"), "{stderr}");
+    assert!(
+        a.daemon_log().contains(&format!(
+            "signed by a user, so other members may run them: {busy}, {waits}\n"
+        )),
+        "{}",
+        a.daemon_log()
+    );
+    wait_until("b has the user", || trust_of(&b).users_exist());
+    let user = user_key(&a);
+    for id in [&busy, &waits] {
+        let spec = a.get(id).spec;
+        let auth = spec.auth.clone().expect("signed");
+        assert_eq!(auth.key, user.public());
+        let unsigned = potluck::types::JobSpec { auth: None, ..spec };
+        assert_eq!(potluck::jobauth::open(&auth).unwrap(), unsigned, "{id}");
+    }
+    a.cli_ok(&["cancel", &busy]);
+    let j = a.done(&waits);
+    assert_eq!(
+        (j.state, j.node.as_deref()),
+        (JobState::Succeeded, Some("b")),
+        "{j:#?}\nA:\n{}\nB:\n{}",
+        a.daemon_log(),
+        b.daemon_log()
+    );
+    assert!(output_of(&a, &waits).contains("on b"));
+    assert!(!b.daemon_log().contains("WARNING"), "{}", b.daemon_log());
+    assert_eq!(b.stored(&waits).spec.auth, a.get(&waits).spec.auth);
+
+    // Nothing is left to sign.
+    match a.client().call(Request::UnsignedJobs) {
+        Ok(Response::Jobs { jobs }) => assert!(jobs.is_empty(), "{jobs:?}"),
+        other => panic!("{other:?}"),
+    }
+    // Asked over the mesh, by a member, with a user's signature: refused there.
+    let sign = Request::SignJobs {
+        jobs: vec![JobSignature {
+            job: waits.clone(),
+            auth: a.get(&waits).spec.auth.unwrap(),
+        }],
+    };
+    let mesh = client_mesh(&b);
+    for req in [Request::UnsignedJobs, sign] {
+        let e = refusal(relayed(
+            &mesh,
+            "a",
+            &req,
+            Some(RequestAuth::sign(&user, &req)),
+        ));
+        assert!(
+            e.contains("are not relayed between members"),
+            "{req:?}: {e}"
+        );
+    }
+    mesh.stop();
 }
 
 /// A job runs only on machines in the pools its signed spec names, and `nodes` shows each

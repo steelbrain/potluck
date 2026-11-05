@@ -8,6 +8,10 @@
 //! signature ([`JobAuth::signed_spec`]), so a machine checks the very bytes that were signed, on
 //! any version, and then compares the spec it was given with the one it derives from them
 //! ([`derived`]): the owner's salting of repository ids is the only change a machine makes.
+//!
+//! `potluck user init` signs the jobs its machine dispatched before the cluster had users, and
+//! hasn't ended, as that machine holds them: their ids salted already, which a runner takes as
+//! they are ([`derived`]).
 
 use crate::mesh::identity::{PublicKey, Signature, Signer};
 use crate::types::{JobSpec, Millis};
@@ -117,12 +121,23 @@ pub fn owned(owner: &str, spec: &JobSpec, pre_salting: bool) -> JobSpec {
 /// Whether `effective` (a spec as its owner holds it, signature included) is the one the user
 /// signed, `signed`: equal, field by field, to [`owned`] of `signed` with `signed`'s
 /// `submitted_from` as the owner. A spec pinned to a workspace whose repository id is the signed,
-/// unsalted one may be the [`owned`] form from before salting.
+/// unsalted one may be the [`owned`] form from before salting. A signed spec whose ids are salted
+/// already ([`salted_already`]: signed as its owner held it, by `potluck user init`) must be
+/// `effective` itself, salted no second time: the user signed that very spec for that owner.
 pub fn derived(signed: &JobSpec, effective: &JobSpec) -> Result<(), String> {
     let effective = JobSpec {
         auth: None,
         ..effective.clone()
     };
+    if salted_already(signed) {
+        if effective == *signed {
+            return Ok(());
+        }
+        return Err(format!(
+            "its {} is not what its signature covers",
+            differing(signed, &effective).join(", ")
+        ));
+    }
     let owner = &signed.submitted_from;
     let salted = owned(owner, signed, false);
     if effective == salted {
@@ -138,6 +153,20 @@ pub fn derived(signed: &JobSpec, effective: &JobSpec) -> Result<(), String> {
         "its {} is not what its signature covers",
         differing(&salted, &effective).join(", ")
     ))
+}
+
+/// Whether `spec`'s repository ids are salted already, as its owner holds them ([`owned`]): its
+/// carried repositories' all, and its own repository's (its submodules' derive from it); or, for
+/// a job pinned to a workspace from before salting, which keeps its own unsalted id, its carried
+/// repositories', of which it has some. A spec the command line sends has none salted
+/// ([`crate::types::repo_id`]).
+pub fn salted_already(spec: &JobSpec) -> bool {
+    use crate::types::{is_owned_repo_id, is_unsalted_repo_id};
+    let carried = &spec.repo.carried;
+    let top = &spec.repo.id;
+    carried.iter().all(|c| is_owned_repo_id(&c.repo_id))
+        && (is_owned_repo_id(top)
+            || (spec.workspace.is_some() && is_unsalted_repo_id(top) && !carried.is_empty()))
 }
 
 /// The fields in which `a` and `b` differ, by their names in JSON.
@@ -576,6 +605,60 @@ mod tests {
             ..owned("studio", &spec(), true)
         };
         assert!(verify_grant(&kept, "studio", yes).is_err());
+    }
+
+    /// `potluck user init` signs a job as its owner holds it, its ids salted already: a runner
+    /// takes that spec as it is, and not salted a second time, nor unsalted. So too a job pinned to
+    /// a workspace from before salting (its own ids unsalted, its carried ones salted).
+    #[test]
+    fn a_spec_signed_as_its_owner_holds_it_is_taken_as_it_is() {
+        let tmp = tempfile::tempdir().unwrap();
+        let k = key(tmp.path(), "user.key");
+        let yes = |_: &PublicKey| true;
+        let held = owned("studio", &spec(), false);
+        assert!(salted_already(&held) && !salted_already(&spec()));
+        let signed = sign(&held, &k, 1_000);
+        assert_eq!(verify_grant(&signed, "studio", yes).unwrap(), held);
+        let twice = JobSpec {
+            auth: signed.auth.clone(),
+            ..owned("studio", &held, false)
+        };
+        assert_ne!(twice.repo.id, held.repo.id);
+        let e = verify_grant(&twice, "studio", yes).unwrap_err();
+        assert_eq!(e, "its repo is not what its signature covers");
+        let unsalted = JobSpec {
+            auth: signed.auth.clone(),
+            ..spec()
+        };
+        assert!(verify_grant(&unsalted, "studio", yes).is_err());
+        // Any other change is one still.
+        let mut cmd = signed.clone();
+        cmd.cmd.push("--all".into());
+        assert!(verify_grant(&cmd, "studio", yes).is_err());
+        // For another owner than the one that holds it, no.
+        assert!(verify_grant(&signed, "msi", yes).is_err());
+
+        let pinned = JobSpec {
+            workspace: Some("msi-w3".into()),
+            ..spec()
+        };
+        let kept = owned("studio", &pinned, true);
+        assert!(salted_already(&kept) && !salted_already(&pinned));
+        let signed = sign(&kept, &k, 1_000);
+        assert_eq!(verify_grant(&signed, "studio", yes).unwrap(), kept);
+        let carried_twice = JobSpec {
+            auth: signed.auth.clone(),
+            ..owned("studio", &kept, true)
+        };
+        assert!(verify_grant(&carried_twice, "studio", yes).is_err());
+        // Unpinned, an unsalted id is the command line's: salted by the owner, not taken as is.
+        let loose = JobSpec {
+            workspace: None,
+            ..kept
+        };
+        assert!(!salted_already(&loose));
+        let signed = sign(&loose, &k, 1_000);
+        assert!(verify_grant(&signed, "studio", yes).is_err());
     }
 
     /// A spec in a record from before signed jobs, or signed, loads; and the signature's text

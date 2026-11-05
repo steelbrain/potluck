@@ -15,9 +15,10 @@
   into one of those pools, `default` when none is given. See [Jobs](docs/jobs.md#where-it-runs).
 - Signed jobs. In a cluster with users, the command line signs every dispatch with its user key and
   refuses to dispatch without one; a machine runs another machine's job only when a user it knows
-  signed it for that machine and the job it was granted is the one signed. Jobs queued before
-  `user init` run only on the machine they were dispatched on. See
+  signed it for that machine and the job it was granted is the one signed. Jobs other machines
+  queued before `user init` run only on the machine they were dispatched on. See
   [A cluster](docs/cluster.md#users).
+- `potluck user init` also signs the jobs its machine queued before it that haven't ended.
 - `potluck nodes` shows each machine's pool, in its POOL column and as `pool` with `--json`.
 - In a cluster with users, a request another member answers (`wait`, `logs`, `why` or `cancel` of
   a job dispatched elsewhere, `cp`, `hold` or `release` of a workspace elsewhere, `env NODE`) is

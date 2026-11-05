@@ -320,6 +320,9 @@ use std::io::Write;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+/// How many jobs `user init` signs in one request.
+const SIGN_BATCH: usize = 64;
+
 /// `potluck wait --max-wait` exits with this when the job hasn't ended.
 pub const EXIT_STILL_RUNNING: i32 = 3;
 /// Usage errors and potluck's own errors.
@@ -1589,6 +1592,7 @@ impl Cx<'_> {
                     Response::Ok => {}
                     other => return Err(unexpected("user init", &other)),
                 }
+                let (signed_jobs, not_signed) = self.sign_unsigned_jobs(&key, &m.node);
                 let members: Vec<&str> = m.members.iter().map(|e| e.name.as_str()).collect();
                 let warning = match m.elders.as_slice() {
                     [] => None,
@@ -1606,6 +1610,25 @@ impl Cx<'_> {
                     notes.push(format!("made a user key at {}", path.display()));
                 }
                 notes.extend(warning.clone());
+                notes.extend(not_signed.iter().map(|(job, why)| match job {
+                    Some(job) => format!("job {job} was not signed: {why}"),
+                    None => why.clone(),
+                }));
+                let jobs = match signed_jobs.len() {
+                    0 => String::new(),
+                    1 => format!(
+                        "; signed 1 job {} dispatched before it that hasn't ended",
+                        m.node
+                    ),
+                    n => format!(
+                        "; signed {n} jobs {} dispatched before it that haven't ended",
+                        m.node
+                    ),
+                };
+                let not_signed: serde_json::Map<String, Value> = not_signed
+                    .into_iter()
+                    .map(|(job, why)| (job.unwrap_or_default(), json!(why)))
+                    .collect();
                 Ok(Report {
                     note: notes.join("\npotluck: "),
                     ..Report::new(
@@ -1616,9 +1639,11 @@ impl Cx<'_> {
                             "made": made,
                             "members": members,
                             "warning": warning,
+                            "signed_jobs": signed_jobs,
+                            "jobs_not_signed": not_signed,
                         }),
                         format!(
-                            "{name} is the cluster's first user; signed in {}: {}",
+                            "{name} is the cluster's first user; signed in {}: {}{jobs}",
                             if members.len() == 1 {
                                 "its member"
                             } else {
@@ -1691,6 +1716,63 @@ impl Cx<'_> {
                 ))
             }
         }
+    }
+
+    /// After `user init`: signs with `key` this machine's jobs that haven't ended and that no user
+    /// signed (dispatched before the cluster had users), each as its daemon holds it, for `node`
+    /// (this machine), so that other members may run them. Returns the jobs signed, and those
+    /// that weren't with why (None: none was).
+    fn sign_unsigned_jobs(
+        &mut self,
+        key: &UserKey,
+        node: &str,
+    ) -> (Vec<String>, Vec<(Option<String>, String)>) {
+        let none = |why: String| {
+            let why = format!("the jobs {node} dispatched before users were not signed: {why}");
+            (Vec::new(), vec![(None, why)])
+        };
+        let jobs = match self.call(Req::UnsignedJobs) {
+            Ok(Response::Jobs { jobs }) => jobs,
+            Ok(other) => return none(format!("{:#}", unexpected("unsigned jobs", &other))),
+            Err(e) => return none(format!("{e:#}")),
+        };
+        let (mut signed, mut refused) = (Vec::new(), Vec::new());
+        // A bounded request each, however many jobs there are.
+        for batch in jobs.chunks(SIGN_BATCH) {
+            let now = now_ms();
+            let jobs: Vec<crate::proto::JobSignature> = batch
+                .iter()
+                .filter_map(|j| {
+                    let spec = crate::types::JobSpec {
+                        submitted_from: node.to_string(),
+                        ..j.spec.clone()
+                    };
+                    let auth = crate::jobauth::sign(&spec, key, now).auth?;
+                    Some(crate::proto::JobSignature {
+                        job: j.id.clone(),
+                        auth,
+                    })
+                })
+                .collect();
+            match self.call(Req::SignJobs { jobs }) {
+                Ok(Response::JobsSigned {
+                    signed: s,
+                    refused: r,
+                }) => {
+                    signed.extend(s);
+                    refused.extend(r.into_iter().map(|(job, why)| (Some(job), why)));
+                }
+                Ok(other) => {
+                    let why = format!("{:#}", unexpected("sign jobs", &other));
+                    refused.extend(batch.iter().map(|j| (Some(j.id.clone()), why.clone())));
+                }
+                Err(e) => {
+                    let why = format!("{e:#}");
+                    refused.extend(batch.iter().map(|j| (Some(j.id.clone()), why.clone())));
+                }
+            }
+        }
+        (signed, refused)
     }
 
     fn text_request(&mut self, req: Req, what: &str) -> anyhow::Result<Report> {

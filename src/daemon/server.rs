@@ -305,6 +305,8 @@ pub(crate) fn describe(req: &Request) -> String {
         Request::Membership => ("membership", None),
         Request::UserInit { .. } => ("user_init", None),
         Request::UserRecord { .. } => ("user_record", None),
+        Request::UnsignedJobs => ("unsigned_jobs", None),
+        Request::SignJobs { .. } => ("sign_jobs", None),
         Request::SelfUpdate => ("self_update", None),
         Request::Restart { .. } => ("restart", None),
     };
@@ -428,6 +430,12 @@ fn handle_req<W: Write>(
             }
         }
         Request::LeaseCheck { job, token } => Ok(lease_check(sh, job, token)),
+        // A user's command line on this machine signs its jobs: never another member's word.
+        Request::UnsignedJobs | Request::SignJobs { .. } if relayed => {
+            Err("a machine's jobs are signed on that machine".to_string())
+        }
+        Request::UnsignedJobs => Ok(unsigned_jobs(sh)),
+        Request::SignJobs { jobs } => sign_jobs(sh, jobs),
         Request::PairRequest
         | Request::PairFinish { .. }
         | Request::Admit { .. }
@@ -584,6 +592,22 @@ pub(crate) fn take_nonce(
     nonce: &str,
     now: Millis,
 ) -> Result<(), String> {
+    take_nonce_of(
+        st,
+        nonce,
+        now,
+        "the dispatch's signature is refused: this signed dispatch was made here before (its nonce was seen); a dispatch is signed anew each time",
+    )
+}
+
+/// [`take_nonce`], saying `replay` when it was taken before. Dispatches and jobs signed later
+/// ([`sign_jobs`]) share one set of nonces: one taken by either is refused to both.
+fn take_nonce_of(
+    st: &mut super::state::State,
+    nonce: &str,
+    now: Millis,
+    replay: &str,
+) -> Result<(), String> {
     let key = format!("{NONCE_PREFIX}{nonce}");
     let seen = match st.unsaved_kv.get(&key) {
         Some(v) => v.is_some(),
@@ -594,11 +618,123 @@ pub(crate) fn take_nonce(
             .is_some(),
     };
     if seen {
-        return Err(
-            "the dispatch's signature is refused: this signed dispatch was made here before (its nonce was seen); a dispatch is signed anew each time".into(),
-        );
+        return Err(replay.to_string());
     }
     st.save_kv(&key, Some(now.to_string()));
+    Ok(())
+}
+
+/// This machine's own jobs that haven't ended and that no user signed ([`Request::UnsignedJobs`]):
+/// dispatched before the cluster had users, queued, or starting or running here or elsewhere (one
+/// running elsewhere is queued again when that machine is lost). Oldest first.
+fn unsigned_jobs(sh: &Shared) -> Response {
+    let st = sh.lock();
+    let mut jobs: Vec<JobRecord> = st
+        .jobs
+        .values()
+        .filter(|j| {
+            super::cluster::peer::owner_of(&j.id) == st.node
+                && !j.state.is_done()
+                && j.spec.auth.is_none()
+        })
+        .cloned()
+        .collect();
+    jobs.sort_by_key(|j| j.submitted_at);
+    Response::Jobs { jobs }
+}
+
+/// Keeps the signatures `potluck user init` made of this machine's unsigned jobs
+/// ([`Request::SignJobs`]): each one by a user this machine recognizes, over the job's spec as it
+/// stands (its ids salted already: [`crate::jobauth::derived`]), for this machine, within
+/// [`crate::jobauth::MAX_SKEW_MS`] of its clock, with a nonce not taken before. The job is then a
+/// signed one, which other members claim and run.
+pub(crate) fn sign_jobs(
+    sh: &Shared,
+    jobs: &[crate::proto::JobSignature],
+) -> Result<Response, String> {
+    let Some(c) = sh.cluster() else {
+        return Err("this machine is in no cluster, which has no users to sign its jobs".into());
+    };
+    let mesh = c.mesh();
+    if !mesh.users_exist() {
+        return Err("this cluster has no users yet: `potluck user init` makes the first".into());
+    }
+    let users: std::collections::BTreeSet<crate::mesh::PublicKey> = jobs
+        .iter()
+        .map(|s| s.auth.key)
+        .filter(|k| mesh.recognized_user(k))
+        .collect();
+    let now = now_ms();
+    let mut signed = Vec::new();
+    let mut refused = std::collections::BTreeMap::new();
+    {
+        let mut st = sh.lock();
+        for s in jobs {
+            match sign_job(&mut st, s, users.contains(&s.auth.key), now) {
+                Ok(()) => signed.push(s.job.clone()),
+                Err(why) => {
+                    refused.insert(s.job.clone(), why);
+                }
+            }
+        }
+    }
+    if !signed.is_empty() {
+        sh.log.log(format!(
+            "signed by a user, so other members may run them: {}",
+            signed.join(", ")
+        ));
+        c.push_soon();
+        sh.kick();
+    }
+    for (job, why) in &refused {
+        sh.log
+            .log(format!("{job}: a user's signature of it is refused: {why}"));
+    }
+    Ok(Response::JobsSigned { signed, refused })
+}
+
+/// One signature [`sign_jobs`] was given; `by_user`: its key is a user's.
+pub(crate) fn sign_job(
+    st: &mut super::state::State,
+    s: &crate::proto::JobSignature,
+    by_user: bool,
+    now: Millis,
+) -> Result<(), String> {
+    let node = st.node.clone();
+    let owner = super::cluster::peer::owner_of(&s.job);
+    if owner != node {
+        return Err(format!("it is {owner}'s job, not {node}'s"));
+    }
+    let Some(j) = st.jobs.get(&s.job) else {
+        return Err(format!("{node} has no job {} that hasn't ended", s.job));
+    };
+    if j.state.is_done() {
+        return Err(format!("it has ended ({})", j.state.as_str()));
+    }
+    if j.spec.auth.is_some() {
+        return Err("a user signed it already".into());
+    }
+    if !by_user {
+        return Err(format!(
+            "it is signed by key {}, which is no user of this cluster",
+            s.auth.key
+        ));
+    }
+    let as_signed = JobSpec {
+        auth: Some(s.auth.clone()),
+        ..j.spec.clone()
+    };
+    crate::jobauth::check_dispatch(&as_signed, &node, now)?;
+    take_nonce_of(
+        st,
+        &s.auth.nonce,
+        now,
+        "its signature's nonce was taken here before: each job is signed with a nonce of its own",
+    )?;
+    if let Some(j) = st.jobs.get_mut(&s.job) {
+        j.spec.auth = Some(s.auth.clone());
+    }
+    st.save_job(&s.job);
     Ok(())
 }
 

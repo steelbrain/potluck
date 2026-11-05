@@ -93,7 +93,7 @@ none, and makes it the cluster's first user:
 
 ```console
 studio$ potluck user init --name anees
-anees is the cluster's first user; signed in its members: mini, studio
+anees is the cluster's first user; signed in its members: mini, studio; signed 12 jobs studio dispatched before it that haven't ended
 potluck: made a user key at /Users/anees/.config/potluck/user.key
 ```
 
@@ -124,8 +124,11 @@ From then on:
   fails the check isn't run: the machine hands it back, logs a `WARNING` line saying why, and
   doesn't claim it again while it stays queued. A job queued again after its machine is lost is the
   same signed job, and is checked again where it runs next.
-- Jobs queued before `user init` are unsigned: they still run, but only on the machine they were
-  dispatched on.
+- `user init` signs, with the user key, the jobs the machine it runs on dispatched before it that
+  haven't ended (queued, or starting or running on any member), each as that machine holds it, so
+  they run on any member as before; it says how many (with `--json`, `signed_jobs` lists them).
+  Jobs other machines dispatched before it stay unsigned: they still run, but only on the machine
+  they were dispatched on.
 - Only a user's signed record adds or removes a user. `potluck user key` prints this command line's
   public key, making the key first if there is none. A user adds that key with `potluck user add
   NAME KEY` and removes it with `potluck user remove NAME`; `user remove` refuses to remove the
