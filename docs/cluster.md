@@ -129,13 +129,12 @@ the other members need no access to its remotes. A member keeps a bare mirror of
 each of its submodule repositories from the first time a job from it is queued that the member could
 run (the dispatching machine, at dispatch). Mirrors are fed from the dispatching machine over the
 cluster's connections with git's own protocol, so only the objects a mirror lacks travel. The
-dispatching machine serves a repository only while one of its jobs names it and is queued, or
-runs on the member that asks. Mirrors
-are exact copies of the source's branches and tags, force-updates and deletions included. A job that
-runs git in its workspace writes the mirror's branches and tags (a worktree shares them): a branch
-or tag that changed since the last sync is reset to the source's at the next sync. A mirror that
-changed that way, or that fails its checks and is cloned again from the source, is reported in the
-daemon's log and in the log and `why` of the job the sync was for:
+dispatching machine serves a repository only while one of its jobs names it and is queued, or runs
+on the member that asks. Mirrors are exact copies of the source's branches and tags, force-updates
+and deletions included. A job that runs git in its workspace writes the mirror's branches and tags
+(a worktree shares them): a branch or tag that changed since the last sync is reset to the source's
+at the next sync. A mirror that changed that way, or that fails its checks and is cloned again from
+the source, is reported in the daemon's log and in the log and `why` of the job the sync was for:
 
 ```console
 --- potluck: warning: mini: the mirror of app-7c27480694ae7212 had changed since its last sync, so something other than potluck wrote to it (a job running git in its workspace, for one), and was reset to its source's branches and tags: refs/heads/scratch was made here, at f988fe3f3570 ---
@@ -158,15 +157,15 @@ syncing shows in `why` as a `sync` blocker.
 ## Queue and claims
 
 Each machine keeps the queue of the jobs dispatched on it. Members exchange queues about once a
-second and whenever one changes, so every member sees every queue. What members tell each other
-of a job leaves out its command, env and the paths of its repositories (and, while it runs,
-its labels and `--keep` globs), except to the job's dispatching machine; the machine that claims
-a job gets all of it with the grant. So `status` on a machine that neither dispatched nor runs a
-job shows it without its command (`-`), and other members' workspaces without their paths. Each machine plans for itself
-and claims a job from its dispatching machine only when it can start it now. The dispatching
+second and whenever one changes, so every member sees every queue. What members tell each other of a
+job leaves out its command, env and the paths of its repositories (and, while it runs, its labels
+and `--keep` globs), except to the job's dispatching machine; the machine that claims a job gets all
+of it with the grant. So `status` on a machine that neither dispatched nor runs a job shows it
+without its command (`-`), and other members' workspaces without their paths. Each machine plans for
+itself and claims a job from its dispatching machine only when it can start it now. The dispatching
 machine grants each job once; a machine whose claim is refused plans again. A machine with no
-workspace of the job's repository leaves the job for 3 seconds when a member with one could start
-it by then; `why` says so meanwhile.
+workspace of the job's repository leaves the job for 3 seconds when a member with one could start it
+by then; `why` says so meanwhile.
 
 The machine running a job streams its output to the dispatching machine and sends the kept files
 at the end, so `wait` and `logs` work there as on one machine. Kept files that can't be delivered
