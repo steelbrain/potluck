@@ -1,6 +1,6 @@
 [package]
 name = "potluck"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "A build and test cluster for a handful of Linux and macOS machines"
 license = "MIT"

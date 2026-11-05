@@ -65,11 +65,11 @@
 
 ## install.sh
 
-Once a release is published, this installs the latest one, or a given version:
+This installs the latest release, or a given version:
 
 ```sh
 curl -fsSL https://github.com/steelbrain/potluck/releases/latest/download/install.sh | sh
-curl -fsSL https://github.com/steelbrain/potluck/releases/latest/download/install.sh | sh -s -- 0.2.0
+curl -fsSL https://github.com/steelbrain/potluck/releases/latest/download/install.sh | sh -s -- 0.1.1
 ```
 
 `install.sh` picks the binary for the OS and architecture: macOS arm64 or x86_64, or Linux x86_64
@@ -95,7 +95,7 @@ uses sudo and never prompts. When no service is installed yet, it prints the nex
 
 ## Building from source
 
-Until a release is published, build from source. Stable Rust works:
+Or build from source. Stable Rust works:
 
 ```sh
 cargo install --locked --git https://github.com/steelbrain/potluck

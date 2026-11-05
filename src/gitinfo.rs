@@ -421,8 +421,10 @@ fn collect_submodules(
         }
         let sub_dir = dir.join(&path);
         let not_checked_out = || {
+            // Escaped: the flag takes a glob, and a path may hold `*`, `?` or `[`.
             format!(
-                "submodule {full}: not checked out (git submodule update --init --recursive, or leave it out with --without-submodule {full})"
+                "submodule {full}: not checked out (git submodule update --init --recursive, or leave it out with --without-submodule {})",
+                glob::Pattern::escape(&full)
             )
         };
         if sub_dir.join(".git").symlink_metadata().is_err() {

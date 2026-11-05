@@ -21,8 +21,13 @@ hold what a checkout writes, and `git status` there shows it modified too.
 `--without-submodule PATTERN`, repeatable, leaves out the submodules a job doesn't need. PATTERN
 is a submodule's path from the top of the repository, or a glob on such paths in which `*`
 doesn't cross a `/`. A submodule left out, and every submodule nested in it, is neither checked
-at dispatch nor copied to the machine that runs the job: its directory in the workspace is
-empty, and its uncommitted changes, or its being at another commit than recorded, don't count.
+at dispatch nor copied to the machine that runs the job: its directory in the job's new
+workspace is empty, and its uncommitted changes, or its being at another commit than recorded,
+don't count. A job dispatched into an existing workspace (`--workspace W`) gets W as it was made:
+a submodule that W's first dispatch shipped is there even if this one leaves it out, and a
+dispatch that ships one W was made without fails (`workspace W failed verification: submodule
+PATH (...) is not a checkout`). Leave out the same submodules in every dispatch into one
+workspace.
 `dispatch` names what it left out on stderr (with `--json`, `without_submodules`). A pattern that
 matches no submodule of the commit is refused, so a typo can't ship what it meant to leave out;
 one that names a submodule inside another left out counts as matched.
