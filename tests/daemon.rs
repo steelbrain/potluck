@@ -7,7 +7,7 @@ mod common;
 use potluck::client::Client;
 use potluck::config::{GpuConfig, NodeConfig, Paths};
 use potluck::daemon::{
-    Clock, Daemon, Options, Parts, RealScheduler, SystemClock, WorkspaceProvider,
+    Clock, ClusterOptions, Daemon, Options, Parts, RealScheduler, SystemClock, WorkspaceProvider,
 };
 use potluck::exec::{Executor, Launch, Sample};
 use potluck::proto::{ClientContext, Request, Response};
@@ -579,6 +579,8 @@ struct Fixture {
     login_env: BTreeMap<String, String>,
     clock: Arc<SteppedClock>,
     daemon: Option<Daemon>,
+    /// Its first start makes the cluster's first user (`potluck user init`).
+    user: bool,
 }
 
 fn facts() -> Facts {
@@ -664,6 +666,7 @@ impl Fixture {
             login_env,
             clock: Arc::new(SteppedClock::default()),
             daemon: None,
+            user: true,
             _dir: dir,
         }
     }
@@ -683,8 +686,68 @@ impl Fixture {
             login_env: self.login_env.clone(),
             clock: self.clock.clone(),
         };
-        self.daemon =
-            Some(Daemon::start(&self.paths, &self.config, parts, self.opts.clone()).unwrap());
+        self.launch(parts);
+    }
+
+    /// The cluster the daemon is a member of: one of its own, alone (it never listens).
+    fn cluster(&self) -> ClusterOptions {
+        let mut c = ClusterOptions::new(&self.paths, &self.config);
+        c.tick_ms = 100;
+        c.mesh.listen = "127.0.0.1:0".parse().unwrap();
+        c
+    }
+
+    /// Starts the daemon with `parts`, as a member of [`Fixture::cluster`]; on its first start,
+    /// `potluck user init` makes the cluster's first user, whose key signs the dispatches
+    /// ([`Fixture::signed`]).
+    fn launch(&mut self, parts: Parts) {
+        assert!(self.daemon.is_none());
+        self.daemon = Some(
+            Daemon::start_cluster(
+                &self.paths,
+                &self.config,
+                parts,
+                self.opts.clone(),
+                self.cluster(),
+            )
+            .unwrap(),
+        );
+        if self.user && !self.user_key().exists() {
+            assert_eq!(common::user_init(&self.paths), self.user_key());
+        }
+    }
+
+    /// The first user's key file, beside node.toml, where `potluck user init` made it.
+    fn user_key(&self) -> PathBuf {
+        self.paths.config.with_file_name("user.key")
+    }
+
+    /// `spec` signed by the cluster's user, as the command line signs a dispatch: for this
+    /// daemon's machine, now.
+    fn signed(&self, spec: JobSpec) -> JobSpec {
+        let node = match self.client().call(Request::Ping).unwrap() {
+            Response::Pong { node, .. } => node,
+            other => panic!("{other:?}"),
+        };
+        let key = potluck::mesh::user::UserKey::load(&self.user_key())
+            .unwrap()
+            .expect("the user's key");
+        let spec = JobSpec {
+            submitted_from: node,
+            ..spec
+        };
+        potluck::jobauth::sign(&spec, &key, now_ms())
+    }
+
+    /// [`Fixture::signed`] `spec` dispatched: the job's id, or the daemon's refusal.
+    fn try_dispatch(&self, spec: JobSpec) -> Result<String, String> {
+        match self.client().call(Request::Dispatch {
+            spec: Box::new(self.signed(spec)),
+        }) {
+            Ok(Response::Dispatched { job, .. }) => Ok(job),
+            Ok(other) => panic!("{other:?}"),
+            Err(e) => Err(e.to_string()),
+        }
     }
 
     fn stop(&mut self) {
@@ -716,12 +779,7 @@ impl Fixture {
     }
 
     fn dispatch(&self, spec: JobSpec) -> String {
-        match self.client().call(Request::Dispatch {
-            spec: Box::new(spec),
-        }) {
-            Ok(Response::Dispatched { job, .. }) => job,
-            other => panic!("{other:?}"),
-        }
+        self.try_dispatch(spec).unwrap_or_else(|e| panic!("{e}"))
     }
 
     fn get(&self, job: &str) -> JobRecord {
@@ -1083,13 +1141,10 @@ fn a_carried_repository_is_synced_pinned_and_named_to_the_job() {
         );
     }
 
-    let mut c = f.client();
-    let mut call = |carried: Vec<potluck::types::CarriedRef>| {
+    let call = |carried: Vec<potluck::types::CarriedRef>| {
         let mut s = spec("true");
         s.repo.carried = carried;
-        c.call(Request::Dispatch { spec: Box::new(s) })
-            .unwrap_err()
-            .to_string()
+        f.try_dispatch(s).unwrap_err()
     };
     let e = call(vec![carried("de-p", "dep-01234567")]);
     assert!(
@@ -1147,15 +1202,53 @@ fn a_warning_from_a_sync_shows_in_the_jobs_log_and_why() {
     assert!(f.wait(&id).notes.is_empty());
 }
 
+/// A machine whose cluster has no users takes no dispatch: there is no user to have signed it,
+/// so it is refused whether it is unsigned or signed by a key. Once `potluck user init` has made
+/// that key the first user, the signed one runs.
+#[test]
+fn without_users_no_dispatch_is_taken() {
+    let mut f = Fixture::new();
+    f.user = false;
+    let f = f.start();
+    let refused = "this cluster has no users yet, and a machine takes only a dispatch a user signed: `potluck user init` makes the first user (on a machine in no cluster, it founds one)";
+    let call = |s: JobSpec| match f.client().call(Request::Dispatch { spec: Box::new(s) }) {
+        Ok(other) => panic!("{other:?}"),
+        Err(e) => e.to_string(),
+    };
+    assert_eq!(call(spec("true")), refused);
+    let key = potluck::mesh::user::UserKey::load_or_create(&f.user_key())
+        .unwrap()
+        .0;
+    let signed = |s: JobSpec| {
+        let s = JobSpec {
+            submitted_from: "testnode".into(),
+            ..s
+        };
+        potluck::jobauth::sign(&s, &key, now_ms())
+    };
+    assert_eq!(call(signed(spec("true"))), refused);
+    assert!(f.exec.launched.lock().unwrap().is_empty());
+    assert_eq!(common::user_init(&f.paths), f.user_key());
+    let id = match f.client().call(Request::Dispatch {
+        spec: Box::new(signed(spec("true"))),
+    }) {
+        Ok(Response::Dispatched { job, .. }) => job,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(f.wait(&id).state, JobState::Succeeded);
+    // An unsigned one is refused still, for want of a signature now.
+    assert!(
+        call(spec("true")).starts_with("this cluster has users, so a dispatch is signed"),
+        "{}",
+        call(spec("true"))
+    );
+}
+
 #[test]
 fn dispatch_refuses_what_cannot_run() {
     let f = Fixture::new().start();
     let mut c = f.client();
-    let mut call = |s: JobSpec| {
-        c.call(Request::Dispatch { spec: Box::new(s) })
-            .unwrap_err()
-            .to_string()
-    };
+    let call = |s: JobSpec| f.try_dispatch(s).unwrap_err();
     let mut s = spec("true");
     s.on.insert("os".into(), "plan9".into());
     let e = call(s);
@@ -1238,16 +1331,25 @@ fn dispatch_refuses_what_cannot_run() {
         "{:?}",
         f.ws.pins.lock().unwrap()
     );
-    for req in [
-        Request::PairRequest,
-        Request::Admit {
-            request: "x".into(),
-            admission: None,
-        },
-        Request::SelfUpdate,
+    // Nor is an admission or a removal no user signed: this machine signs none.
+    for (req, want) in [
+        (
+            Request::Admit {
+                request: "x".into(),
+                admission: None,
+            },
+            "this cluster has users: only a user's signed admission admits a machine (`potluck admit` where a user's key is)",
+        ),
+        (
+            Request::Remove {
+                node: "x".into(),
+                removal: None,
+            },
+            "this cluster has users: only a user's signed removal removes a machine (`potluck remove` where a user's key is)",
+        ),
     ] {
         let e = c.call(req).unwrap_err().to_string();
-        assert!(e.contains("not available yet"), "{e}");
+        assert_eq!(e, want);
     }
     // Nothing was queued or pinned.
     assert!(f.ws.pins.lock().unwrap().is_empty());
@@ -1278,7 +1380,7 @@ fn keys_make_dispatch_idempotent() {
     match f
         .client()
         .call(Request::Dispatch {
-            spec: Box::new(s.clone()),
+            spec: Box::new(f.signed(s.clone())),
         })
         .unwrap()
     {
@@ -1298,7 +1400,7 @@ fn a_job_outlives_its_client() {
         let mut c = f.client();
         match c
             .call(Request::Dispatch {
-                spec: Box::new(spec("sleep 0.5; echo done; exit 3")),
+                spec: Box::new(f.signed(spec("sleep 0.5; echo done; exit 3"))),
             })
             .unwrap()
         {
@@ -1361,11 +1463,34 @@ fn cancel_queued_and_running() {
 
 /// What the daemon answers a resize of `job` to `ram_mib`, unsigned: the job and its request
 /// before, or the refusal.
+/// The job's spec as the daemon holds it, with `ram_mib` its RAM request, signed by the cluster's
+/// user as `potluck resize` signs it (None for a job the daemon doesn't have).
+fn resize_auth(f: &Fixture, job: &str, ram_mib: u64) -> Option<Box<potluck::jobauth::JobAuth>> {
+    let held = match f.client().call(Request::Get { job: job.into() }) {
+        Ok(Response::Job { job }) => job.spec,
+        _ => return None,
+    };
+    let key = potluck::mesh::user::UserKey::load(&f.user_key())
+        .unwrap()
+        .unwrap();
+    let spec = JobSpec {
+        request: potluck::types::Request {
+            ram_mib,
+            ..held.request.clone()
+        },
+        auth: None,
+        ..held
+    };
+    potluck::jobauth::sign(&spec, &key, now_ms())
+        .auth
+        .map(Box::new)
+}
+
 fn resized(f: &Fixture, job: &str, ram_mib: u64) -> Result<(JobRecord, u64), String> {
     match f.client().call(Request::Resize {
         job: job.into(),
         ram_mib,
-        auth: None,
+        auth: resize_auth(f, job, ram_mib),
     }) {
         Ok(Response::Resized { job, from_ram_mib }) => Ok((*job, from_ram_mib)),
         Ok(other) => panic!("{other:?}"),
@@ -1414,7 +1539,16 @@ fn resize_lowers_a_queued_jobs_request_in_place() {
     );
     let mut want = before.spec.clone();
     want.request.ram_mib = 5 << 10;
-    assert_eq!(after.spec, want, "only the request changed");
+    let unsigned = |s: &JobSpec| JobSpec {
+        auth: None,
+        ..s.clone()
+    };
+    assert_eq!(
+        unsigned(&after.spec),
+        unsigned(&want),
+        "only the request changed"
+    );
+    assert_ne!(after.spec.auth, before.spec.auth, "signed anew, with it");
     std::thread::sleep(Duration::from_millis(300));
     assert_eq!(queued(), [first.clone(), behind.clone()]);
     assert_eq!(f.get(&behind).state, JobState::Queued);
@@ -2057,7 +2191,7 @@ fn a_facts_refresh_keeps_the_machines_name() {
         login_env: BTreeMap::new(),
         clock: f.clock.clone(),
     };
-    f.daemon = Some(Daemon::start(&f.paths, &f.config, parts, f.opts.clone()).unwrap());
+    f.launch(parts);
     // The third detection starts once the second (the first refresh) has been applied.
     wait_until("two refreshes", || calls.load(Ordering::SeqCst) >= 3);
     match f.client().call(Request::Nodes).unwrap() {
@@ -2318,12 +2452,7 @@ fn hold_release_and_reminders() {
     // A different commit can't use it.
     let mut moved = s.clone();
     moved.repo.commit = "e".repeat(40);
-    let e = c
-        .call(Request::Dispatch {
-            spec: Box::new(moved),
-        })
-        .unwrap_err()
-        .to_string();
+    let e = f.try_dispatch(moved).unwrap_err();
     assert!(e.contains("is at commit"), "{e}");
 
     // Release with an invocation running in it ends the hold but keeps it.
@@ -2368,10 +2497,7 @@ fn hold_release_and_reminders() {
         .unwrap_err()
         .to_string();
     assert!(e.contains("is gone"), "{e}");
-    let e = c
-        .call(Request::Dispatch { spec: Box::new(s) })
-        .unwrap_err()
-        .to_string();
+    let e = f.try_dispatch(s).unwrap_err();
     assert!(e.contains("is gone"), "{e}");
 }
 
@@ -2567,12 +2693,7 @@ fn unset_env_leaves_variables_out_of_the_job() {
     assert_eq!(env["FROM_SPEC"], "spec");
     assert_eq!(env["POTLUCK_JOB"], id);
 
-    let mut c = f.client();
-    let mut call = |s: JobSpec| {
-        c.call(Request::Dispatch { spec: Box::new(s) })
-            .unwrap_err()
-            .to_string()
-    };
+    let call = |s: JobSpec| f.try_dispatch(s).unwrap_err();
     for (k, want) in [
         (
             "TMPDIR",
@@ -2617,7 +2738,7 @@ fn env_is_the_login_environment_jobs_start_from() {
         .to_string();
     assert_eq!(
         e,
-        "msi is not a member of the cluster: this machine, testnode, is in no cluster"
+        "msi is not a member of the cluster (`potluck nodes` lists them)"
     );
 }
 
@@ -3517,11 +3638,7 @@ fn a_request_that_panics_is_logged_without_its_env() {
     let mut s = spec("true");
     s.env.insert("API_TOKEN".into(), "hunter2-secret".into());
     s.repo.source = PathBuf::from("/panic/.git");
-    let e = f
-        .client()
-        .call(Request::Dispatch { spec: Box::new(s) })
-        .unwrap_err()
-        .to_string();
+    let e = f.try_dispatch(s).unwrap_err();
     assert!(e.contains("internal error: the sync blew up"), "{e}");
     let log = std::fs::read_to_string(f.paths.daemon_log()).unwrap();
     assert!(
@@ -4315,7 +4432,15 @@ fn a_job_queued_during_the_drain_runs_after_a_restart_in_place() {
         clock: f.clock.clone(),
     };
     f.daemon = Some(
-        Daemon::start_from(&f.paths, &f.config, parts, f.opts.clone(), None, inherited).unwrap(),
+        Daemon::start_from(
+            &f.paths,
+            &f.config,
+            parts,
+            f.opts.clone(),
+            Some(f.cluster()),
+            inherited,
+        )
+        .unwrap(),
     );
     match asking.join().unwrap() {
         Ok(Response::Text { text }) => assert!(text.starts_with("Restarted in place"), "{text}"),

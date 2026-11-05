@@ -4,7 +4,7 @@
 
 mod common;
 
-use common::{FakeDaemon, job, potluck, reminder, run};
+use common::{FakeDaemon, job, pair_request, potluck, reminder, run};
 use potluck::cli::{Env, run_args};
 use potluck::proto::{Blocker, ClientRequest, NodeView, Request, Response, StatusView, WhyView};
 use potluck::types::{
@@ -208,6 +208,10 @@ fn dispatch_and_release_wait_for_a_slow_answer() {
         Request::Get { job: id } => conn.send(Response::Job {
             job: Box::new(job(id, JobState::Queued, None)),
         }),
+        Request::Ping => conn.send(Response::Pong {
+            version: "0".into(),
+            node: "studio".into(),
+        }),
         _ => conn.send(Response::Error {
             message: "unexpected".into(),
         }),
@@ -232,6 +236,51 @@ fn dispatch_and_release_wait_for_a_slow_answer() {
     assert!(
         String::from_utf8_lossy(&dispatch.stdout).starts_with("job studio-5\n"),
         "{stderr}"
+    );
+}
+
+/// Until the cluster has a user, `dispatch`, `admit` and `remove` are refused here, saying how to
+/// make the first: exit 2, and with --json the error document. None of them is asked of the
+/// daemon.
+#[test]
+fn dispatch_admit_and_remove_need_a_user() {
+    let fake = FakeDaemon::without_users(vec![], |_, conn| {
+        conn.send(Response::Error {
+            message: "unexpected".into(),
+        })
+    });
+    let repo = repo_with(RECIPES);
+    let request = pair_request("new");
+    let cases: [(&[&str], &str); 4] = [
+        (&["dispatch", "--timeout", "1m", "--", "true"], "a dispatch"),
+        (&["admit", &request], "an admission"),
+        (&["admit", "--pool", "cloud", &request], "an admission"),
+        (&["remove", "old-box"], "a removal"),
+    ];
+    for (args, what) in cases {
+        let want = format!(
+            "{what} is signed by a user, and this cluster has no users yet: `potluck user init` makes this command line's key the first user"
+        );
+        let r = run(potluck(fake.home()).current_dir(repo.path()).args(args));
+        assert_eq!(
+            (r.code, r.stdout.as_str()),
+            (2, ""),
+            "{args:?}: {}",
+            r.stderr
+        );
+        assert_eq!(r.stderr, format!("potluck: {want}\n"), "{args:?}");
+        let r = run(potluck(fake.home())
+            .current_dir(repo.path())
+            .arg("--json")
+            .args(args));
+        assert_eq!(r.code, 2, "{args:?}");
+        assert_eq!(one_json(&r.stdout)["error"], want.as_str(), "{args:?}");
+    }
+    let ops = fake.ops();
+    assert!(
+        !ops.iter()
+            .any(|op| ["dispatch", "admit", "remove"].contains(&op.as_str())),
+        "{ops:?}"
     );
 }
 
@@ -713,6 +762,10 @@ fn dispatch_with_a_taken_key_names_that_jobs_state_in_words() {
         Request::Get { job: id } => conn.send(Response::Job {
             job: Box::new(job(id, JobState::TimedOut, Some(124))),
         }),
+        Request::Ping => conn.send(Response::Pong {
+            version: "0".into(),
+            node: "studio".into(),
+        }),
         _ => conn.send(Response::Error {
             message: "unexpected".into(),
         }),
@@ -945,7 +998,8 @@ fn a_potluck_toml_that_is_not_a_file_is_named_as_such() {
 #[test]
 fn dispatch_leaves_the_owner_to_the_daemon_whatever_node_toml_says() {
     // The daemon numbers the job and owns it; a node.toml it refused, or one edited since it
-    // started, must not put another machine's name in the record.
+    // started, must not put another machine's name in the record: the spec is signed for the
+    // machine the daemon says it is.
     let fake = dispatch_daemon();
     std::fs::write(fake.home().join("node.toml"), "name = \"box\"\nbogus = 1\n").unwrap();
     let repo = repo_with(RECIPES);
@@ -954,7 +1008,10 @@ fn dispatch_leaves_the_owner_to_the_daemon_whatever_node_toml_says() {
         &["dispatch", "--timeout", "5m", "--", "true"],
     );
     assert_eq!(out.code, 0, "{}", out.stderr);
-    assert_eq!(dispatched_spec(&fake).submitted_from, "");
+    let spec = dispatched_spec(&fake);
+    assert_eq!(spec.submitted_from, "studio");
+    let signed = potluck::jobauth::open(spec.auth.as_ref().unwrap()).unwrap();
+    assert_eq!(signed.submitted_from, "studio");
 }
 
 #[test]
@@ -2788,6 +2845,7 @@ fn status_why_and_nodes_print_plain_tables() {
 #[test]
 fn small_commands_print_what_they_did_and_the_reminders() {
     let fake = status_daemon();
+    let request = pair_request("old-box");
     let cases: [(&[&str], &str); 7] = [
         (&["cancel", "studio-1"], "cancelled job studio-1\n"),
         (
@@ -2797,7 +2855,7 @@ fn small_commands_print_what_they_did_and_the_reminders() {
         (&["release", "msi-w7"], "released workspace msi-w7\n"),
         (&["remove", "old-box"], "removed old-box from the cluster\n"),
         (&["pair"], "PASTE-ME\n"),
-        (&["admit", "REQ"], "PASTE-ME\n"),
+        (&["admit", &request], "PASTE-ME\n"),
         (&["pair", "--finish", "REPLY"], "pair --finish: done\n"),
     ];
     for (args, want) in cases {
@@ -2818,7 +2876,7 @@ fn small_commands_print_what_they_did_and_the_reminders() {
     for (args, next) in [
         (&["pair"][..], "into `potluck admit` on a member"),
         (
-            &["admit", "REQ"][..],
+            &["admit", &request][..],
             "into `potluck pair --finish` on the new machine",
         ),
     ] {

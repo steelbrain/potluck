@@ -20,8 +20,8 @@ use std::fs::File;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 const BIN: &str = env!("CARGO_BIN_EXE_potluck");
@@ -212,6 +212,10 @@ struct Node {
     daemon_env: Vec<(String, String)>,
     /// Where the daemon's stdout and stderr go.
     daemon_out: PathBuf,
+    /// The user key its command line signs with ($POTLUCK_USER_KEY), once it is another
+    /// machine's ([`Node::signs_as`]); None: user.key beside its node.toml, the key of the first
+    /// user of the cluster it founded.
+    user_key: Mutex<Option<PathBuf>>,
 }
 
 /// What a CLI run printed.
@@ -301,10 +305,42 @@ impl Node {
             bin: PathBuf::from(BIN),
             daemon_env: Vec::new(),
             daemon_out,
+            user_key: Mutex::new(None),
         };
         let _ = shell;
         node.start_daemon();
+        // A cluster of its own, with its command line's key as its first user, as `potluck user
+        // init` makes it.
+        common::user_init(&node.paths);
         node
+    }
+
+    /// The user key file its command line signs with.
+    fn key_file(&self) -> PathBuf {
+        self.user_key
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| self.paths.config.with_file_name("user.key"))
+    }
+
+    /// From now on its command line signs with `other`'s user key: it joined `other`'s cluster,
+    /// where its own key is no user's.
+    fn signs_as(&self, other: &Node) {
+        *self.user_key.lock().unwrap() = Some(other.key_file());
+    }
+
+    /// The CLI with this node's environment, in `cwd`.
+    fn command(&self, cwd: &Path) -> Command {
+        let mut c = Command::new(BIN);
+        c.current_dir(cwd)
+            .env("POTLUCK_HOME", &self.paths.home)
+            .env("POTLUCK_CONFIG", &self.paths.config)
+            .env("POTLUCK_USER_KEY", self.key_file())
+            .env_remove("POTLUCK_JOB")
+            .env_remove("POTLUCK_LEASE")
+            .stdin(Stdio::null());
+        c
     }
 
     fn start_daemon(&mut self) {
@@ -371,16 +407,11 @@ impl Node {
 
     /// Runs the CLI with `--json` in `cwd` (the project by default).
     fn cli_in(&self, cwd: &Path, args: &[&str]) -> Out {
-        let out = Command::new(BIN)
+        let out = self
+            .command(cwd)
             .arg("--json")
             .args(args)
-            .current_dir(cwd)
-            .env("POTLUCK_HOME", &self.paths.home)
-            .env("POTLUCK_CONFIG", &self.paths.config)
             .env("E2E_CALLER", "leaked")
-            .env_remove("POTLUCK_JOB")
-            .env_remove("POTLUCK_LEASE")
-            .stdin(Stdio::null())
             .output()
             .unwrap();
         let stdout = String::from_utf8_lossy(&out.stdout);
@@ -1732,12 +1763,14 @@ fn recipes_come_from_the_committed_file() {
 }
 
 /// After `potluck user init` (here a cluster of one, with this command line's key as its user),
-/// the command line signs each dispatch: the job runs as before, and its record says who signed
-/// it. Without the key, a dispatch is refused before it is sent.
+/// the command line signs each dispatch: the job runs, and its record says who signed it.
+/// Without the key, a dispatch is refused before it is sent.
 #[test]
 fn a_dispatch_after_user_init_is_signed_and_runs() {
     let n = Node::new();
-    let user = n.cli_ok(&["user", "init", "--name", "me"]);
+    // The node's setup ran `potluck user init`.
+    let user = n.cli_ok(&["user", "key"]);
+    assert_eq!(user["made"], false, "{user}");
     let job = n.dispatch(&["hello"]);
     let (code, j, out) = n.wait(&job);
     assert_eq!(code, 0, "{j}");
@@ -1873,6 +1906,8 @@ fn two_daemons_pair_and_follow_each_others_jobs() {
         .unwrap()
         .to_string();
     b.cli_ok(&["pair", "--finish", &reply]);
+    // b's own user key is no user of a's cluster: its command line signs with a's.
+    b.signs_as(&a);
     let sees = |n: &Node, other: &str| {
         n.cli_ok(&["nodes"])["nodes"]
             .as_array()
@@ -1929,7 +1964,8 @@ fn two_daemons_pair_and_follow_each_others_jobs() {
     }
 }
 
-/// Pairs `b` into `a`'s cluster through the CLI and waits until each sees the other alive.
+/// Pairs `b` into `a`'s cluster through the CLI (a's command line admits it, with its user's key)
+/// and waits until each sees the other alive. From then on b's command line signs with that key.
 fn pair(a: &Node, b: &Node) {
     let request = b.cli_ok(&["pair"])["text"].as_str().unwrap().to_string();
     let reply = a.cli_ok(&["admit", &request])["text"]
@@ -1937,6 +1973,7 @@ fn pair(a: &Node, b: &Node) {
         .unwrap()
         .to_string();
     b.cli_ok(&["pair", "--finish", &reply]);
+    b.signs_as(a);
     let sees = |n: &Node, other: &str| {
         n.cli_ok(&["nodes"])["nodes"]
             .as_array()
@@ -2323,15 +2360,6 @@ impl TwoBranches {
         let a = Node::new();
         let b = Node::new();
         pair(&a, &b);
-        a.cli_ok(&["user", "init", "--name", "owner"]);
-        let start = Instant::now();
-        while b.cli_ok(&["user", "list"])["users"]
-            .as_array()
-            .is_none_or(|u| u.is_empty())
-        {
-            assert!(start.elapsed() < Duration::from_secs(30), "b has no user");
-            std::thread::sleep(Duration::from_millis(100));
-        }
         let proj = a.proj.clone();
         let commit = |file: &str| {
             std::fs::write(proj.join(file), format!("{file}\n")).unwrap();
@@ -2651,14 +2679,8 @@ fn longest_gap(answers: &[Instant]) -> Duration {
 
 /// Runs the CLI (without `--json`) as a child process, its output piped.
 fn spawn_cli(n: &Node, args: &[&str]) -> Child {
-    Command::new(BIN)
+    n.command(&n.proj)
         .args(args)
-        .current_dir(&n.proj)
-        .env("POTLUCK_HOME", &n.paths.home)
-        .env("POTLUCK_CONFIG", &n.paths.config)
-        .env_remove("POTLUCK_JOB")
-        .env_remove("POTLUCK_LEASE")
-        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()

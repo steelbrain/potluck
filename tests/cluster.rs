@@ -449,8 +449,8 @@ fn git(dir: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
-/// What the nodes of one test share: the repository jobs are dispatched from, and its source
-/// (the commits a sync can bring).
+/// What the nodes of one test share: the repository jobs are dispatched from, its source (the
+/// commits a sync can bring), and the user key their command lines sign with.
 struct World {
     dir: tempfile::TempDir,
     repo: PathBuf,
@@ -468,6 +468,7 @@ impl World {
         git(&repo, &["commit", "-qm", "init"]);
         let id = potluck::types::repo_id(&repo.join(".git"));
         let commit = git(&repo, &["rev-parse", "HEAD"]);
+        potluck::mesh::user::UserKey::load_or_create(&dir.path().join("user.key")).unwrap();
         World {
             source: Arc::new(Mutex::new([(id, commit)].into())),
             dir,
@@ -489,10 +490,18 @@ impl World {
         repo
     }
 
+    /// The user key every node's command line holds, a copy of it at user.key beside its
+    /// node.toml, unless built [`NodeBuilder::no_user_key`]: the first user, `owner`, of each
+    /// node's cluster.
+    fn user_key(&self) -> PathBuf {
+        self.dir.path().join("user.key")
+    }
+
     fn node(&self, name: &str) -> NodeBuilder<'_> {
         NodeBuilder {
             world: self,
             name: name.into(),
+            user_key: true,
             gpu: false,
             cpu_model: "slow".into(),
             version: TEST_VERSION.into(),
@@ -510,6 +519,9 @@ impl World {
 struct NodeBuilder<'w> {
     world: &'w World,
     name: String,
+    /// Its command line holds the world's user key, and the node starts as the first user's
+    /// machine, in a cluster of its own (`potluck user init`), until it pairs into another.
+    user_key: bool,
     gpu: bool,
     cpu_model: String,
     version: String,
@@ -523,6 +535,13 @@ struct NodeBuilder<'w> {
 }
 
 impl NodeBuilder<'_> {
+    /// Its command line holds no user key (user.key beside its node.toml, which isn't there),
+    /// and it starts in no cluster, without users: a machine as it was before `potluck user
+    /// init`, or one a user's key never reached.
+    fn no_user_key(mut self) -> Self {
+        self.user_key = false;
+        self
+    }
     /// The daemon's clocks (the cluster's own reads the machine's).
     fn clock(mut self, clock: Arc<SteppedClock>) -> Self {
         self.clock = clock;
@@ -614,6 +633,10 @@ impl NodeBuilder<'_> {
                 Ok("updated (test)".to_string().into())
             })
         });
+        if self.user_key {
+            std::fs::copy(self.world.user_key(), dir.join("user.key")).unwrap();
+        }
+        let user_key = self.user_key;
         let mut node = Node {
             name: self.name,
             dir: dir.clone(),
@@ -651,6 +674,9 @@ impl NodeBuilder<'_> {
             daemon: None,
         };
         node.start();
+        if user_key {
+            node.cli_ok(&["user", "init", "--name", "owner"]);
+        }
         node
     }
 }
@@ -774,7 +800,7 @@ impl Node {
     }
 
     /// The CLI run in repository `dir`, its user key the file `user_key` ($POTLUCK_USER_KEY), or
-    /// with None user.key beside this node's node.toml.
+    /// with None user.key beside this node's node.toml ([`Node::key_file`]).
     fn cli_keyed(&self, dir: &Path, user_key: Option<&Path>, args: &[&str]) -> Out {
         let mut cmd = Command::new(BIN);
         cmd.arg("--json")
@@ -821,6 +847,11 @@ impl Node {
             .unwrap()
     }
 
+    /// The user key file this node's command line signs with: user.key beside its node.toml.
+    fn key_file(&self) -> PathBuf {
+        self.dir.join("user.key")
+    }
+
     fn cli_ok(&self, args: &[&str]) -> Value {
         let o = self.cli(args);
         assert_eq!(
@@ -840,11 +871,11 @@ impl Node {
     }
 
     /// [`Node::dispatch`] from this node's command line holding the user key `user`'s command
-    /// line made (user.key beside its node.toml).
+    /// line holds ([`Node::key_file`]).
     fn dispatch_signed_by(&self, user: &Node, args: &[&str]) -> String {
         let mut all = vec!["dispatch", "--timeout", "60s"];
         all.extend_from_slice(args);
-        let key = user.dir.join("user.key");
+        let key = user.key_file();
         let o = self.cli_keyed(&self.repo, Some(&key), &all);
         assert_eq!(
             o.code, 0,
@@ -996,6 +1027,29 @@ fn pair(member: &Node, new: &Node) {
         .as_str()
         .unwrap()
         .to_string();
+    let joined = new.cli_ok(&["pair", "--finish", &reply]);
+    assert!(
+        joined["text"].as_str().unwrap().contains(&member.name),
+        "{joined}"
+    );
+    wait_until(&format!("{} sees {}", member.name, new.name), || {
+        member.node_alive(&new.name) && new.node_alive(&member.name)
+    });
+}
+
+/// Pairs `new` into `member`'s cluster as members did before users (0.1.1): `member`'s machine
+/// key signs the admission. Its daemon on this version signs none, so a bare mesh with its key
+/// admits while the daemon is stopped; `new` then finishes pairing through its command line. Such
+/// records still count in a cluster that has no users yet: an upgraded cluster's membership.
+fn pair_unsigned(member: &mut Node, new: &Node) {
+    let request = new.cli_ok(&["pair"])["text"].as_str().unwrap().to_string();
+    member.stop();
+    let mesh =
+        potluck::mesh::Mesh::start_unlistening(member.mesh_config(), Arc::new(Scripted::default()))
+            .unwrap();
+    let reply = mesh.admit(&request).unwrap();
+    mesh.stop();
+    member.start();
     let joined = new.cli_ok(&["pair", "--finish", &reply]);
     assert!(
         joined["text"].as_str().unwrap().contains(&member.name),
@@ -1609,23 +1663,27 @@ fn says_out(node: &Node) -> bool {
         .is_some_and(|n| n.iter().any(|x| x.as_str().unwrap().contains("removed")))
 }
 
-/// b removes c while a, stopped, removes b, not knowing of b's removal of c; c hears of b's
+/// In a cluster paired before users, b removes c (as members on 0.1.1 did, signing with its
+/// machine key) while a, stopped, removes b, not knowing of b's removal of c; c hears of b's
 /// first. a's removal voids b's (a hadn't seen it), so once c hears of a's, c is a member again,
 /// for its mesh as for every member: its daemon says so and runs work for the others again.
 #[test]
 fn a_machine_whose_removal_turns_out_void_takes_work_again() {
     let w = World::new();
-    let mut a = w.node("a").start();
-    let b = w.node("b").start();
-    let c = w.node("c").start();
-    pair(&a, &b);
-    pair(&a, &c);
+    let mut a = w.node("a").no_user_key().start();
+    let mut b = w.node("b").no_user_key().start();
+    let c = w.node("c").no_user_key().start();
+    pair_unsigned(&mut a, &b);
+    pair_unsigned(&mut a, &c);
     wait_until("b and c see each other", || {
         b.node_alive("c") && c.node_alive("b")
     });
     a.stop();
-    b.cli_ok(&["remove", "c"]);
+    let as_b = b.impostor(Arc::new(Scripted::default()));
+    as_b.remove("c").unwrap();
     wait_until("c knows b removed it", || says_out(&c));
+    as_b.stop();
+    b.start();
     {
         use potluck::mesh::{Record, Removal, identity::Identity, trust::Trust};
         let keys = a.paths.keys_dir();
@@ -1639,6 +1697,8 @@ fn a_machine_whose_removal_turns_out_void_takes_work_again() {
     }
     a.start();
     wait_until("c is in the cluster again", || !says_out(&c));
+    a.cli_ok(&["user", "init", "--name", "owner"]);
+    wait_until("c has the user", || trust_of(&c).users_exist());
     let job = a.dispatch(&["--on", "node=c", "--", "true"]);
     let j = a.done(&job);
     assert_eq!(
@@ -1800,96 +1860,6 @@ fn members_with(node: &Node, rec: potluck::mesh::Record) -> Vec<String> {
     names
 }
 
-/// x was admitted before y, so a removal of x that y signs, x can undo by removing y back
-/// (removals that void each other go to the member admitted first). `potluck remove x` on y has
-/// the founder sign it: final, and x removing the founder back changes nothing.
-#[test]
-fn a_removal_asked_of_a_young_member_is_signed_by_the_founder() {
-    let w = World::new();
-    let a = w.node("a").start();
-    let x = w.node("x").start();
-    let y = w.node("y").start();
-    pair(&a, &x);
-    pair(&a, &y);
-    wait_until("y sees x", || y.node_alive("x"));
-    let out = y.cli_ok(&["remove", "x"]);
-    assert_eq!(out["final"], true, "{out}");
-    assert!(out["warning"].is_null(), "{out}");
-    wait_until("y holds a's removal of x", || holds_removal(&y, "x", "a"));
-    assert!(!holds_removal(&y, "x", "y"));
-    assert!(
-        a.daemon_log()
-            .contains("cluster: removal of x signed for y")
-    );
-    let back = removal_by(&x, "x", &a);
-    assert_eq!(members_with(&y, back), ["a", "y"]);
-}
-
-/// Audit repro (round 7 trust): the founder is up but can't sign the removal (it can't save its
-/// records: a full disk; here its keys directory is read-only). y's `potluck remove x` failed with
-/// the founder's error, its path on the founder's disk unexplained, and x stayed a member. Now y
-/// signs the removal itself, as with the founder down, and says why the founder didn't.
-#[test]
-fn a_removal_the_founder_cant_sign_is_signed_here_and_says_why() {
-    use std::os::unix::fs::PermissionsExt;
-    let w = World::new();
-    let a = w.node("a").start();
-    let x = w.node("x").start();
-    let y = w.node("y").start();
-    pair(&a, &x);
-    pair(&a, &y);
-    wait_until("y sees x", || y.node_alive("x"));
-    let keys = a.paths.keys_dir();
-    let mode = |m: u32| std::fs::set_permissions(&keys, std::fs::Permissions::from_mode(m));
-    mode(0o500).unwrap();
-    let out = y.cli(&["remove", "x"]);
-    mode(0o700).unwrap();
-    assert_eq!(out.code, 0, "{}\n{}", out.stdout, out.stderr);
-    assert_eq!(out.json["final"], false, "{}", out.json);
-    assert!(holds_removal(&y, "x", "y"));
-    let warning = out.json["warning"].as_str().unwrap();
-    assert!(
-        warning.contains("x can undo this removal")
-            && warning.contains("a did not sign it: ")
-            && warning.contains("members.json"),
-        "{warning}"
-    );
-    wait_until("a takes y's removal of x", || !a.node_alive("x"));
-}
-
-/// With the founder down, y signs the removal of x itself, says that x can undo it and how to
-/// make it final; and x can.
-#[test]
-fn with_the_founder_down_a_removal_says_it_can_be_undone() {
-    let w = World::new();
-    let mut a = w.node("a").start();
-    let x = w.node("x").start();
-    let y = w.node("y").start();
-    pair(&a, &x);
-    pair(&a, &y);
-    wait_until("y sees x", || y.node_alive("x"));
-    a.stop();
-    let out = y.cli_ok(&["remove", "x"]);
-    assert_eq!(out["final"], false, "{out}");
-    assert!(holds_removal(&y, "x", "y"));
-    let warning = out["warning"].as_str().unwrap();
-    assert!(
-        warning.contains("x can undo this removal")
-            && warning.contains("run `potluck remove x` again when a is up"),
-        "{warning}"
-    );
-    let back = removal_by(&x, "x", &y);
-    assert_eq!(members_with(&y, back), ["a", "x"]);
-    // With a up again, the removal asked again is a's: final.
-    a.start();
-    wait_until("y sees a", || y.node_alive("a"));
-    let out = y.cli_ok(&["remove", "x"]);
-    assert_eq!(out["final"], true, "{out}");
-    wait_until("y holds a's removal of x", || holds_removal(&y, "x", "a"));
-    let back = removal_by(&x, "x", &y);
-    assert_eq!(members_with(&y, back), ["a", "y"]);
-}
-
 /// `node`'s saved store, as its daemon last saved it.
 fn trust_of(node: &Node) -> potluck::mesh::trust::Trust {
     potluck::mesh::trust::Trust::load_read_only(&node.paths.keys_dir()).unwrap()
@@ -1906,19 +1876,20 @@ fn error_of(o: &Out) -> String {
     o.json["error"].as_str().unwrap_or_default().to_string()
 }
 
-/// `potluck user init` on the founder of a cluster of three: every member stays one, now by the
-/// user's admission, and jobs run across them as before. From then on only what a user signs
-/// admits or removes a machine: `admit --pool cloud` with the user's key joins a machine in that
-/// pool; a member without a user's key can't admit or remove, its daemon signs neither, and the
-/// records members sign count for nothing; a removal the user signs is final.
+/// `potluck user init` on the founder of a cluster of three paired before users (as on 0.1.1):
+/// every member stays one, now by the user's admission, and jobs run across them as before. From
+/// then on only what a user signs admits or removes a machine: `admit --pool cloud` with the
+/// user's key joins a machine in that pool; a member without a user's key can't admit or remove,
+/// its daemon signs neither, and the records members sign count for nothing; a removal the user
+/// signs is final.
 #[test]
 fn after_user_init_only_what_users_sign_admits_and_removes() {
     let w = World::new();
-    let a = w.node("a").start();
-    let b = w.node("b").start();
-    let c = w.node("c").start();
-    pair(&a, &b);
-    pair(&a, &c);
+    let mut a = w.node("a").no_user_key().start();
+    let b = w.node("b").no_user_key().start();
+    let c = w.node("c").no_user_key().start();
+    pair_unsigned(&mut a, &b);
+    pair_unsigned(&mut a, &c);
     wait_until("b and c see each other", || {
         b.node_alive("c") && c.node_alive("b")
     });
@@ -1973,7 +1944,7 @@ fn after_user_init_only_what_users_sign_admits_and_removes() {
     assert!(!b.dir.join("user.key").exists());
 
     // d joins in pool cloud, admitted with the user's key.
-    let d = w.node("d").start();
+    let d = w.node("d").no_user_key().start();
     let request = d.cli_ok(&["pair"])["text"].as_str().unwrap().to_string();
     let refused = b.cli(&["admit", &request]);
     assert!(
@@ -2089,8 +2060,8 @@ fn after_user_init_only_what_users_sign_admits_and_removes() {
 #[test]
 fn a_second_users_key_signs_until_it_is_removed() {
     let w = World::new();
-    let a = w.node("a").start();
-    let b = w.node("b").start();
+    let a = w.node("a").no_user_key().start();
+    let b = w.node("b").no_user_key().start();
     let out = a.cli_ok(&["user", "init", "--name", "owner"]);
     assert_eq!(out["members"], serde_json::json!(["a"]), "{out}");
     assert!(trust_of(&a).users_exist());
@@ -2117,7 +2088,7 @@ fn a_second_users_key_signs_until_it_is_removed() {
     a.cli_ok(&["user", "add", "bob", &key]);
     wait_until("b knows bob", || trust_of(&b).recognized_user(&bob));
     // bob, on b, admits c.
-    let c = w.node("c").start();
+    let c = w.node("c").no_user_key().start();
     pair(&b, &c);
     wait_until("a sees c", || a.node_alive("c"));
     assert_eq!(trust_of(&a).view.by_name("c").unwrap().by, "bob");
@@ -2151,7 +2122,6 @@ fn a_second_users_key_signs_until_it_is_removed() {
 fn user_add_takes_a_key_that_starts_with_a_hyphen() {
     let w = World::new();
     let a = w.node("a").start();
-    a.cli_ok(&["user", "init", "--name", "owner"]);
     let dir = tempfile::tempdir().unwrap();
     let keys: Vec<potluck::mesh::PublicKey> = (0..)
         .map(|i| {
@@ -4206,18 +4176,20 @@ fn jobs_only_a_lost_machine_could_run_end_as_lost() {
 }
 
 /// Members forward only what cluster-design.md lists (a job's requests to its owner, a
-/// workspace's to its machine, a removal to a member admitted before the machine removed).
-/// Anything else relayed by a member, such as an admission, is refused: it would have this
-/// machine sign a membership record on another member's word.
+/// workspace's to its machine). Anything else relayed by a member, such as an admission, is
+/// refused: it would have this machine sign a membership record on another member's word. So is
+/// a removal a member on 0.1.1 relays to one admitted before the machine removed for it to sign:
+/// a user signs each removal. Here in a cluster paired before users, where no relayed request
+/// needs a user's signature.
 #[test]
-fn only_job_workspace_and_removal_requests_are_relayed() {
+fn only_job_and_workspace_requests_are_relayed() {
     use potluck::proto::{ClientRequest, ServerResponse, read_msg};
     let w = World::new();
-    let a = w.node("a").start();
-    let b = w.node("b").start();
-    let c = w.node("c").start();
-    pair(&a, &b);
-    pair(&a, &c);
+    let mut a = w.node("a").no_user_key().start();
+    let b = w.node("b").no_user_key().start();
+    let c = w.node("c").no_user_key().start();
+    pair_unsigned(&mut a, &b);
+    pair_unsigned(&mut a, &c);
     wait_until("c sees b", || c.node_alive("b"));
     // c relays to a, with its own keys (as `potluck _tunnel` dials), a request to admit a
     // machine.
@@ -4238,7 +4210,7 @@ fn only_job_workspace_and_removal_requests_are_relayed() {
         let mut r = std::io::BufReader::new(stream);
         read_msg::<_, ServerResponse>(&mut r).unwrap().unwrap().resp
     };
-    let request = w.node("d").start().cli_ok(&["pair"])["text"]
+    let request = w.node("d").no_user_key().start().cli_ok(&["pair"])["text"]
         .as_str()
         .unwrap()
         .to_string();
@@ -4255,26 +4227,24 @@ fn only_job_workspace_and_removal_requests_are_relayed() {
         relay(Request::Get { job: "a-999".into() }),
         Response::Error { message } if message.contains("no job a-999")
     ));
-    // A removal only when a was admitted before the machine removed: never of a, the founder.
-    match relay(Request::Remove {
-        node: "a".into(),
-        removal: None,
-    }) {
-        Response::Error { message } => {
-            assert!(message.contains("a was not admitted before a"), "{message}")
+    // A removal: never, though a was admitted before b.
+    for node in ["a", "b"] {
+        match relay(Request::Remove {
+            node: node.into(),
+            removal: None,
+        }) {
+            Response::Error { message } => assert_eq!(
+                message,
+                format!(
+                    "a signs no removal of {node} that c relays: a user's signed removal removes a machine (`potluck user init` makes the first user)"
+                )
+            ),
+            other => panic!("a relayed removal of {node} was answered: {other:?}"),
         }
-        other => panic!("a relayed removal of the founder was answered: {other:?}"),
     }
-    assert!(matches!(
-        relay(Request::Remove {
-            node: "b".into(),
-            removal: None
-        }),
-        Response::Ok
-    ));
+    assert!(trust_of(&a).view.by_name("b").is_some());
     assert!(
-        a.daemon_log()
-            .contains("cluster: removal of b signed for c"),
+        !a.daemon_log().contains("signed for c"),
         "{}",
         a.daemon_log()
     );
@@ -5539,7 +5509,6 @@ fn upload_pack_serves_the_askers_commits_and_what_they_reach() {
     wait_until("b and c see each other", || {
         b.node_alive("c") && c.node_alive("b")
     });
-    a.cli_ok(&["user", "init", "--name", "owner"]);
     let ended = a.dispatch(&["--on", "node=a", "--", "true"]);
     let ended_repo = a.done(&ended).spec.repo.id;
     // b takes nothing: a's jobs for it stay queued.
@@ -5742,9 +5711,9 @@ fn a_wait_while_the_owner_is_away_takes_no_third_members_word() {
 // ---------------------------------------------------------------------------------------------
 // Signed jobs and pools
 
-/// The user key `node`'s command line holds (user.key beside its node.toml).
+/// The user key `node`'s command line holds ([`Node::key_file`]).
 fn user_key(node: &Node) -> potluck::mesh::user::UserKey {
-    potluck::mesh::user::UserKey::load(&node.dir.join("user.key"))
+    potluck::mesh::user::UserKey::load(&node.key_file())
         .unwrap()
         .unwrap()
 }
@@ -5770,7 +5739,7 @@ fn dispatched(node: &Node, spec: potluck::types::JobSpec) -> Result<String, Stri
     }
 }
 
-/// After `potluck user init` a's command line signs what it dispatches, and a job runs on another
+/// a's command line signs what it dispatches with the user's key, and a job runs on another
 /// member, which checks the signature first; queued again when that runner is lost, the same
 /// signed job runs on a third. A dispatch without a user's signature is refused: from c's command
 /// line, which has no user key, and sent straight to a's daemon. So is a replay of one of a's, and
@@ -5781,7 +5750,6 @@ fn after_user_init_jobs_are_signed_and_checked_where_they_run() {
     let a = w.node("a").start();
     let mut b = w.node("b").cpu("fast").start();
     pair(&a, &b);
-    a.cli_ok(&["user", "init", "--name", "owner"]);
     for n in [&a, &b] {
         wait_until(&format!("{} has the user", n.name), || {
             trust_of(n).users_exist()
@@ -5799,7 +5767,7 @@ fn after_user_init_jobs_are_signed_and_checked_where_they_run() {
     wait_until("a has b's line", || output_of(&a, &job).contains("on b"));
 
     // b is lost: c, admitted since with the user's key, runs the same signed job.
-    let c = w.node("c").cpu("fast").start();
+    let c = w.node("c").cpu("fast").no_user_key().start();
     pair(&a, &c);
     b.stop();
     let j = a.done(&job);
@@ -5873,57 +5841,357 @@ fn after_user_init_jobs_are_signed_and_checked_where_they_run() {
     );
 }
 
-/// Two jobs a dispatched before `user init`, unsigned, that only b runs: one running on b, one
-/// queued behind it. `user init` on a signs neither and says nothing of them; the queued one stays
-/// queued on a once b is free, unsigned: b never claims it.
+/// Until a cluster has a user, `dispatch`, `admit` and `remove` are refused: on a machine in no
+/// cluster, and in a cluster paired before users (as on 0.1.1), whose machines' own records still
+/// make them members. The command line says how to make the first user (exit 2; with --json, the
+/// error document); the daemon takes no dispatch, signed or not, and signs no admission or
+/// removal. Once `potluck user init` has run, each works.
 #[test]
-fn user_init_signs_no_jobs_queued_before_it() {
+fn dispatch_admit_and_remove_need_a_user_first() {
     let w = World::new();
-    let a = w.node("a").start();
-    let b = w.node("b").start();
-    pair(&a, &b);
-    let busy = a.dispatch(&["--on", "node=b", "--exclusive", "--", "sleep", "60"]);
-    a.running_on(&busy, "b");
-    let waits = a.dispatch(&["--on", "node=b", "--", "true"]);
-    assert_eq!(a.get(&waits).state, JobState::Queued);
-    let out = Command::new(BIN)
-        .args(["user", "init", "--name", "owner"])
-        .current_dir(&a.repo)
-        .env("POTLUCK_HOME", &a.paths.home)
-        .env("POTLUCK_CONFIG", &a.paths.config)
+    let alone = w.node("alone").no_user_key().start();
+    let c = w.node("c").no_user_key().start();
+    let request = c.cli_ok(&["pair"])["text"].as_str().unwrap().to_string();
+    let cases: [(&[&str], &str); 3] = [
+        (
+            &["dispatch", "--timeout", "60s", "--", "true"],
+            "a dispatch",
+        ),
+        (&["admit", &request], "an admission"),
+        (&["remove", "b"], "a removal"),
+    ];
+    for (args, what) in cases {
+        let o = alone.cli(args);
+        assert_eq!(o.code, 2, "{args:?}: {}", o.stdout);
+        assert_eq!(
+            error_of(&o),
+            format!(
+                "{what} is signed by a user of a cluster, and this machine is in none yet: `potluck user init` founds one, with this command line's key as its first user"
+            ),
+            "{args:?}"
+        );
+    }
+    let human = Command::new(BIN)
+        .args(["dispatch", "--timeout", "60s", "--", "true"])
+        .current_dir(&alone.repo)
+        .env("POTLUCK_HOME", &alone.paths.home)
+        .env("POTLUCK_CONFIG", &alone.paths.config)
         .output()
         .unwrap();
-    let (stdout, stderr) = (
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr),
-    );
+    assert_eq!(human.status.code(), Some(2));
     assert_eq!(
-        stdout, "owner is the cluster's first user; signed in its members: a, b\n",
-        "{stderr}"
+        String::from_utf8_lossy(&human.stderr),
+        "potluck: a dispatch is signed by a user of a cluster, and this machine is in none yet: `potluck user init` founds one, with this command line's key as its first user\n"
     );
-    assert_eq!(
-        stderr,
-        format!(
-            "potluck: made a user key at {}\n",
-            a.dir.join("user.key").display()
-        )
-    );
-    wait_until("b has the user", || trust_of(&b).users_exist());
-    a.cli_ok(&["cancel", &busy]);
-    a.done(&busy);
-    std::thread::sleep(Duration::from_secs(2));
-    for id in [&busy, &waits] {
-        assert!(a.get(id).spec.auth.is_none(), "{id}");
+    assert!(!alone.dir.join("user.key").exists());
+
+    let mut a = w.node("a").no_user_key().start();
+    let b = w.node("b").no_user_key().start();
+    pair_unsigned(&mut a, &b);
+    for (args, what) in cases {
+        let o = a.cli(args);
+        assert_eq!(o.code, 2, "{args:?}: {}", o.stdout);
+        assert_eq!(
+            error_of(&o),
+            format!(
+                "{what} is signed by a user, and this cluster has no users yet: `potluck user init` makes this command line's key the first user"
+            ),
+            "{args:?}"
+        );
     }
-    let j = a.get(&waits);
+    // Straight to a's daemon.
+    let stranger = tempfile::tempdir().unwrap();
+    let key = potluck::mesh::user::UserKey::load_or_create(&stranger.path().join("k"))
+        .unwrap()
+        .0;
+    let unsigned = potluck::types::JobSpec {
+        submitted_from: "a".into(),
+        ..common::spec(&["true"])
+    };
+    let no_users = "this cluster has no users yet, and a machine takes only a dispatch a user signed: `potluck user init` makes the first user (on a machine in no cluster, it founds one)";
+    for spec in [
+        unsigned.clone(),
+        potluck::jobauth::sign(&unsigned, &key, now_ms()),
+    ] {
+        assert_eq!(dispatched(&a, spec).unwrap_err(), no_users);
+    }
+    let e = a
+        .client()
+        .call(Request::Admit {
+            request: request.clone(),
+            admission: None,
+        })
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        e,
+        "this cluster has no users yet, and only a user's signed admission admits a machine: `potluck user init` makes the first user (on a machine in no cluster, it founds one)"
+    );
+    let e = a
+        .client()
+        .call(Request::Remove {
+            node: "b".into(),
+            removal: None,
+        })
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        e,
+        "this cluster has no users yet, and only a user's signed removal removes a machine: `potluck user init` makes the first user (on a machine in no cluster, it founds one)"
+    );
+    let names = |n: &Node| -> Vec<String> {
+        let mut v: Vec<String> = trust_of(n)
+            .view
+            .members
+            .values()
+            .map(|m| m.node.clone())
+            .collect();
+        v.sort();
+        v
+    };
+    assert_eq!(names(&a), ["a", "b"]);
+    let status = a.cli_ok(&["status"]);
+    assert_eq!(status["queued"], serde_json::json!([]), "{status}");
+
+    // The first user: each works.
+    a.cli_ok(&["user", "init", "--name", "owner"]);
+    wait_until("b has the user", || trust_of(&b).users_exist());
+    let job = a.dispatch(&["--on", "node=b", "--", "true"]);
+    let j = a.done(&job);
     assert_eq!(
         (j.state, j.node.as_deref()),
-        (JobState::Queued, None),
+        (JobState::Succeeded, Some("b")),
         "{j:#?}"
     );
-    assert!(b.exec.launch_of(&waits).is_none());
-    assert!(!b.daemon_log().contains(&waits), "{}", b.daemon_log());
-    a.cli_ok(&["cancel", &waits]);
+    let reply = a.cli_ok(&["admit", &request]);
+    c.cli_ok(&["pair", "--finish", reply["text"].as_str().unwrap()]);
+    wait_until("a and c meet", || a.node_alive("c") && c.node_alive("a"));
+    assert_eq!(a.cli_ok(&["remove", "c"])["final"], true);
+    assert_eq!(names(&a), ["a", "b"]);
+}
+
+/// A job `owner` queued as members did before the cluster had users (0.1.1), no user's signature
+/// on it: `id` at the world's repository commit, running `cmd`, wanting `on`, with priority
+/// `priority`; held as its owner holds it (its ids salted).
+fn unsigned_job(
+    w: &World,
+    owner: &str,
+    id: &str,
+    priority: u8,
+    exclusive: bool,
+    on: &[(&str, &str)],
+    cmd: &[&str],
+) -> JobRecord {
+    let source = w.repo.join(".git");
+    let spec = potluck::types::JobSpec {
+        priority,
+        request: potluck::types::Request {
+            ram_mib: 1024,
+            cpu: 1,
+            gpus: Vec::new(),
+            exclusive,
+        },
+        on: on
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+        repo: RepoRef {
+            id: potluck::types::repo_id(&source),
+            commit: git(&w.repo, &["rev-parse", "HEAD"]),
+            source,
+            branch: Some(BRANCH.into()),
+            submodules: Vec::new(),
+            carried: Vec::new(),
+        },
+        cmd: cmd.iter().map(|c| c.to_string()).collect(),
+        timeout_ms: 60_000,
+        submitted_from: owner.into(),
+        ..common::spec(&[])
+    };
+    JobRecord {
+        id: id.into(),
+        spec: potluck::jobauth::owned(owner, &spec, false),
+        submitted_at: now_ms(),
+        started_at: None,
+        node: None,
+        workspace: None,
+        ..common::job(id, JobState::Queued, None)
+    }
+}
+
+/// Puts `jobs` in `node`'s store, its daemon stopped meanwhile, as jobs it queued before the
+/// cluster had users ([`unsigned_job`]); their commits in its mirror, as their dispatch synced
+/// them.
+fn queued_before_users(node: &mut Node, jobs: &[JobRecord]) {
+    node.stop();
+    let mut store = potluck::store::Store::open(&node.paths.db()).unwrap();
+    for j in jobs {
+        assert!(j.spec.auth.is_none());
+        store.put_job(j).unwrap();
+        node.ws
+            .mirror
+            .lock()
+            .unwrap()
+            .insert((j.spec.repo.id.clone(), j.spec.repo.commit.clone()));
+    }
+    drop(store);
+    node.start();
+}
+
+/// An upgraded cluster: a and b paired before users, and jobs a queued then, no user's signature
+/// on them. a-900 runs on a (exclusive); a-902, which any machine could run, waits behind it on a,
+/// and b, idle, never claims it, nor is it granted to a member that claims it (here a hostile
+/// one, with b's key): only a runs it, once a-900 is cancelled. a-901, for b alone, which a can't
+/// run, stays queued, with b up or lost, and after `user init` (which signs none of them); it
+/// holds back no job: a signed one for b dispatched later runs there. `why` says why it waits,
+/// on a alone; `cancel` ends it.
+#[test]
+fn a_job_queued_before_users_runs_only_where_it_was_dispatched() {
+    let w = World::new();
+    let mut a = w.node("a").no_user_key().start();
+    let mut b = w.node("b").no_user_key().start();
+    pair_unsigned(&mut a, &b);
+    let echo = ["sh", "-c", "echo on $POTLUCK_NODE"];
+    let busy = unsigned_job(&w, "a", "a-900", 5, true, &[], &["sleep", "60"]);
+    let for_b = unsigned_job(&w, "a", "a-901", 3, false, &[("node", "b")], &echo);
+    let any = unsigned_job(&w, "a", "a-902", 3, false, &[], &echo);
+    queued_before_users(&mut a, &[busy, for_b, any]);
+    wait_until("a sees b", || a.node_alive("b") && b.node_alive("a"));
+    a.running_on("a-900", "a");
+    // b plans for a few ticks, a's report in hand.
+    std::thread::sleep(Duration::from_secs(2));
+    for id in ["a-901", "a-902"] {
+        let j = a.get(id);
+        assert_eq!(
+            (j.state, j.node.as_deref()),
+            (JobState::Queued, None),
+            "{id}"
+        );
+        assert!(b.exec.launch_of(id).is_none(), "{id}");
+        assert!(!b.daemon_log().contains(id), "{id}: {}", b.daemon_log());
+    }
+    // A member that claims it anyway is refused.
+    let mesh = client_mesh(&b);
+    let claim = serde_json::json!({
+        "op": "claim",
+        "job": "a-902",
+        "lease": {
+            "grant": {"ram_mib": 1024, "cpu": 1, "gpus": [], "exclusive": false},
+            "granted_at": now_ms(),
+            "deadline": now_ms() + 60_000,
+            "token": "t1",
+        },
+        "workspace": "b-w9",
+    });
+    let r = mesh.call("a", claim).unwrap();
+    mesh.stop();
+    assert_eq!(r["kind"], "refused", "{r}");
+    assert_eq!(
+        r["reason"],
+        "a-902 is not for b: it was dispatched unsigned, before the cluster had users: only the machine it was dispatched on runs it",
+        "{r}"
+    );
+    assert_eq!(a.get("a-902").state, JobState::Queued);
+
+    // b is lost: a-901, which only b could run, is kept.
+    b.stop();
+    wait_until("a counts b lost", || {
+        a.daemon_log().contains("cluster: b is down")
+    });
+    std::thread::sleep(Duration::from_secs(1));
+    assert_eq!(a.get("a-901").state, JobState::Queued, "{}", a.daemon_log());
+    let why = a.cli_ok(&["why", "a-901"]);
+    let lines: Vec<&str> = why["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| l.as_str().unwrap())
+        .collect();
+    assert!(
+        lines.contains(
+            &"it was queued before the cluster had users, and no user signed it: only a, where it was dispatched, may run it (`potluck cancel a-901` ends it)"
+        ),
+        "{lines:?}"
+    );
+    assert!(
+        lines.contains(&"a can't run it: needs node=b (this machine: node=a)"),
+        "{lines:?}"
+    );
+    assert!(
+        !lines
+            .iter()
+            .any(|l| l.contains("b could run it") || l.contains("ends as lost")),
+        "{lines:?}"
+    );
+
+    // The first user: it signs no job, and a-901 still holds nothing back.
+    b.start();
+    wait_until("a sees b again", || a.node_alive("b"));
+    let init = a.cli_ok(&["user", "init", "--name", "owner"]);
+    assert_eq!(init["members"], serde_json::json!(["a", "b"]), "{init}");
+    wait_until("b has the user", || trust_of(&b).users_exist());
+    let signed = a.dispatch(&["--on", "node=b", "--", "true"]);
+    let j = a.done(&signed);
+    assert_eq!(
+        (j.state, j.node.as_deref()),
+        (JobState::Succeeded, Some("b")),
+        "{j:#?}"
+    );
+    for id in ["a-900", "a-901", "a-902"] {
+        assert!(a.get(id).spec.auth.is_none(), "{id}");
+    }
+    assert_eq!(a.get("a-901").state, JobState::Queued);
+    // a-902 runs on a once a is free.
+    a.cli_ok(&["cancel", "a-900"]);
+    let j = a.done("a-902");
+    assert_eq!(
+        (j.state, j.node.as_deref()),
+        (JobState::Succeeded, Some("a")),
+        "{j:#?}"
+    );
+    assert!(output_of(&a, "a-902").contains("on a"));
+    assert!(b.exec.launch_of("a-902").is_none() && b.exec.launch_of("a-901").is_none());
+    let j = a.cli_ok(&["cancel", "a-901"]);
+    assert_eq!(j["record"]["state"], "cancelled", "{j}");
+}
+
+/// c, a member on 0.1.1 in a cluster without users, queues an unsigned job for b and would grant
+/// it: b, on this version, never claims it.
+#[test]
+fn a_runner_never_claims_a_job_no_user_signed() {
+    let w = World::new();
+    let mut a = w.node("a").no_user_key().start();
+    let b = w.node("b").no_user_key().start();
+    let mut c = w.node("c").no_user_key().start();
+    pair_unsigned(&mut a, &b);
+    pair_unsigned(&mut a, &c);
+    wait_until("b and c see each other", || {
+        b.node_alive("c") && c.node_alive("b")
+    });
+    let job = unsigned_job(&w, "c", "c-901", 3, false, &[("node", "b")], &["true"]);
+    b.ws.mirror
+        .lock()
+        .unwrap()
+        .insert((job.spec.repo.id.clone(), job.spec.repo.commit.clone()));
+    let v = serde_json::to_value(&job).unwrap();
+    let mut report = report_to(&b, "c");
+    report["queue"] = Value::Array(vec![v.clone()]);
+    report["seq"] = 0.into();
+    let forger = Arc::new(Forger {
+        report,
+        jobs: [("c-901".to_string(), v)].into(),
+        claims: Mutex::default(),
+    });
+    let mesh = c.impostor(forger.clone());
+    wait_until("b has c's report", || {
+        b.cli_ok(&["status"])["nodes"]
+            .as_array()
+            .is_some_and(|n| n.iter().any(|n| n["facts"]["node"] == "c"))
+    });
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(forger.claims("b", "c-901"), 0, "{}", b.daemon_log());
+    assert!(b.exec.launch_of("c-901").is_none());
+    mesh.stop();
 }
 
 /// A job runs only on machines in the pools its signed spec names, and `nodes` shows each
@@ -5937,7 +6205,6 @@ fn a_job_runs_only_in_its_pools() {
     let a = w.node("a").start();
     let b = w.node("b").start();
     pair(&a, &b);
-    a.cli_ok(&["user", "init", "--name", "owner"]);
     let d = w.node("d").start();
     let request = d.cli_ok(&["pair"])["text"].as_str().unwrap().to_string();
     let reply = a.cli_ok(&["admit", "--pool", "cloud", &request]);
@@ -6164,12 +6431,6 @@ fn a_forged_or_unsigned_job_from_another_owner_is_never_run() {
     wait_until("b and c see each other", || {
         b.node_alive("c") && c.node_alive("b")
     });
-    a.cli_ok(&["user", "init", "--name", "owner"]);
-    for n in [&a, &b, &c] {
-        wait_until(&format!("{} has the user", n.name), || {
-            trust_of(n).users_exist()
-        });
-    }
     let user = user_key(&a);
     let theirs = a.dispatch(&["--on", "node=b", "--", "true"]);
     assert_eq!(a.done(&theirs).state, JobState::Succeeded);
@@ -6278,7 +6539,7 @@ fn a_grant_unlike_the_queue_entry_claimed_is_never_run() {
     wait_until("b and c see each other", || {
         b.node_alive("c") && c.node_alive("b")
     });
-    init_users(&a, &[&a, &b, &c]);
+    users_admitted(&[&a, &b, &c]);
     let user = user_key(&a);
     let theirs = a.dispatch(&["--on", "node=b", "--", "true"]);
     assert_eq!(a.done(&theirs).state, JobState::Succeeded);
@@ -6364,10 +6625,8 @@ fn a_grant_unlike_the_queue_entry_claimed_is_never_run() {
     mesh.stop();
 }
 
-/// `potluck user init` on `first`, and every member of `all` holding the first user's admission
-/// of each.
-fn init_users(first: &Node, all: &[&Node]) {
-    first.cli_ok(&["user", "init", "--name", "owner"]);
+/// Every member of `all` holding the first user's admission of each.
+fn users_admitted(all: &[&Node]) {
     for n in all {
         wait_until(&format!("{} has the first user", n.name), || {
             let t = trust_of(n);
@@ -6376,13 +6635,6 @@ fn init_users(first: &Node, all: &[&Node]) {
                 && t.view.members.values().all(|m| m.by_user())
         });
     }
-}
-
-/// The user key `user init` made beside `node`'s node.toml.
-fn user_key_of(node: &Node) -> potluck::mesh::user::UserKey {
-    potluck::mesh::user::UserKey::load(&node.dir.join("user.key"))
-        .unwrap()
-        .unwrap()
 }
 
 /// What `to` answers first to `req` with `auth`, which the member `mesh` runs as relays to it.
@@ -6423,15 +6675,15 @@ fn after_user_init_a_relayed_request_needs_a_users_signature() {
     use potluck::proto::RequestAuth;
     let w = World::new();
     let a = w.node("a").start();
-    let b = w.node("b").start();
-    let c = w.node("c").start();
+    let b = w.node("b").no_user_key().start();
+    let c = w.node("c").no_user_key().start();
     pair(&a, &b);
     pair(&a, &c);
     wait_until("b and c see each other", || {
         b.node_alive("c") && c.node_alive("b")
     });
-    init_users(&a, &[&a, &b, &c]);
-    let user = user_key_of(&a);
+    users_admitted(&[&a, &b, &c]);
+    let user = user_key(&a);
 
     // b's jobs and workspace (dispatched on b with the user's key), from the user's command line
     // on a.
@@ -6779,7 +7031,6 @@ fn a_relayed_answer_too_long_is_dropped_at_its_limit() {
     let a = w.node("a").start();
     let mut b = w.node("b").start();
     pair(&a, &b);
-    init_users(&a, &[&a, &b]);
     let overlong = Arc::new(Overlong::default());
     let mesh = b.impostor(overlong.clone());
 
@@ -6835,7 +7086,6 @@ fn kept_files_with_a_message_too_long_are_dropped_at_its_limit() {
     let a = w.node("a").start();
     let mut b = w.node("b").start();
     pair(&a, &b);
-    init_users(&a, &[&a, &b]);
     let mesh = b.impostor(Arc::new(Scripted::default()));
     let job = a.dispatch(&["--on", "node=b", "--keep", "out/**", "--", "true"]);
     let claim = serde_json::json!({
@@ -6870,8 +7120,8 @@ fn kept_files_with_a_message_too_long_are_dropped_at_its_limit() {
 }
 
 /// A cancel that a member relays to the machine running a job for another owner goes to that
-/// owner, which cancels it as it does any of its jobs running elsewhere: not around it. So in a
-/// cluster without users, and with users once a user signed it.
+/// owner, which cancels it as it does any of its jobs running elsewhere: not around it; once a
+/// user signed it.
 #[test]
 fn a_cancel_relayed_to_the_runner_of_another_owners_job_goes_to_its_owner() {
     use potluck::proto::RequestAuth;
@@ -6908,12 +7158,8 @@ fn a_cancel_relayed_to_the_runner_of_another_owners_job_goes_to_its_owner() {
         );
     };
 
-    let first = a.dispatch(&["--on", "node=b", "--", "sleep", "30"]);
-    a.running_on(&first, "b");
-    cancelled_through_a(&first, &|_| None);
-
-    init_users(&a, &[&a, &b, &c]);
-    let user = user_key_of(&a);
+    users_admitted(&[&a, &b, &c]);
+    let user = user_key(&a);
     let second = a.dispatch(&["--on", "node=b", "--", "sleep", "30"]);
     a.running_on(&second, "b");
     let cancel = Request::Cancel {
@@ -6942,8 +7188,8 @@ fn a_member_answers_a_relayed_request_only_about_its_own_jobs_and_workspaces() {
     wait_until("b and c see each other", || {
         b.node_alive("c") && c.node_alive("b")
     });
-    init_users(&a, &[&a, &b, &c]);
-    let user = user_key_of(&a);
+    users_admitted(&[&a, &b, &c]);
+    let user = user_key(&a);
     let ran = a.dispatch(&["--on", "node=b", "--", "sh", "-c", "echo secret"]);
     a.done(&ran);
     assert_eq!(output_of(&b, &ran), "secret\n");
@@ -7108,7 +7354,19 @@ fn a_resize_lowers_a_queued_jobs_request_where_it_stands() {
     );
     let mut want = before.spec.clone();
     want.request.ram_mib = 5 << 10;
-    assert_eq!(after.spec, want, "only the request changed");
+    let unsigned = |spec: &potluck::types::JobSpec| potluck::types::JobSpec {
+        auth: None,
+        ..spec.clone()
+    };
+    assert_eq!(
+        unsigned(&after.spec),
+        unsigned(&want),
+        "only the request changed"
+    );
+    // Signed again, by the user, with its new request.
+    let auth = after.spec.auth.as_ref().unwrap();
+    assert_ne!(Some(auth), before.spec.auth.as_ref());
+    assert_eq!(potluck::jobauth::open(auth).unwrap(), unsigned(&after.spec));
     wait_until("b sees the new request", || {
         queued_on(&b) == [(first.clone(), 5 << 10), (behind.clone(), 1 << 10)]
     });
@@ -7251,10 +7509,10 @@ fn with_users_a_resized_job_is_signed_and_its_runner_runs_it() {
     let w = World::new();
     let a = w.node("a").start();
     let b = w.node("b").start();
-    let c = w.node("c").start();
+    let c = w.node("c").no_user_key().start();
     pair(&a, &b);
     pair(&a, &c);
-    init_users(&a, &[&a, &b, &c]);
+    users_admitted(&[&a, &b, &c]);
     let user = user_key(&a);
     let busy = a.dispatch(&["--on", "node=b", "--ram", "4", "--", "sleep", "60"]);
     a.running_on(&busy, "b");

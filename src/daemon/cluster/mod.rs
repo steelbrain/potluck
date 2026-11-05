@@ -1454,7 +1454,7 @@ pub(crate) fn membership(
         Request::Admit { request, admission } => {
             // This machine signs no admission with its machine key: a user signs each one.
             let Some(admission) = admission else {
-                return Err(unsigned_membership(c, "an admission", "admits a machine"));
+                return Err(unsigned_membership(c, "admission", "admits", "admit"));
             };
             // The founder's first admission: it listens before it answers, so the reply says
             // where; if nobody is admitted after all, it stops again.
@@ -1511,7 +1511,7 @@ pub(crate) fn membership(
         Request::Remove { node, removal } => {
             // Nor any removal: a user signs each one.
             let Some(removal) = removal else {
-                return Err(unsigned_membership(c, "a removal", "removes a machine"));
+                return Err(unsigned_membership(c, "removal", "removes", "remove"));
             };
             {
                 // Not while the mesh is being replaced, as for PairRequest: made on the mesh
@@ -1570,15 +1570,16 @@ pub(crate) fn membership(
     }
 }
 
-/// Why `what` ("an admission", "a removal") that no user signed is refused here: only a user's
-/// signed one `does` ("admits a machine"), and this machine signs none with its machine key.
-fn unsigned_membership(c: &Cluster, what: &str, does: &str) -> String {
+/// Why an admission or a removal (`what`) that no user signed is refused here: only a user's
+/// signed one `does` ("admits") a machine, and this machine signs none with its machine key.
+/// `command`: what the command line runs to sign one.
+fn unsigned_membership(c: &Cluster, what: &str, does: &str, command: &str) -> String {
     match c.mesh().users_exist() {
         true => format!(
-            "this cluster has users: only a user's signed admission or removal {does} (the command line signs {what} with its user key)"
+            "this cluster has users: only a user's signed {what} {does} a machine (`potluck {command}` where a user's key is)"
         ),
         false => format!(
-            "this cluster has no users yet, and only a user's signed admission or removal {does}: `potluck user init` makes the first user (on a machine in no cluster, it founds one)"
+            "this cluster has no users yet, and only a user's signed {what} {does} a machine: `potluck user init` makes the first user (on a machine in no cluster, it founds one)"
         ),
     }
 }
@@ -1634,6 +1635,7 @@ pub(crate) fn remote_workspace(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mesh::user::UserKey;
     use crate::types::JobRecord;
 
     struct NoCalls;
@@ -1756,9 +1758,29 @@ mod tests {
         crate::daemon::Daemon::start_cluster(&paths, &config, parts, opts, cluster).unwrap()
     }
 
-    /// A job record `id` in `state` on `node`, with lease `token`; no machine but `node` can run
-    /// it (`--on node=...`).
+    /// A user's key, as signs the jobs these tests make (a job another machine runs is signed;
+    /// its owner checked whose at the dispatch).
+    fn a_user() -> UserKey {
+        let dir = tempfile::tempdir().unwrap();
+        UserKey::load_or_create(&dir.path().join("user.key"))
+            .unwrap()
+            .0
+    }
+
+    /// A job record `id` in `state` on `node`, with lease `token`, signed by a user; no machine
+    /// but `node` can run it (`--on node=...`).
     fn job_on(id: &str, state: crate::types::JobState, node: &str, token: &str) -> JobRecord {
+        job_signed_by(id, state, node, token, &a_user())
+    }
+
+    /// [`job_on`], signed by the user `key`.
+    fn job_signed_by(
+        id: &str,
+        state: crate::types::JobState,
+        node: &str,
+        token: &str,
+        key: &UserKey,
+    ) -> JobRecord {
         let spec = crate::types::JobSpec {
             key: None,
             labels: BTreeMap::new(),
@@ -1788,6 +1810,7 @@ mod tests {
             pools: Vec::new(),
             auth: None,
         };
+        let spec = crate::jobauth::sign(&spec, key, now());
         let mut j = crate::daemon::runner::new_record(id.into(), spec, now());
         j.state = state;
         j.node = Some(node.into());
@@ -1828,18 +1851,8 @@ mod tests {
         cfg.listen = "127.0.0.1:0".parse().unwrap();
         cfg.address = Some("127.0.0.1".into());
         let b = Mesh::start(cfg, Arc::new(NoCalls)).unwrap();
-        let request = b.pair_request().unwrap();
-        let reply = match membership(
-            &sh,
-            &c,
-            &crate::proto::Request::Admit {
-                request,
-                admission: None,
-            },
-        ) {
-            Ok(crate::proto::Response::Text { text }) => text,
-            other => panic!("{other:?}"),
-        };
+        let key = first_user(&sh, &c, dir);
+        let reply = admit(&sh, &c, &key, b.pair_request().unwrap());
         b.pair_finish(&reply).unwrap();
         let start = std::time::Instant::now();
         while !c.alive("b") {
@@ -1847,6 +1860,67 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         }
         (d, b)
+    }
+
+    /// The cluster's first user ("owner"), made on this daemon as `potluck user init` makes it;
+    /// its key at `dir`/user.key, beside node.toml, where the command line looks.
+    fn first_user(sh: &Arc<Shared>, c: &Arc<Cluster>, dir: &Path) -> UserKey {
+        let key = UserKey::load_or_create(&dir.join("user.key")).unwrap().0;
+        let m = c.mesh().membership();
+        match membership(sh, c, &crate::cli::first_user(&m, &key, "owner")) {
+            Ok(crate::proto::Response::Ok) => key,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The user key [`first_user`] made in `dir`.
+    fn user_key(dir: &Path) -> UserKey {
+        UserKey::load(&dir.join("user.key")).unwrap().unwrap()
+    }
+
+    /// The first user ("owner", `key`) of the cluster the bare mesh `m` is alone in, as `potluck
+    /// user init` there makes it.
+    fn first_user_of(m: &Mesh, key: &UserKey) {
+        match crate::cli::first_user(&m.membership(), key, "owner") {
+            crate::proto::Request::UserInit {
+                genesis,
+                admissions,
+            } => m.user_init(*genesis, admissions).unwrap(),
+            other => unreachable!("{other:?}"),
+        }
+    }
+
+    /// The admission `potluck admit` signs with the user `key` ("owner") of the machine that made
+    /// `request`, in the cluster `on` is in.
+    fn admission(on: &Mesh, key: &UserKey, request: &str) -> crate::mesh::Admission {
+        let req = crate::mesh::trust::PairRequest::from_text(request).unwrap();
+        crate::mesh::Admission::sign_by_user(
+            key,
+            "owner",
+            &req.name,
+            req.key,
+            &req.address,
+            crate::mesh::trust::DEFAULT_POOL,
+            &req.nonce,
+            on.membership().next_clock,
+        )
+    }
+
+    /// The removal `potluck remove` signs with the user `key` ("owner") of `node`, in the cluster
+    /// `on` is in.
+    fn removal(on: &Mesh, key: &UserKey, node: &str) -> crate::mesh::Removal {
+        let m = on.membership();
+        let target = m.members.iter().chain(&m.removed).find(|e| e.name == node);
+        crate::mesh::Removal::sign_by_user(key, "owner", node, target.unwrap().key, m.next_clock)
+    }
+
+    /// `potluck admit` here, signed with the user `key`: the reply to `request`.
+    fn admit(sh: &Arc<Shared>, c: &Arc<Cluster>, key: &UserKey, request: String) -> String {
+        let admission = Some(Box::new(admission(&c.mesh(), key, &request)));
+        match membership(sh, c, &crate::proto::Request::Admit { request, admission }) {
+            Ok(crate::proto::Response::Text { text }) => text,
+            other => panic!("{other:?}"),
+        }
     }
 
     /// `b` calls the daemon with a peer request.
@@ -2368,28 +2442,18 @@ mod tests {
     /// remove at a time: a mesh of 30 holds about a thousand connections.
     #[test]
     fn a_removal_asked_while_the_mesh_is_replaced_holds() {
-        use crate::proto::{Request, Response};
+        use crate::proto::Request;
         const N: usize = 12;
         let dir = tempfile::tempdir().unwrap();
         let (d, b) = daemon_with_b(dir.path());
         let sh = d.shared.clone();
         let c = sh.cluster().unwrap();
+        let key = user_key(dir.path());
         let mut kept = Vec::new();
         for i in 0..N {
             let name = format!("m{i}");
             let m = bare_mesh(dir.path(), &name);
-            let request = m.pair_request().unwrap();
-            let reply = match membership(
-                &sh,
-                &c,
-                &Request::Admit {
-                    request,
-                    admission: None,
-                },
-            ) {
-                Ok(Response::Text { text }) => text,
-                other => panic!("{other:?}"),
-            };
+            let reply = admit(&sh, &c, &key, m.pair_request().unwrap());
             m.pair_finish(&reply).unwrap();
             let go = Arc::new(std::sync::Barrier::new(2));
             let swap = {
@@ -2405,7 +2469,7 @@ mod tests {
                 &c,
                 &Request::Remove {
                     node: name.clone(),
-                    removal: None,
+                    removal: Some(Box::new(removal(&c.mesh(), &key, &name))),
                 },
             ) {
                 Ok(_) => {}
@@ -2448,7 +2512,13 @@ mod tests {
                 other => panic!("{other:?}"),
             };
             let b = bare_mesh(dir.path(), "b");
-            let reply = b.admit(&request).unwrap();
+            let key = UserKey::load_or_create(&dir.path().join("user.key"))
+                .unwrap()
+                .0;
+            first_user_of(&b, &key);
+            let reply = b
+                .admit_signed(&request, Some(admission(&b, &key, &request)))
+                .unwrap();
             let go = Arc::new(std::sync::Barrier::new(2));
             let swap = {
                 let (sh, c, go) = (sh.clone(), c.clone(), go.clone());
@@ -2481,7 +2551,9 @@ mod tests {
         let (d, b) = daemon_with_b(dir.path());
         let sh = d.shared.clone();
         let c = sh.cluster().unwrap();
-        b.remove("lone").unwrap();
+        let user = user_key(dir.path());
+        b.remove_signed("lone", Some(removal(&b, &user, "lone")))
+            .unwrap();
         let start = std::time::Instant::now();
         while c.cs().out.is_none() {
             assert!(start.elapsed() < Duration::from_secs(30), "never out");
@@ -2495,7 +2567,9 @@ mod tests {
             .unwrap()
             .key;
         assert_eq!(c.mesh().key(), key);
-        let reply = b.admit(&request).unwrap();
+        let reply = b
+            .admit_signed(&request, Some(admission(&b, &user, &request)))
+            .unwrap();
         match membership(&sh, &c, &Request::PairFinish { reply }) {
             Ok(Response::Text { text }) => assert!(text.starts_with("joined"), "{text}"),
             other => panic!("{other:?}"),
@@ -2514,7 +2588,9 @@ mod tests {
         let (d, b) = daemon_with_b(dir.path());
         let sh = d.shared.clone();
         let c = sh.cluster().unwrap();
-        b.remove("lone").unwrap();
+        let key = user_key(dir.path());
+        b.remove_signed("lone", Some(removal(&b, &key, "lone")))
+            .unwrap();
         let start = std::time::Instant::now();
         while c.cs().out.is_none() {
             assert!(start.elapsed() < Duration::from_secs(30), "never out");
@@ -2524,7 +2600,9 @@ mod tests {
             Ok(Response::Text { text }) => text,
             other => panic!("{other:?}"),
         };
-        let reply = b.admit(&request).unwrap();
+        let reply = b
+            .admit_signed(&request, Some(admission(&b, &key, &request)))
+            .unwrap();
         // What `pair --finish` does first, then the loop's turn before it says it joined.
         c.mesh().pair_finish(&reply).unwrap();
         back_in(&sh, &c);
@@ -2545,7 +2623,9 @@ mod tests {
         let (d, b) = daemon_with_b(dir.path());
         let sh = d.shared.clone();
         let c = sh.cluster().unwrap();
-        b.remove("lone").unwrap();
+        let key = user_key(dir.path());
+        b.remove_signed("lone", Some(removal(&b, &key, "lone")))
+            .unwrap();
         let start = std::time::Instant::now();
         while c.cs().out.is_none() {
             assert!(start.elapsed() < Duration::from_secs(30), "never out");
@@ -2567,18 +2647,9 @@ mod tests {
         cfg.listen = "127.0.0.1:0".parse().unwrap();
         cfg.address = Some("127.0.0.1".into());
         let e = Mesh::start(cfg, Arc::new(NoCalls)).unwrap();
-        let request = e.pair_request().unwrap();
-        let reply = match membership(
-            &sh,
-            &c,
-            &Request::Admit {
-                request,
-                admission: None,
-            },
-        ) {
-            Ok(Response::Text { text }) => text,
-            other => panic!("{other:?}"),
-        };
+        // `potluck user init` founds the new cluster, then `potluck admit`.
+        let key = first_user(&sh, &c, dir.path());
+        let reply = admit(&sh, &c, &key, e.pair_request().unwrap());
         e.pair_finish(&reply).unwrap();
         let start = std::time::Instant::now();
         while !c.alive("e") {
@@ -3058,7 +3129,12 @@ mod tests {
         cfg.listen = "127.0.0.1:0".parse().unwrap();
         cfg.address = Some("127.0.0.1".into());
         let b = Mesh::start(cfg, Arc::new(NoCalls)).unwrap();
-        let reply = c.mesh().admit(&b.pair_request().unwrap()).unwrap();
+        let key = first_user(&d.shared, &c, dir.path());
+        let request = b.pair_request().unwrap();
+        let reply = c
+            .mesh()
+            .admit_signed(&request, Some(admission(&c.mesh(), &key, &request)))
+            .unwrap();
         b.pair_finish(&reply).unwrap();
         let swaps = || c.events_gen.load(Ordering::SeqCst);
         let start = std::time::Instant::now();
@@ -3169,7 +3245,9 @@ mod tests {
         let (d, b) = daemon_with_b(dir.path());
         let sh = d.shared.clone();
         let c = sh.cluster().unwrap();
-        let mut ran = job_on("b-1", JobState::Succeeded, "lone", "t1");
+        // b's job, signed by the cluster's user: this machine may run it.
+        let user = user_key(dir.path());
+        let mut ran = job_signed_by("b-1", JobState::Succeeded, "lone", "t1", &user);
         ran.exit_code = Some(0);
         ran.ended_at = Some(now());
         {
@@ -3177,7 +3255,7 @@ mod tests {
             st.jobs.insert("b-1".into(), ran.clone());
             st.save_job("b-1");
         }
-        let mut queued = job_on("b-1", JobState::Queued, "lone", "t1");
+        let mut queued = job_signed_by("b-1", JobState::Queued, "lone", "t1", &user);
         (queued.node, queued.lease) = (None, None);
         let rc = (queued.spec.repo.id.clone(), queued.spec.repo.commit.clone());
         let push = |seq: u64, queue: Vec<JobRecord>| {

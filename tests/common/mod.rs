@@ -4,7 +4,11 @@
 #![allow(dead_code)]
 
 use potluck::config::Paths;
-use potluck::proto::{ClientRequest, Response, ServerResponse, read_msg, write_msg};
+use potluck::mesh::user::UserKey;
+use potluck::mesh::{MemberEntry, MembershipView, UserEntry};
+use potluck::proto::{
+    ClientRequest, Request as ProtoRequest, Response, ServerResponse, read_msg, write_msg,
+};
 use potluck::types::{
     JobRecord, JobSpec, JobState, Reminder, RepoRef, Request, Usage, WorkspaceState,
 };
@@ -73,13 +77,124 @@ pub struct FakeDaemon {
     thread: Option<JoinHandle<()>>,
 }
 
+/// The name of the user [`FakeDaemon::start`] makes, and the tests' first user.
+pub const USER: &str = "owner";
+
+/// What a daemon of a cluster says of its membership ([`Request::Membership`]): machine
+/// "studio", with "old-box" a member too, and with `user`, a user named [`USER`] (None: a
+/// cluster without users).
+pub fn membership(user: Option<&UserKey>) -> MembershipView {
+    let me = user.map_or_else(
+        || {
+            let dir = tempfile::tempdir().unwrap();
+            UserKey::load_or_create(&dir.path().join("k"))
+                .unwrap()
+                .0
+                .public()
+        },
+        |k| k.public(),
+    );
+    MembershipView {
+        node: "studio".into(),
+        key: me,
+        cluster: me,
+        member: true,
+        next_clock: 2,
+        users_exist: user.is_some(),
+        members: ["studio", "old-box"]
+            .into_iter()
+            .map(|name| MemberEntry {
+                name: name.into(),
+                key: me,
+                address: format!("{name}:7465"),
+                pool: "default".into(),
+            })
+            .collect(),
+        users: user
+            .map(|k| UserEntry {
+                name: USER.into(),
+                key: k.public(),
+                by: USER.into(),
+                at: 1,
+                signed: Vec::new(),
+            })
+            .into_iter()
+            .collect(),
+        removed: Vec::new(),
+        elders: Vec::new(),
+    }
+}
+
+/// A pairing request, as `potluck pair` prints it on machine `name`.
+pub fn pair_request(name: &str) -> String {
+    let dir = tempfile::tempdir().unwrap();
+    let key = UserKey::load_or_create(&dir.path().join("k")).unwrap().0;
+    potluck::mesh::trust::PairRequest {
+        v: 1,
+        name: name.into(),
+        key: key.public(),
+        address: format!("{name}:7465"),
+        version: potluck::VERSION.into(),
+        nonce: "n0nce-0123456789abcdef".into(),
+    }
+    .to_text()
+}
+
+/// Makes this cluster's first user as a person does, with `potluck user init` (the binary, on
+/// the daemon at `paths`): its key is user.key beside the node.toml, where the command line
+/// finds it. Returns that file.
+pub fn user_init(paths: &Paths) -> PathBuf {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_potluck"))
+        .args(["--json", "user", "init", "--name", USER])
+        .env("POTLUCK_HOME", &paths.home)
+        .env("POTLUCK_CONFIG", &paths.config)
+        .env_remove("POTLUCK_JOB")
+        .env_remove("POTLUCK_LEASE")
+        .env_remove("POTLUCK_WORKSPACE")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "potluck user init: {}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    paths.config.with_file_name("user.key")
+}
+
 impl FakeDaemon {
-    /// Listens on `<temp POTLUCK_HOME>/potluck.sock`; every response carries `reminders`.
+    /// Listens on `<temp POTLUCK_HOME>/potluck.sock`; every response carries `reminders`. It is
+    /// the daemon of a cluster with a user, whose key is user.key there, beside node.toml, where
+    /// the command line finds it: it answers [`Request::Membership`] itself ([`membership`]),
+    /// and `handler` every other request.
     pub fn start(
         reminders: Vec<Reminder>,
         handler: impl Fn(&ClientRequest, &mut Conn) + Send + Sync + 'static,
     ) -> FakeDaemon {
+        FakeDaemon::start_with(true, reminders, handler)
+    }
+
+    /// [`FakeDaemon::start`] of a cluster without users, and no user key.
+    pub fn without_users(
+        reminders: Vec<Reminder>,
+        handler: impl Fn(&ClientRequest, &mut Conn) + Send + Sync + 'static,
+    ) -> FakeDaemon {
+        FakeDaemon::start_with(false, reminders, handler)
+    }
+
+    fn start_with(
+        users: bool,
+        reminders: Vec<Reminder>,
+        handler: impl Fn(&ClientRequest, &mut Conn) + Send + Sync + 'static,
+    ) -> FakeDaemon {
         let dir = tempfile::tempdir().unwrap();
+        let user = users.then(|| {
+            UserKey::load_or_create(&dir.path().join("user.key"))
+                .unwrap()
+                .0
+        });
+        let view = membership(user.as_ref());
         let listener = UnixListener::bind(dir.path().join("potluck.sock")).unwrap();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
@@ -92,8 +207,12 @@ impl FakeDaemon {
                         break;
                     }
                     let Ok(mut stream) = stream else { continue };
-                    let (requests, handler, reminders) =
-                        (requests.clone(), handler.clone(), reminders.clone());
+                    let (requests, handler, reminders, view) = (
+                        requests.clone(),
+                        handler.clone(),
+                        reminders.clone(),
+                        view.clone(),
+                    );
                     std::thread::spawn(move || {
                         let mut reader = BufReader::new(stream.try_clone().unwrap());
                         while let Ok(Some(req)) = read_msg::<_, ClientRequest>(&mut reader) {
@@ -102,7 +221,12 @@ impl FakeDaemon {
                                 stream: &mut stream,
                                 reminders: reminders.clone(),
                             };
-                            handler(&req, &mut conn);
+                            match &req.req {
+                                ProtoRequest::Membership => conn.send(Response::Membership {
+                                    membership: Box::new(view.clone()),
+                                }),
+                                _ => handler(&req, &mut conn),
+                            }
                         }
                     });
                 }

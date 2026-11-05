@@ -980,6 +980,54 @@ fn a_machine_plans_without_the_jobs_it_cannot_take_yet() {
     );
 }
 
+/// A job only one machine may run (no user signed it: it was queued before the cluster had users)
+/// is explained on that machine alone: not by the others, one of which could run it, nor by what
+/// no machine has.
+#[test]
+fn a_job_only_one_machine_may_run_is_explained_on_it_alone() {
+    let mut w = World::new(vec![
+        Machine::new("studio", 48, vec![]),
+        Machine::new("msi", 64, vec![]),
+    ]);
+    w.queue(job("q").ram(56));
+    let views: Vec<MachineView> = w.machines.iter().map(|m| m.view()).collect();
+    let snap = Snapshot {
+        now: NOW,
+        machines: &views,
+        jobs: &w.jobs,
+        queue: &w.queue,
+        reservation: None,
+    };
+    let (none, held): (BTreeMap<String, String>, BTreeMap<String, BTreeSet<String>>) =
+        Default::default();
+    let waits = |only| Waits {
+        unsynced: &none,
+        locality: &none,
+        catch_up: &none,
+        held_out: &held,
+        only,
+    };
+    let why = explain_waits("q", &snap, &waits(Some("studio")));
+    has(
+        &why,
+        "studio can't run it: needs 56 GiB RAM, its capacity is 48 GiB",
+    );
+    assert!(
+        !why.lines
+            .iter()
+            .any(|l| l.contains("msi") || l.starts_with("no machine")),
+        "{:?}",
+        why.lines
+    );
+    // Any machine may: msi can start it now.
+    let why = explain_waits("q", &snap, &waits(None));
+    assert!(
+        why.lines.iter().any(|l| l.contains("msi")),
+        "{:?}",
+        why.lines
+    );
+}
+
 /// A signal from a peer's record or the store can be anything: the exit code `wait` and `why`
 /// give saturates instead of overflowing.
 #[test]
