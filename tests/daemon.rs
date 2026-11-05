@@ -1500,8 +1500,8 @@ fn resized(f: &Fixture, job: &str, ram_mib: u64) -> Result<(JobRecord, u64), Str
 
 /// A resize lowers a queued job's RAM request where it stands in line: its priority, passes,
 /// submit time and id stay, so the job dispatched after it, which fits but may not jump the line,
-/// stays behind it; once its request fits, it starts, and then the one behind it. The same amount
-/// changes nothing; more, or a job that runs or has ended, is refused.
+/// stays behind it; once its request fits, it runs, and so does the one behind it, which waited
+/// until then. The same amount changes nothing; more, or a job that runs or has ended, is refused.
 #[test]
 fn resize_lowers_a_queued_jobs_request_in_place() {
     let f = Fixture::new().start();
@@ -1574,7 +1574,9 @@ fn resize_lowers_a_queued_jobs_request_in_place() {
     assert_eq!(e, "no job testnode-999");
     assert_eq!(f.get(&first).spec.request.ram_mib, 5 << 10);
 
-    // 2 GiB fits: it starts, and the job behind it after it.
+    // 2 GiB fits: it runs, and the one behind it, which waited its turn until then.
+    assert_eq!(f.get(&behind).state, JobState::Queued);
+    let resized_at = now_ms();
     resized(&f, &first, 2 << 10).unwrap();
     let a = f.wait(&first);
     let b = f.wait(&behind);
@@ -1582,7 +1584,16 @@ fn resize_lowers_a_queued_jobs_request_in_place() {
         (a.state, b.state),
         (JobState::Succeeded, JobState::Succeeded)
     );
-    assert!(a.started_at <= b.started_at, "{a:#?}\n{b:#?}");
+    // Both reserved only after the resize: the one behind waited behind the first until then.
+    // Granted in one plan, the two may start in either order.
+    for j in [&a, &b] {
+        let granted = j.lease.as_ref().map(|l| l.granted_at);
+        assert!(
+            granted.is_some_and(|t| t >= resized_at),
+            "{}: reserved at {granted:?}, resized at {resized_at}",
+            j.id
+        );
+    }
     assert_eq!(a.lease.map(|l| l.grant.ram_mib), Some(2 << 10));
     assert_eq!(f.exec.launched(&first).mem_max, 2 << 30);
     let e = resized(&f, &first, 1 << 10).unwrap_err();
