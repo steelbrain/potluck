@@ -171,6 +171,14 @@ struct PeerState {
     last_error: Option<String>,
     /// When [`Event::Unreachable`] was last said of it.
     unreachable_said: Option<Instant>,
+    /// When it last reached this machine: a connection or a request from it.
+    reached_us: Option<Instant>,
+    /// When the last heartbeat to it failed to reach it ([`MeshError::Unreachable`]), while
+    /// they fail so.
+    unreachable_at: Option<Instant>,
+    /// Heartbeats in a row that failed to reach it, each after it reached this machine since
+    /// the one before.
+    one_way: u32,
 }
 
 impl PeerState {
@@ -185,6 +193,9 @@ impl PeerState {
             mismatch_since: None,
             last_error: None,
             unreachable_said: None,
+            reached_us: None,
+            unreachable_at: None,
+            one_way: 0,
         }
     }
 }
@@ -1263,6 +1274,9 @@ impl Inner {
                     // Not handed over: the next heartbeat says it again.
                     last_error: None,
                     unreachable_said: None,
+                    reached_us: None,
+                    unreachable_at: None,
+                    one_way: 0,
                 },
             );
         }
@@ -1662,6 +1676,13 @@ impl Inner {
     fn on_hello(&self, key: PublicKey, hello: &Hello) {
         self.note_address(key, hello);
         self.mark_seen(key, &hello.node, Some(&hello.version));
+    }
+
+    /// Notes that member `key` reached this machine: a connection or a request from it.
+    fn reached_us(&self, key: PublicKey) {
+        if let Some(p) = lock(&self.peers).get_mut(&key) {
+            p.reached_us = Some(Instant::now());
+        }
     }
 
     /// The address a member gave in its hello (also when its version differs: the newer side
@@ -2230,6 +2251,7 @@ impl Inner {
         self.hello_done(&reg);
         slot.release();
         self.on_hello(key, &ch.hello);
+        self.reached_us(key);
         if ch.hello.digest == lock(&self.trust).digest() {
             self.compared(key);
         }
@@ -2342,6 +2364,7 @@ impl Inner {
                 return;
             }
             self.mark_seen(peer.key, &peer.name, None);
+            self.reached_us(peer.key);
             let reply = match frame {
                 Frame::Call { body } => match self.handler.call(peer, body) {
                     Ok(body) => Reply::Ok { body },
@@ -2425,11 +2448,30 @@ impl Inner {
         let mut unreachable = None;
         if let Some(p) = lock(&self.peers).get_mut(&t.key) {
             p.last_error = pong.as_ref().err().map(|e| e.to_string());
-            // Up, so it reaches this machine, but this machine can't reach it: nothing else
+            if matches!(pong, Err(MeshError::Unreachable { .. })) {
+                let reached = p
+                    .unreachable_at
+                    .zip(p.reached_us)
+                    .is_some_and(|(failed, reached)| reached > failed);
+                p.one_way = if reached {
+                    p.one_way.saturating_add(1)
+                } else {
+                    0
+                };
+                p.unreachable_at = Some(Instant::now());
+            } else {
+                p.unreachable_at = None;
+                p.one_way = 0;
+            }
+            // It keeps reaching this machine, but this machine can't reach it: nothing else
             // shows that (on macOS, Local Network privacy can block the daemon's own
-            // connections and nothing else).
+            // connections and nothing else). Not a member that stopped, up until the down time
+            // (a request it sent as it stopped can come in after a heartbeat failed), nor one
+            // that answers on another version, nor one back from sleep as a heartbeat to it
+            // fails.
             if let Some(why) = &p.last_error
                 && p.up == Some(true)
+                && p.one_way >= 2
                 && p.unreachable_said
                     .is_none_or(|at| at.elapsed() >= UNREACHABLE_EVERY)
             {

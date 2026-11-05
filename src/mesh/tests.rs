@@ -643,6 +643,38 @@ fn a_member_up_but_out_of_reach_is_said() {
     assert!(a.member("b").unwrap().alive);
 }
 
+/// A member that answers on another version, or stops, is up for a while yet and heartbeats to
+/// it fail, but it doesn't reach this machine: not said to be out of reach.
+#[test]
+fn a_member_that_stops_or_answers_on_another_version_is_not_said_out_of_reach() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = start("a", tmp.path());
+    let b = start("b", tmp.path());
+    pair(&a, &b);
+    wait_event(&a, "b up", |e| *e == Event::Up { node: "b".into() });
+    // Every event of a until `what`; none says b is out of reach.
+    let quietly = |what: &str, until: &dyn Fn(&Event) -> bool| {
+        wait_event(&a, what, |e| {
+            assert!(!matches!(e, Event::Unreachable { .. }), "{what}: {e:?}");
+            until(e)
+        });
+    };
+    // Stopped, then back on another version: up all along (updating), as it answers.
+    let b = restart(b, "b", "0.2.0");
+    quietly(
+        "mismatch on a",
+        &|e| matches!(e, Event::VersionMismatch { node, .. } if node == "b"),
+    );
+    thread::sleep(HEARTBEAT * 5);
+    assert!(a.member("b").unwrap().alive);
+    // Stopped: up until the down time.
+    drop(b);
+    quietly(
+        "b down",
+        &|e| matches!(e, Event::Down { node, .. } if node == "b"),
+    );
+}
+
 #[test]
 fn heartbeats_tell_down_and_up() {
     let tmp = tempfile::tempdir().unwrap();
