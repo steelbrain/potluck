@@ -6,13 +6,13 @@
 //! `<owner>-<seq>`); the **runner** is the machine that claimed it. A machine is often both.
 //!
 //! Control messages:
-//! - `report`: a member's [`MachineReport`]: its facts, load, own queue, workspaces and the jobs it
-//!   can't take yet for want of commits, as much of them as the asker may know (each member gets
-//!   its own, [`super::views::for_member`]). Pulled about once a second from every live member, and
-//!   pushed (`push`) by a member whose queue or load changed. A pull names the digest of the
-//!   report the asker holds (`have`); one that says the same is answered `unchanged`, with the
-//!   numbers of the report built now, not resent (a member's workspaces alone can run to
-//!   hundreds of kilobytes).
+//! - `report`: a member's [`MachineReport`]: its facts, load, own queue, the machines its own jobs
+//!   elsewhere run on, workspaces and the jobs it can't take yet for want of commits, as much of
+//!   them as the asker may know (each member gets its own, [`super::views::for_member`]). Pulled
+//!   about once a second from every live member, and pushed (`push`) by a member whose queue or
+//!   load changed. A pull names the digest of the report the asker holds (`have`); one that says
+//!   the same is answered `unchanged`, with the numbers of the report built now, not resent (a
+//!   member's workspaces alone can run to hundreds of kilobytes).
 //! - `claim` (runner to owner): the runner can start a queued job now. The owner grants a job once:
 //!   while it is still queued it becomes Starting on that runner and the answer is `granted` with
 //!   the job's record; otherwise `refused`. The lease's token identifies this run of the job in
@@ -67,6 +67,10 @@ pub(crate) enum PeerRequest {
         /// The digest ([`MachineReport::digest`]) of the report the asker holds from this member.
         #[serde(default)]
         have: Option<String>,
+        /// The asker reads [`MachineReport::runners`]. One of an older version doesn't: its
+        /// digest of a report is without them, and so is the report it gets.
+        #[serde(default)]
+        runners: bool,
     },
     Push {
         report: Box<MachineReport>,
@@ -149,6 +153,12 @@ pub(crate) struct MachineReport {
     pub ram_capacity_mib: u64,
     /// Jobs holding a lease here (any owner's), as this machine records them.
     pub running: Vec<JobRecord>,
+    /// This machine's own jobs starting or running on other machines, with the machine it
+    /// granted each to: another member's word that it runs one of them counts while this
+    /// machine is up only as this says. None from a member of an older version, which doesn't
+    /// say, and to one ([`PeerRequest::Report`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runners: Option<BTreeMap<JobId, NodeName>>,
     /// This machine's own queued jobs.
     pub queue: Vec<JobRecord>,
     /// Workspaces here that exist (not removed).

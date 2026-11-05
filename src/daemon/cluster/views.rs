@@ -64,6 +64,7 @@ fn build_report(st: &State, cs: &CState) -> MachineReport {
                 ..j.clone()
             })
             .collect(),
+        runners: Some(runners_elsewhere(st).collect()),
         queue: own_queue(st),
         ws_owners: workspaces
             .iter()
@@ -85,7 +86,8 @@ fn build_report(st: &State, cs: &CState) -> MachineReport {
 /// command, environment, kept-file globs, labels, source paths or signed spec; of a queued job,
 /// no command, environment, source paths or signed spec (the machine that claims it gets the
 /// whole spec with its grant), only who signed it; only the queued jobs `to` may take
-/// ([`super::owner::may_take`]); and no workspace paths.
+/// ([`super::owner::may_take`]); and no workspace paths. Where its own jobs run elsewhere goes to
+/// every member, as each runner's report of them does.
 pub(super) fn for_member(mut report: MachineReport, to: &super::owner::Taker) -> MachineReport {
     for j in &mut report.running {
         if let Some(l) = &mut j.lease {
@@ -159,6 +161,19 @@ pub(super) fn for_dispatch(w: &WorkspaceRecord) -> WorkspaceRecord {
     }
 }
 
+/// This machine's own jobs starting or running on other machines, with the machine each was
+/// granted to.
+fn runners_elsewhere(st: &State) -> impl Iterator<Item = (JobId, NodeName)> + '_ {
+    st.jobs
+        .values()
+        .filter(|j| owner_of(&j.id) == st.node)
+        .filter(|j| matches!(j.state, JobState::Starting | JobState::Running))
+        .filter_map(|j| {
+            let n = j.node.as_ref().filter(|n| **n != st.node)?;
+            Some((j.id.clone(), n.clone()))
+        })
+}
+
 /// This machine's own queued jobs.
 fn own_queue(st: &State) -> Vec<JobRecord> {
     st.jobs
@@ -209,10 +224,11 @@ pub(super) fn received(sh: &Shared, c: &Cluster, from: &str, mut report: Machine
 }
 
 /// What a report from `from` says for its own machine, the rest dropped: its queue holds only its
-/// own queued jobs, what runs there only jobs starting or running there, and its workspaces only
-/// workspaces there. Anything else (no report of a member's holds it) would keep this machine's
-/// workspaces a job is pinned to from removal, answer a `wait` while the job's owner is away, or
-/// hold a job back for a warm workspace (locality) and show it in `status`.
+/// own queued jobs, what runs there only jobs starting or running there, its workspaces only
+/// workspaces there, and where jobs run elsewhere only its own jobs. Anything else (no report of a
+/// member's holds it) would keep this machine's workspaces a job is pinned to from removal,
+/// answer a `wait` while the job's owner is away, or hold a job back for a warm workspace
+/// (locality) and show it in `status`.
 fn own_entries(from: &str, report: &mut MachineReport) {
     report
         .queue
@@ -224,6 +240,29 @@ fn own_entries(from: &str, report: &mut MachineReport) {
         .workspaces
         .retain(|w| w.node == from && node_of_ws(&w.id) == from);
     report.ws_owners.retain(|w, _| node_of_ws(w) == from);
+    if let Some(runners) = &mut report.runners {
+        runners.retain(|j, n| owner_of(j) == from && n != from);
+    }
+}
+
+/// Whether job `id` runs on `runner` as far as its owner says, from the `reports` held: as the
+/// owner's report says while the owner is up (in `up`) and its report says where its jobs run
+/// ([`MachineReport::runners`]: one of an older version doesn't). Otherwise (the owner away)
+/// the runner's word stands.
+fn owner_says(
+    reports: &BTreeMap<NodeName, Remote>,
+    up: &BTreeSet<NodeName>,
+    id: &str,
+    runner: &str,
+) -> bool {
+    let owner = owner_of(id);
+    if owner == runner || !up.contains(owner) {
+        return true;
+    }
+    match reports.get(owner).and_then(|r| r.report.runners.as_ref()) {
+        Some(runners) => runners.get(id).is_some_and(|n| n == runner),
+        None => true,
+    }
 }
 
 /// A pull found the report held from `from` still current: it takes the numbers of the one `from`
@@ -249,7 +288,8 @@ pub(super) fn pulls_and_pushes(sh: &Arc<Shared>, c: &Arc<Cluster>, now: u64) {
         .filter(|m| !m.this_machine)
         .map(|m| (m.name.clone(), c.up(&m)))
         .collect();
-    // What the others act on: the queue, what runs here, and the workspaces here.
+    // What the others act on: the queue, what runs here, where its own jobs elsewhere run, and
+    // the workspaces here.
     let digest = {
         let st = sh.lock();
         let mut d: Vec<String> = own_queue(&st)
@@ -263,6 +303,7 @@ pub(super) fn pulls_and_pushes(sh: &Arc<Shared>, c: &Arc<Cluster>, now: u64) {
                 .filter(|j| j.node.as_deref() == Some(st.node.as_str()))
                 .map(|j| format!("r{}:{:?}", j.id, j.state)),
         );
+        d.extend(runners_elsewhere(&st).map(|(j, n)| format!("g{j}:{n}")));
         d.extend(
             st.records()
                 .iter()
@@ -337,7 +378,14 @@ fn pull(sh: &Arc<Shared>, n: &str) {
         return;
     };
     let have = c.cs().reports.get(n).map(|r| r.digest.clone());
-    let r = c.call(n, &PeerRequest::Report { have }, PULL_TIMEOUT);
+    let r = c.call(
+        n,
+        &PeerRequest::Report {
+            have,
+            runners: true,
+        },
+        PULL_TIMEOUT,
+    );
     {
         let mut cs = c.cs();
         cs.pulling.remove(n);
@@ -377,7 +425,10 @@ fn refresh_unknown_of(sh: &Arc<Shared>, c: &Cluster, members: Vec<Member>) {
             s.spawn(move || {
                 if let Ok(PeerResponse::Report { report }) = c.call(
                     n,
-                    &PeerRequest::Report { have: None },
+                    &PeerRequest::Report {
+                        have: None,
+                        runners: true,
+                    },
                     Duration::from_secs(2),
                 ) {
                     received(sh, c, n, *report);
@@ -545,7 +596,8 @@ pub(crate) fn status(sh: &Arc<Shared>, c: &Cluster) -> Result<Response, String> 
     let now = now();
     let nodes = node_views(&st, &cs, c, now, members);
     // Running anywhere: this machine's records first (its own jobs wherever they run, and the
-    // jobs it runs for others), then what the other members report.
+    // jobs it runs for others), then what the other members report, each job where its owner
+    // says it runs while the owner is up.
     let mut running: Vec<JobRecord> = st
         .jobs
         .values()
@@ -560,7 +612,10 @@ pub(crate) fn status(sh: &Arc<Shared>, c: &Cluster) -> Result<Response, String> 
         }
         for j in &r.report.running {
             // This machine's own jobs are as its records say (a report may be older).
-            if owner_of(&j.id) != st.node && seen.insert(j.id.clone()) {
+            if owner_of(&j.id) != st.node
+                && owner_says(&cs.reports, &alive, &j.id, n)
+                && seen.insert(j.id.clone())
+            {
                 running.push(j.clone());
             }
         }
@@ -838,7 +893,10 @@ pub(crate) fn workspace_changed(sh: &Shared, c: &Cluster, node: &str, ws: &Works
             };
         }
     }
-    let full = PeerRequest::Report { have: None };
+    let full = PeerRequest::Report {
+        have: None,
+        runners: true,
+    };
     if let Ok(PeerResponse::Report { report }) = c.call(node, &full, PULL_TIMEOUT) {
         received(sh, c, node, *report);
     }
@@ -889,6 +947,36 @@ mod tests {
     }
 
     #[test]
+    fn a_job_runs_elsewhere_as_its_owner_says_while_it_is_up() {
+        let held = |runners: Option<&[(&str, &str)]>| Remote {
+            report: MachineReport {
+                node: "o".into(),
+                runners: runners.map(|r| {
+                    r.iter()
+                        .map(|(j, n)| (j.to_string(), n.to_string()))
+                        .collect()
+                }),
+                ..Default::default()
+            },
+            at: 0,
+            digest: String::new(),
+        };
+        let up: BTreeSet<NodeName> = ["o".into(), "r".into(), "x".into()].into();
+        let reports: BTreeMap<NodeName, Remote> =
+            [("o".into(), held(Some(&[("o-1", "r")])))].into();
+        assert!(owner_says(&reports, &up, "o-1", "r"));
+        assert!(!owner_says(&reports, &up, "o-1", "x"), "granted to r");
+        assert!(!owner_says(&reports, &up, "o-2", "x"), "not granted");
+        assert!(owner_says(&reports, &up, "o-2", "o"), "its own report");
+        // The owner away, or of an older version: the runner's word stands.
+        let away: BTreeSet<NodeName> = ["r".into(), "x".into()].into();
+        assert!(owner_says(&reports, &away, "o-1", "x"));
+        assert!(owner_says(&BTreeMap::new(), &up, "o-1", "x"), "no report");
+        let older: BTreeMap<NodeName, Remote> = [("o".into(), held(None))].into();
+        assert!(owner_says(&older, &up, "o-1", "x"));
+    }
+
+    #[test]
     fn a_report_keeps_only_what_it_says_of_its_own_machine() {
         let ws = |id: &str, node: &str| WorkspaceRecord {
             id: id.into(),
@@ -914,11 +1002,22 @@ mod tests {
                 ws("b-w4", "m"),
             ],
             ws_owners: [("m-w1".into(), "a".into()), ("b-w2".into(), "a".into())].into(),
+            runners: Some(
+                [("m-1", "b"), ("a-2", "b"), ("m-3", "m")]
+                    .iter()
+                    .map(|(j, n)| (j.to_string(), n.to_string()))
+                    .collect(),
+            ),
             ..Default::default()
         };
         own_entries("m", &mut r);
         let ids: Vec<&str> = r.workspaces.iter().map(|w| w.id.as_str()).collect();
         assert_eq!(ids, ["m-w1"]);
         assert_eq!(r.ws_owners.keys().collect::<Vec<_>>(), ["m-w1"]);
+        let runners = r.runners.unwrap();
+        assert_eq!(
+            runners.into_iter().collect::<Vec<_>>(),
+            [("m-1".to_string(), "b".to_string())]
+        );
     }
 }

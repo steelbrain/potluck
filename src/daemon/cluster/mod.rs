@@ -1016,9 +1016,12 @@ fn handle_call(
     req: PeerRequest,
 ) -> Result<PeerResponse, String> {
     Ok(match req {
-        PeerRequest::Report { have } => {
+        PeerRequest::Report { have, runners } => {
             let to = owner::Taker::of(&c.mesh(), from);
             let mut report = views::for_member(views::own_report(sh, c), &to);
+            if !runners {
+                report.runners = None;
+            }
             match have {
                 Some(h) if report.digest() == h => PeerResponse::Unchanged {
                     started_at: report.started_at,
@@ -2965,7 +2968,13 @@ mod tests {
             }
         }
         let size = |r: &PeerResponse| serde_json::to_vec(r).unwrap().len();
-        let r = call_as_b(&b, &PeerRequest::Report { have: None });
+        let r = call_as_b(
+            &b,
+            &PeerRequest::Report {
+                have: None,
+                runners: true,
+            },
+        );
         // Every workspace in full (its record alone is over 200 bytes, the temp path apart).
         assert!(size(&r) > 300 * 200, "{} bytes", size(&r));
         let PeerResponse::Report { mut report } = r else {
@@ -2977,6 +2986,7 @@ mod tests {
             &b,
             &PeerRequest::Report {
                 have: Some(digest.clone()),
+                runners: true,
             },
         );
         assert!(size(&r) < 200, "{} bytes: {r:?}", size(&r));
@@ -2993,7 +3003,13 @@ mod tests {
             let w = held(301);
             st.workspaces.insert(w.id.clone(), w);
         }
-        let r = call_as_b(&b, &PeerRequest::Report { have: Some(digest) });
+        let r = call_as_b(
+            &b,
+            &PeerRequest::Report {
+                have: Some(digest),
+                runners: true,
+            },
+        );
         assert!(
             matches!(&r, PeerResponse::Report { report } if report.workspaces.len() == 301),
             "{r:?}"
@@ -3345,7 +3361,13 @@ mod tests {
             st.jobs.insert("lone-1".into(), queued);
             st.save_job("lone-1");
         }
-        let report = || match call_as_b(&b, &PeerRequest::Report { have: None }) {
+        let report = || match call_as_b(
+            &b,
+            &PeerRequest::Report {
+                have: None,
+                runners: true,
+            },
+        ) {
             PeerResponse::Report { report } => *report,
             other => panic!("{other:?}"),
         };

@@ -31,6 +31,9 @@
 - A member's report counts only the workspaces on that member. Workspaces it listed on other
   machines showed in `status` and could hold a job back for the 3-second locality wait, as if the
   member had a workspace of the job's repository.
+- `status` shows a job dispatched on another machine running where that machine says it granted
+  it, while that machine is up. A member that said it ran such a job, granted elsewhere or still
+  queued, was shown running it.
 - Linux with systemd older than 256 (Ubuntu 24.04 has 255): a job that the kernel's OOM killer
   ended at its own `--ram` limit was reported as `failed`, "killed because the machine ran short of
   memory, under its own limit", when potluck learned of the kill only after the job's unit had

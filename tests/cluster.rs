@@ -5284,6 +5284,69 @@ fn a_report_counts_only_the_workspaces_on_its_machine() {
     mesh.stop();
 }
 
+/// a, an impostor, reports that it runs b's job that b granted to c, and b's job still queued
+/// at b. `status` on d shows each where b says: the first on c, the second queued. While b is
+/// away, a's word stands, as before (it is all d has of the second).
+#[test]
+fn status_shows_a_job_running_where_its_owner_says() {
+    let w = World::new();
+    let mut a = w.node("a").start();
+    let mut b = w.node("b").start();
+    let c = w.node("c").start();
+    let d = w.node("d").start();
+    pair(&b, &a);
+    pair(&b, &c);
+    pair(&b, &d);
+    wait_until("the members see each other", || {
+        a.node_alive("c")
+            && a.node_alive("d")
+            && c.node_alive("d")
+            && d.node_alive("a")
+            && d.node_alive("c")
+    });
+    // c full with b's first job, so the second waits in b's queue.
+    let granted = b.dispatch(&["--on", "node=c", "--ram", "8", "--", "sleep", "60"]);
+    b.running_on(&granted, "c");
+    let queued = b.dispatch(&["--on", "node=c", "--ram", "1", "--", "sleep", "60"]);
+    let lease = serde_json::to_value(b.get(&granted)).unwrap()["lease"].clone();
+    let on_a = |id: &str| {
+        let mut j = serde_json::to_value(b.get(id)).unwrap();
+        j["state"] = "running".into();
+        j["node"] = "a".into();
+        j["workspace"] = "a-w9".into();
+        j["lease"] = lease.clone();
+        j
+    };
+    let mut report = report_to(&d, "a");
+    report["running"] = Value::Array(vec![on_a(&granted), on_a(&queued)]);
+    report["seq"] = 0.into();
+    let reporter = Reporter::new(report);
+    let mesh = a.impostor(reporter.clone());
+    asked_again(&reporter, &["d"]);
+    let nodes_of = |st: &Value, list: &str, id: &str| -> Vec<String> {
+        st[list]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|j| j["id"] == id)
+            .map(|j| j["node"].as_str().unwrap_or("-").to_string())
+            .collect()
+    };
+    let st = d.cli_ok(&["status"]);
+    assert_eq!(nodes_of(&st, "running", &granted), ["c"], "{st}");
+    assert!(nodes_of(&st, "running", &queued).is_empty(), "{st}");
+    assert_eq!(nodes_of(&st, "queued", &queued).len(), 1, "{st}");
+    assert_eq!(b.get(&queued).state, JobState::Queued);
+
+    // b away: what a and c say stands.
+    b.stop();
+    wait_until("d counts b down", || !d.node_alive("b"));
+    let st = d.cli_ok(&["status"]);
+    assert_eq!(nodes_of(&st, "running", &queued), ["a"], "{st}");
+    assert_eq!(nodes_of(&st, "running", &granted).len(), 1, "{st}");
+    mesh.stop();
+}
+
 /// `report` of `of`, as `asker` gets it.
 fn report_to(asker: &Node, of: &str) -> Value {
     let mesh = client_mesh(asker);

@@ -41,6 +41,8 @@ In a cluster with users, a machine whose root is hostile can still:
   mistakes, not lies), and so be granted a job it can't run, or hold a job back from machines
   without a workspace of its repository for up to 3 seconds, the wait for a warm one; workspaces
   it reports on other machines count for nothing;
+- say that it runs a job another machine dispatched: other members show the job running there
+  only while the dispatching machine is away, and the claim ends no `wait`;
 - withhold or delay the records and reports it passes on; it can't forge records other keys
   signed;
 - send a signed request it answered on to another machine within 5 minutes: a request names its
