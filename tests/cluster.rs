@@ -2044,8 +2044,12 @@ fn after_user_init_only_what_users_sign_admits_and_removes() {
 
     // The user's removal: final, everywhere.
     let out = a.cli_ok(&["remove", "c"]);
-    assert_eq!(out["final"], true, "{out}");
-    assert!(out["warning"].is_null(), "{out}");
+    assert_eq!(
+        (&out["removed"], &out["final"]),
+        (&"c".into(), &true.into()),
+        "{out}"
+    );
+    assert!(out.get("warning").is_none(), "{out}");
     for n in [&a, &b, &d] {
         wait_until(&format!("{} holds owner's removal of c", n.name), || {
             holds_removal(n, "c", "owner")

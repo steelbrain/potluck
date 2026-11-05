@@ -701,22 +701,19 @@ impl Cx<'_> {
             Command::User { action } => self.user(action),
             Command::Remove { node } => {
                 let removal = Some(self.signed_removal(&node)?);
-                // Text: the removal holds until the machine removed contests it, and why.
-                let warning = match self.call(Req::Remove {
+                match self.call(Req::Remove {
                     node: node.clone(),
                     removal,
                 })? {
-                    Response::Ok => None,
-                    Response::Text { text } => Some(text),
+                    Response::Ok => {}
                     other => return Err(unexpected("remove", &other)),
-                };
-                Ok(Report {
-                    note: warning.clone().unwrap_or_default(),
-                    ..Report::new(
-                        json!({ "removed": node, "final": warning.is_none(), "warning": warning }),
-                        format!("removed {node} from the cluster"),
-                    )
-                })
+                }
+                // A user's removal is final. `final` stays for scripts written for 0.1.1, where a
+                // removal a machine signed could be undone (`"final": false`, with a `warning`).
+                Ok(Report::new(
+                    json!({ "removed": node, "final": true }),
+                    format!("removed {node} from the cluster"),
+                ))
             }
             Command::SelfUpdate { here } => {
                 if here {

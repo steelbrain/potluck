@@ -36,7 +36,8 @@
 - `dispatch`, `admit` and `remove` need a user: until `potluck user init` has made the cluster's
   first user, they refuse and say so (exit 2), on a new machine and in a cluster paired with 0.1.1
   alike. A member's daemon signs no admission or removal with its machine key and takes no
-  unsigned dispatch.
+  unsigned dispatch. A removal is a user's and final: `remove --json` always has `"final": true`,
+  and no `warning`.
 - A machine runs another machine's job only when a user signed it. In a cluster paired with 0.1.1,
   the jobs queued before `user init` stay unsigned: each stays queued on the machine it was
   dispatched on and runs only there, and `potluck why` says so.
