@@ -11,7 +11,9 @@ use crate::daemon::state::{MachineSnap, State};
 use crate::daemon::{Shared, files, runner};
 use crate::gitinfo::short;
 use crate::sched::{Load, MachineView, Queued, Running};
-use crate::types::{JobId, JobRecord, JobState, Millis, NodeName, RepoRef, Usage, WorkspaceState};
+use crate::types::{
+    JobId, JobRecord, JobSpec, JobState, Millis, NodeName, RepoRef, Usage, WorkspaceState,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::Arc;
@@ -384,11 +386,17 @@ fn claim(sh: &Arc<Shared>, id: &str, passed: Vec<JobId>) {
                 .extend(passed);
         }
     };
-    let Some((repo, lease, ws)) = ({
+    // The queue entry claimed, which the reservation was made from.
+    let Some((repo, lease, ws, claimed)) = ({
         let st = sh.lock();
-        st.jobs
-            .get(id)
-            .and_then(|j| Some((j.spec.repo.clone(), j.lease.clone()?, j.workspace.clone()?)))
+        st.jobs.get(id).and_then(|j| {
+            Some((
+                j.spec.repo.clone(),
+                j.lease.clone()?,
+                j.workspace.clone()?,
+                j.spec.clone(),
+            ))
+        })
     }) else {
         keep_passes(passed);
         return;
@@ -421,7 +429,7 @@ fn claim(sh: &Arc<Shared>, id: &str, passed: Vec<JobId>) {
     );
     match r {
         Ok(PeerResponse::Granted { job, reported }) => {
-            if let Err(why) = verify_grant(sh, &c, id, &job) {
+            if let Err(why) = verify_grant(sh, &c, id, &job, &claimed) {
                 sh.log.log(format!(
                     "WARNING: {id}: granted by {owner}, but not run here: {why}"
                 ));
@@ -508,13 +516,36 @@ fn claim(sh: &Arc<Shared>, id: &str, passed: Vec<JobId>) {
     }
 }
 
-/// What a runner checks of job `id` its owner granted, before it runs it. In a cluster with users:
-/// a user this machine recognizes signed it, for its owner, and the spec granted is the one signed
-/// as its owner holds it ([`crate::jobauth::verify_grant`]); and it runs in this machine's pool,
-/// on this machine's facts (`--on`). Without users, any grant (as before users).
-fn verify_grant(sh: &Shared, c: &Cluster, id: &str, job: &JobRecord) -> Result<(), String> {
+/// What a runner checks of job `id` its owner granted, before it runs it: the spec granted asks
+/// for what the queue entry it claimed asked, the resources reserved here (`request`), `on` and
+/// `workspace` (`claimed`). In a cluster with users also: a user this machine recognizes signed
+/// it, for its owner, and the spec granted is the one signed as its owner holds it
+/// ([`crate::jobauth::verify_grant`]); and it runs in this machine's pool, on this machine's facts
+/// (`--on`).
+fn verify_grant(
+    sh: &Shared,
+    c: &Cluster,
+    id: &str,
+    job: &JobRecord,
+    claimed: &JobSpec,
+) -> Result<(), String> {
     if job.id != id {
         return Err(format!("the grant is of job {}", job.id));
+    }
+    let granted = &job.spec;
+    let differs: Vec<&str> = [
+        ("request", granted.request != claimed.request),
+        ("on", granted.on != claimed.on),
+        ("workspace", granted.workspace != claimed.workspace),
+    ]
+    .into_iter()
+    .filter_map(|(field, differs)| differs.then_some(field))
+    .collect();
+    if !differs.is_empty() {
+        return Err(format!(
+            "its {} is not what the queue entry it was claimed from had",
+            differs.join(", ")
+        ));
     }
     let mesh = c.mesh();
     if !mesh.users_exist() {

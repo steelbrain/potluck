@@ -5912,6 +5912,109 @@ fn a_forged_or_unsigned_job_from_another_owner_is_never_run() {
     mesh.stop();
 }
 
+/// c, an impostor, grants b jobs the user signed for c, each as signed, but its report's queue
+/// showed b another request (less RAM, which b reserved), no `--on`, or no workspace. b runs none
+/// of them: the spec granted asks for what the entry it claimed asked, or b hands it back, logs a
+/// WARNING and doesn't claim it again. One whose entry is the job as signed runs.
+#[test]
+fn a_grant_unlike_the_queue_entry_claimed_is_never_run() {
+    use potluck::jobauth;
+    use potluck::types::JobSpec;
+    let w = World::new();
+    let a = w.node("a").start();
+    let b = w.node("b").start();
+    let mut c = w.node("c").start();
+    pair(&a, &b);
+    pair(&a, &c);
+    wait_until("b and c see each other", || {
+        b.node_alive("c") && c.node_alive("b")
+    });
+    init_users(&a, &[&a, &b, &c]);
+    let user = user_key(&a);
+    let theirs = a.dispatch(&["--on", "node=b", "--", "true"]);
+    assert_eq!(a.done(&theirs).state, JobState::Succeeded);
+    let record = serde_json::to_value(a.get(&theirs)).unwrap();
+    // What a's command line signed (`--on node=b`, 4 GiB of RAM), for c.
+    let signed_for_c = JobSpec {
+        submitted_from: "c".into(),
+        ..jobauth::open(a.get(&theirs).spec.auth.as_ref().unwrap()).unwrap()
+    };
+    assert_eq!(signed_for_c.request.ram_mib, 4096);
+    // Signed by the user for c after `change`, as c would hold it: its ids salted with c's name.
+    let held = |change: &dyn Fn(&mut JobSpec)| {
+        let mut spec = signed_for_c.clone();
+        change(&mut spec);
+        let spec = jobauth::sign(&spec, &user, now_ms());
+        let mut rec: JobRecord = serde_json::from_value(record.clone()).unwrap();
+        rec.spec = JobSpec {
+            auth: spec.auth.clone(),
+            ..jobauth::owned("c", &spec, false)
+        };
+        rec
+    };
+    type Change = Box<dyn Fn(&mut JobSpec)>;
+    let cases: Vec<(&str, JobRecord, Change)> = vec![
+        (
+            "c-911",
+            held(&|_| {}),
+            Box::new(|s| s.request.ram_mib = 1024),
+        ),
+        ("c-912", held(&|_| {}), Box::new(|s| s.on.clear())),
+        (
+            "c-913",
+            held(&|s| s.workspace = Some("b-w99".into())),
+            Box::new(|s| s.workspace = None),
+        ),
+        ("c-914", held(&|_| {}), Box::new(|_| {})),
+    ];
+    let mut jobs = BTreeMap::new();
+    let mut queue = Vec::new();
+    for (id, mut rec, entry) in cases {
+        rec.id = id.into();
+        rec.state = JobState::Queued;
+        (rec.node, rec.lease, rec.workspace) = (None, None, None);
+        (rec.started_at, rec.ended_at, rec.exit_code) = (None, None, None);
+        rec.spec.key = None;
+        jobs.insert(id.to_string(), serde_json::to_value(&rec).unwrap());
+        entry(&mut rec.spec);
+        queue.push(serde_json::to_value(&rec).unwrap());
+    }
+    let mut report = report_to(&b, "c");
+    report["queue"] = Value::Array(queue);
+    report["seq"] = 0.into();
+    let forger = Arc::new(Forger {
+        report,
+        jobs,
+        claims: Mutex::default(),
+    });
+    let mesh = c.impostor(forger.clone());
+    wait_until("b runs c-914", || b.exec.launch_of("c-914").is_some());
+    wait_until("b claimed c-911, c-912 and c-913", || {
+        ["c-911", "c-912", "c-913"]
+            .iter()
+            .all(|id| forger.claims("b", id) >= 1)
+    });
+    // Refused once, never claimed again.
+    std::thread::sleep(Duration::from_secs(2));
+    let log = b.daemon_log();
+    for (id, field) in [
+        ("c-911", "request"),
+        ("c-912", "on"),
+        ("c-913", "workspace"),
+    ] {
+        assert_eq!(forger.claims("b", id), 1, "{id}\n{log}");
+        assert!(b.exec.launch_of(id).is_none(), "{id}\n{log}");
+        assert!(
+            log.contains(&format!(
+                "WARNING: {id}: granted by c, but not run here: its {field} is not what the queue entry it was claimed from had"
+            )),
+            "{id}\n{log}"
+        );
+    }
+    assert_eq!(forger.claims("b", "c-914"), 1);
+    mesh.stop();
+}
+
 /// `potluck user init` on `first`, and every member of `all` holding the first user's admission
 /// of each.
 fn init_users(first: &Node, all: &[&Node]) {
