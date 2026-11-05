@@ -3006,6 +3006,93 @@ fn a_member_on_another_version_is_updating_not_lost() {
     );
 }
 
+/// `potluck env NODE` on any member: NODE's login environment, asked of NODE's daemon over the
+/// cluster connection. A machine that isn't a member, a member that is down, and one on another
+/// version are said.
+#[test]
+fn env_of_another_member_comes_from_its_daemon() {
+    let w = World::new();
+    let a = w.node("a").start();
+    let mut b = w.node("b").start();
+    pair(&a, &b);
+    let home = |n: &Node| n.dir.display().to_string();
+    let here = a.cli_ok(&["env"]);
+    assert_eq!(here["node"], "a");
+    assert_eq!(here["env"]["HOME"], home(&a).as_str(), "{here}");
+    for asker in [&a, &b] {
+        let there = asker.cli_ok(&["env", "b"]);
+        assert_eq!(there["node"], "b");
+        assert_eq!(there["env"]["HOME"], home(&b).as_str(), "{there}");
+        assert_eq!(there["env"]["PATH"], "/usr/bin:/bin:/usr/sbin:/sbin");
+    }
+    let human = Command::new(BIN)
+        .args(["env", "b"])
+        .env("POTLUCK_HOME", &a.paths.home)
+        .env("POTLUCK_CONFIG", &a.paths.config)
+        .output()
+        .unwrap();
+    assert_eq!(human.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&human.stdout),
+        format!("HOME={}\nPATH=/usr/bin:/bin:/usr/sbin:/sbin\n", home(&b))
+    );
+    let note = String::from_utf8_lossy(&human.stderr).into_owned();
+    assert!(
+        note.starts_with(
+            "potluck: this is b's login environment, as its daemon captured it; a job on b gets"
+        ),
+        "{note}"
+    );
+
+    let o = a.cli(&["env", "nosuch"]);
+    assert_eq!(
+        (o.code, o.json["error"].as_str()),
+        (
+            2,
+            Some("nosuch is not a member of the cluster (`potluck nodes` lists them)")
+        ),
+        "{}",
+        o.stdout
+    );
+
+    b.stop();
+    wait_until("a counts b down", || !a.node_alive("b"));
+    let o = a.cli(&["env", "b"]);
+    assert_eq!(
+        (o.code, o.json["error"].as_str()),
+        (
+            2,
+            Some("b is down, and only its own daemon has its environment")
+        ),
+        "{}",
+        o.stdout
+    );
+
+    b.version = "0.1.1".into();
+    b.start();
+    wait_until("a hears b on 0.1.1", || {
+        let nodes = a.cli_ok(&["nodes"]);
+        nodes["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["facts"]["node"] == "b" && n["updating"] == true)
+    });
+    let o = a.cli(&["env", "b"]);
+    assert_eq!(
+        (o.code, o.json["error"].as_str()),
+        (
+            2,
+            Some(
+                "b runs potluck 0.1.1, not this machine's 0.1.0, and members on two versions \
+                 don't answer each other's requests"
+            )
+        ),
+        "{}",
+        o.stdout
+    );
+}
+
 /// A dispatch only a member on another version can run (the two are mid-update: one restarted on
 /// a new version, the other updates itself next) is queued, not refused, and runs there once the
 /// two run one version again. Before, it was refused: "no machine that can run this is up (b:

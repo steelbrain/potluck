@@ -83,6 +83,15 @@ pub enum Command {
     },
     /// The machines and their facts.
     Nodes,
+    /// The login environment a job on NODE starts from.
+    ///
+    /// NODE's daemon captured it when it started, and captures it again on `potluck restart`. A
+    /// job gets the `[[gpu]]` env of the GPUs it holds, its dispatch's env and potluck's own
+    /// variables on top, without what its dispatch unsets.
+    Env {
+        /// A machine's name, as `potluck nodes` lists it. Default: this machine.
+        node: Option<String>,
+    },
     /// Pair this machine with a cluster: prints a request to paste into `potluck admit` on a member.
     Pair {
         /// Finish pairing with the reply `potluck admit` printed.
@@ -595,6 +604,7 @@ impl Cx<'_> {
             Command::Status => self.status(),
             Command::Why { job } => self.why(&job),
             Command::Nodes => self.nodes(),
+            Command::Env { node } => self.env(node),
             // Pairing hands a line from one machine to the other: stdout is that line alone, and
             // stderr says where it goes next.
             Command::Pair { finish } => match finish {
@@ -1164,6 +1174,28 @@ impl Cx<'_> {
         };
         let human = output::nodes_human(&nodes, now_ms());
         Ok(Report::new(json!({ "nodes": nodes }), human))
+    }
+
+    /// `potluck env [NODE]`: the login environment NODE's daemon holds, which every job there
+    /// starts from.
+    fn env(&mut self, node: Option<String>) -> anyhow::Result<Report> {
+        let (node, env) = match self.call(Req::Env { node }) {
+            Ok(Response::Env { node, env }) => (node, env),
+            Ok(other) => return Err(unexpected("env", &other)),
+            Err(e) if crate::client::not_understood(&e) => anyhow::bail!(
+                "the daemon here runs a potluck from before `potluck env`; `potluck restart` \
+                 restarts it on the binary at its path"
+            ),
+            Err(e) => return Err(e),
+        };
+        Ok(Report {
+            note: format!(
+                "this is {node}'s login environment, as its daemon captured it; a job on {node} \
+                 gets the `[[gpu]]` env of the GPUs it holds, its dispatch's env and potluck's own \
+                 variables on top, without what the dispatch unsets"
+            ),
+            ..Report::new(json!({ "node": node, "env": env }), output::env_human(&env))
+        })
     }
 
     /// `potluck restart`: the daemon restarts in place, and the new binary answers.

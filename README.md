@@ -197,6 +197,7 @@ members and what happens when one is lost.
 | `status` | Machines, running jobs, the queue in start order, recent jobs, workspaces. |
 | `why JOB` | What a queued job waits on and who holds it, or how a job ended. |
 | `nodes` | Every machine with its facts, GPUs, version and address. |
+| `env [NODE]` | Print the login environment a job on NODE (default: this machine) starts from. |
 | `pair`, `pair --finish REPLY` | Ask to join a cluster, and finish joining. |
 | `admit REQUEST` | Admit a machine and print the reply. |
 | `remove NODE` | Remove a machine from the cluster. |

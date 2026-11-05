@@ -2350,6 +2350,34 @@ fn unset_env_leaves_variables_out_of_the_job() {
     }
 }
 
+/// `potluck env`: the login environment this daemon holds; another machine's is refused on one
+/// machine.
+#[test]
+fn env_is_the_login_environment_jobs_start_from() {
+    let f = Fixture::new().start();
+    let mut c = f.client();
+    for node in [None, Some("testnode".to_string())] {
+        match c.call(Request::Env { node }).unwrap() {
+            Response::Env { node, env } => {
+                assert_eq!(node, "testnode");
+                assert_eq!(env["FROM_LOGIN"], "login");
+                assert!(!env.contains_key("POTLUCK_JOB"), "{env:?}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    let e = c
+        .call(Request::Env {
+            node: Some("msi".into()),
+        })
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        e,
+        "msi is not a member of the cluster: this machine, testnode, is in no cluster"
+    );
+}
+
 #[test]
 fn restart_adopts_running_jobs() {
     let mut f = Fixture::new().start();

@@ -639,6 +639,20 @@ fn dispatch_wait_logs_env_status_why_cancel() {
     assert_eq!((code, j["state"].as_str()), (130, Some("cancelled")));
 }
 
+/// `potluck env` prints the login environment the daemon captured from the fake login shell, and
+/// nothing from the daemon's own environment or the caller's.
+#[test]
+fn env_prints_the_login_environment_jobs_start_from() {
+    let n = Node::new();
+    let env = n.cli_ok(&["env"]);
+    assert_eq!(env["node"], n.name.as_str());
+    assert_eq!(env["env"]["E2E_LOGIN"], "from-login-profile", "{env}");
+    assert_eq!(env["env"]["E2E_OVERRIDE"], "login", "{env}");
+    for k in ["E2E_CALLER", "POTLUCK_JOB", "FROM_TOML"] {
+        assert!(env["env"].get(k).is_none(), "{k} in {env}");
+    }
+}
+
 /// `--unset-env` leaves a variable out of the job's environment, whether the login shell or the
 /// committed potluck.toml set it.
 #[test]

@@ -115,8 +115,8 @@ The machine running a job streams its output to the dispatching machine and send
 at the end, so `wait` and `logs` work there as on one machine. Kept files that can't be delivered
 for 10 minutes are given up on, and at once if their machine leaves the cluster: the job ends with
 its own exit code and a note saying so (`why` shows it), and the files stay in the job's directory
-on the machine that ran it. `cancel`, `cp`, `hold` and `release` are forwarded to the machine
-concerned, and `status`, `nodes` and `why` show every member.
+on the machine that ran it. `cancel`, `cp`, `hold`, `release` and `env NODE` are forwarded to
+the machine concerned, and `status`, `nodes` and `why` show every member.
 
 ## Lost machines
 

@@ -12,6 +12,7 @@ use crate::types::{
     WorkspaceRecord,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// Who is asking: used for reminders and to find nested calls.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -77,6 +78,11 @@ pub enum Request {
         job: JobId,
     },
     Nodes,
+    /// The login environment `node`'s daemon holds (None: this machine's), which every job there
+    /// starts from. Asked of `node` over the mesh when it is another member.
+    Env {
+        node: Option<NodeName>,
+    },
     /// Whether the lease a job's environment names is live, and what it holds.
     LeaseCheck {
         job: JobId,
@@ -157,6 +163,11 @@ pub enum Response {
     },
     Nodes {
         nodes: Vec<NodeView>,
+    },
+    /// A machine's login environment ([`Request::Env`]).
+    Env {
+        node: NodeName,
+        env: BTreeMap<String, String>,
     },
     Lease {
         live: bool,

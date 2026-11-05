@@ -22,5 +22,13 @@ apart from a job that exited with 3. `potluck restart` exits with 4 when no daem
 in place: none answers, or it runs a potluck from before `restart` (install.sh then restarts the
 service). `restart` never exits with a job's code, so its 4 is always its own.
 
+`potluck env --json` prints the machine's name and its login environment, with the values as they
+are (the text output writes control characters in a name or value as escapes, such as `\n`, so
+each variable stays on one line):
+
+```json
+{"env": {"HOME": "/Users/me", "PATH": "/opt/homebrew/bin:/usr/bin:/bin"}, "node": "studio", "reminders": []}
+```
+
 A job's own exit codes, and the codes potluck gives the endings it causes, are in
 [How a job ends](jobs.md#how-a-job-ends).

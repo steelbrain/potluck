@@ -2057,6 +2057,62 @@ fn nested_dispatch_keeps_the_jobs_own_variables() {
     assert_eq!(r.stdout.trim(), "studio-9 secret /the-jobs-tmp from-flag");
 }
 
+/// `potluck env`: one `K=V` line a variable, a value's line breaks written as escapes, and what
+/// a job gets on top said on stderr; `--json` has the values as they are. A daemon from before
+/// `env` is said.
+#[test]
+fn env_prints_the_login_environment() {
+    let fake = FakeDaemon::start(vec![], |req, conn| match &req.req {
+        Request::Env { node } => conn.send(Response::Env {
+            node: node.clone().unwrap_or_else(|| "studio".into()),
+            env: [("A", "1"), ("TWO_LINES", "a\nB=2")]
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .into(),
+        }),
+        _ => conn.send(Response::Error {
+            message: "unexpected".into(),
+        }),
+    });
+    let r = run(potluck(fake.home()).args(["env"]));
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(r.stdout, "A=1\nTWO_LINES=a\\nB=2\n");
+    assert!(
+        r.stderr.starts_with(
+            "potluck: this is studio's login environment, as its daemon captured it; a job on \
+             studio gets the `[[gpu]]` env of the GPUs it holds, its dispatch's env and potluck's \
+             own variables on top, without what the dispatch unsets\n"
+        ),
+        "{}",
+        r.stderr
+    );
+    let r = run(potluck(fake.home()).args(["--json", "env", "msi"]));
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    let doc = one_json(&r.stdout);
+    assert_eq!(doc["node"], "msi");
+    assert_eq!(
+        doc["env"],
+        serde_json::json!({ "A": "1", "TWO_LINES": "a\nB=2" })
+    );
+    assert!(doc["reminders"].is_array(), "{doc}");
+
+    let old = FakeDaemon::start(vec![], |_, conn| {
+        conn.send(Response::Error {
+            message: "bad request: unknown variant `env`, expected one of `ping`, `dispatch`"
+                .into(),
+        })
+    });
+    let r = run(potluck(old.home()).args(["env"]));
+    assert_eq!(r.code, 2);
+    assert!(
+        r.stderr.starts_with(
+            "potluck: the daemon here runs a potluck from before `potluck env`; `potluck restart` \
+             restarts it on the binary at its path\n"
+        ),
+        "{}",
+        r.stderr
+    );
+}
+
 /// In place, `--unset-env` leaves the variable out of the command's environment, as it would a
 /// job's; potluck's own variables stay, and can't be named.
 #[test]

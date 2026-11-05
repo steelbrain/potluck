@@ -1,8 +1,9 @@
 //! CLI requests in a cluster. The CLI only talks to its own daemon; a request about a job owned by
-//! another machine, or a workspace on another machine, is relayed there over a `client` stream and
-//! answered from there, frame by frame (with this machine's reminders). Status, nodes and why cover
-//! every member; pairing, admission, removal and self-update go to the mesh. A removal goes to the
-//! oldest member up that was admitted before the machine removed, which makes it final.
+//! another machine, a workspace on another machine, or another machine's login environment
+//! (`potluck env NODE`), is relayed there over a `client` stream and answered from there, frame by
+//! frame (with this machine's reminders). Status, nodes and why cover every member; pairing,
+//! admission, removal and self-update go to the mesh. A removal goes to the oldest member up that
+//! was admitted before the machine removed, which makes it final.
 
 use super::peer::{StreamHeader, node_of_ws, owner_of};
 use super::{Cluster, membership, owner, self_update, views};
@@ -132,6 +133,43 @@ pub(crate) fn intercept<W: Write>(
                         "can't reach {node}, where workspace {workspace} is: {e}"
                     )),
                 ),
+            }
+        }
+        Request::Env { node: Some(node) } if *node != me && !relayed => {
+            if c.removed() {
+                return answer(
+                    w,
+                    Err(format!(
+                        "{node} can't be asked: this machine was removed from the cluster; run \
+                         `potluck pair` to join again"
+                    )),
+                );
+            }
+            let Some(m) = c.mesh().member(node) else {
+                return answer(
+                    w,
+                    Err(format!(
+                        "{node} is not a member of the cluster (`potluck nodes` lists them)"
+                    )),
+                );
+            };
+            if !c.up(&m) {
+                let why = match m.version.as_deref().filter(|_| m.alive) {
+                    Some(theirs) => format!(
+                        "{node} runs potluck {theirs}, not this machine's {}, and members on \
+                         two versions don't answer each other's requests",
+                        c.opts.mesh.version
+                    ),
+                    None => format!("{node} is down, and only its own daemon has its environment"),
+                };
+                return answer(w, Err(why));
+            }
+            match relay(sh, &c, node, req, w) {
+                Ok(()) => Ok(true),
+                Err(RelayError::Broken(e)) => Err(e),
+                Err(RelayError::NotStarted(e)) => {
+                    answer(w, Err(format!("can't reach {node}: {e}")))
+                }
             }
         }
         Request::Status => answer(w, views::status(sh, &c)),
@@ -412,9 +450,10 @@ fn serve_removal<W: Write>(
 }
 
 /// A request another member relayed here: answered on the stream as on the socket. Only the
-/// requests [`intercept`] relays are answered (about a job or a workspace, and a removal, which
-/// it relays to a member admitted before the machine removed); anything else, such as an
-/// admission, is refused rather than done here on another member's word.
+/// requests [`intercept`] relays are answered (about a job or a workspace, this machine's login
+/// environment, and a removal, which it relays to a member admitted before the machine removed);
+/// anything else, such as an admission, is refused rather than done here on another member's
+/// word.
 pub(super) fn serve(sh: &Arc<Shared>, req: &ClientRequest, stream: crate::mesh::Stream) {
     let mut s = stream;
     if let Request::Remove { node } = &req.req {
@@ -437,6 +476,7 @@ pub(super) fn serve(sh: &Arc<Shared>, req: &ClientRequest, stream: crate::mesh::
             | Request::Copy { .. }
             | Request::Hold { .. }
             | Request::Release { .. }
+            | Request::Env { .. }
     );
     let answered = if relayable {
         handle_relayed(sh, req, &mut s)
@@ -446,8 +486,8 @@ pub(super) fn serve(sh: &Arc<Shared>, req: &ClientRequest, stream: crate::mesh::
             .and_then(|v| v.get("op").and_then(|o| o.as_str()).map(str::to_string))
             .unwrap_or_default();
         sh.log.log(format!(
-            "cluster: refused a relayed {op} request: only requests about a job, a workspace \
-             or a removal are relayed"
+            "cluster: refused a relayed {op} request: only requests about a job, a workspace, \
+             a machine's environment or a removal are relayed"
         ));
         reply(
             &mut s,

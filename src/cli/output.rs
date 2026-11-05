@@ -126,6 +126,14 @@ pub fn table(headers: &[&str], rows: &[Vec<String>]) -> String {
     s
 }
 
+/// `potluck env`: one `K=V` line a variable, control characters in it written as escapes, so a
+/// value can't pass for more lines (`--json` has the values as they are).
+pub fn env_human(env: &std::collections::BTreeMap<String, String>) -> String {
+    env.iter()
+        .map(|(k, v)| format!("{}={}\n", escape_controls(k), escape_controls(v)))
+        .collect()
+}
+
 /// `s` with each control character written as an escape: `\n`, `\t`, `\r`, `\x7f`, `\u{85}`.
 fn escape_controls(s: &str) -> String {
     let mut out = String::with_capacity(s.len());

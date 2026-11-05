@@ -296,6 +296,7 @@ fn describe(req: &Request) -> String {
         Request::Status => ("status", None),
         Request::Why { job } => ("why", Some(job)),
         Request::Nodes => ("nodes", None),
+        Request::Env { node } => ("env", node.as_deref()),
         Request::LeaseCheck { job, .. } => ("lease_check", Some(job)),
         Request::PairRequest => ("pair_request", None),
         Request::PairFinish { .. } => ("pair_finish", None),
@@ -408,6 +409,20 @@ fn handle_req<W: Write>(
                     .filter_map(|n| st.node_view(n, now))
                     .collect(),
             })
+        }
+        // Another member's is asked there ([`super::cluster::intercept`]).
+        Request::Env { node } => {
+            let me = sh.lock().node.clone();
+            match node {
+                Some(n) if *n != me && sh.cluster().is_none() => Err(format!(
+                    "{n} is not a member of the cluster: this machine, {me}, is in no cluster"
+                )),
+                Some(n) if *n != me => Err(format!("this is {me}, not {n}")),
+                _ => Ok(Response::Env {
+                    node: me,
+                    env: sh.login_env(),
+                }),
+            }
         }
         Request::LeaseCheck { job, token } => Ok(lease_check(sh, job, token)),
         Request::PairRequest

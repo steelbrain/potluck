@@ -45,8 +45,9 @@
 //!   reports, Linux `coredumpctl info`), sent once the runner has collected those written late
 //!   (a few seconds after a crash), the same way as `keep`; the owner stores them under the
 //!   job's `crash/`.
-//! - `client` (any member to a job's owner or a workspace's machine): a CLI request made on another
-//!   machine, answered exactly as on the socket (frames, raw bytes after `Bytes` and `CopyEntry`).
+//! - `client` (any member to a job's owner, a workspace's machine, or the machine `potluck env`
+//!   names): a CLI request made on another machine, answered exactly as on the socket (frames, raw
+//!   bytes after `Bytes` and `CopyEntry`).
 //! - `upload-pack` (a runner's `potluck _tunnel` to an owner): `git upload-pack` of the owner's own
 //!   mirror of a repository a dispatch there named (it holds every commit a job there needs).
 

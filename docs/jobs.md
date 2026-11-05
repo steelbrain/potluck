@@ -258,7 +258,10 @@ The daemon captures the login environment when it starts, so a change to a login
 anything else the login shell reads, reaches jobs only after `potluck restart` on that machine
 (or a restart of the daemon's service). A restart in place captures it again in the background:
 a job that starts before that capture ends gets the environment from before the restart, and so
-do all jobs if the capture fails (`daemon.log` says why).
+do all jobs if the capture fails (`daemon.log` says why). `potluck env NODE` prints the login
+environment NODE's daemon holds now, one `K=V` line a variable, and says on stderr what a job
+gets on top of it; without NODE, this machine's. In a cluster it asks NODE's daemon, and fails
+when NODE is down or runs another potluck version.
 
 ## Dispatching from inside a job
 
