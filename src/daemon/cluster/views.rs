@@ -426,6 +426,8 @@ fn view_of(r: &MachineReport) -> NodeView {
     NodeView {
         facts: r.facts.clone(),
         address: None,
+        // The pool its admission names, not one it reports: set by node_views.
+        pool: crate::mesh::trust::DEFAULT_POOL.to_string(),
         alive: true,
         updating: false,
         last_seen: None,
@@ -445,7 +447,7 @@ fn view_of(r: &MachineReport) -> NodeView {
 }
 
 /// Every member of `members`: this machine as it knows itself, the others from their latest
-/// reports.
+/// reports; each in the pool its admission names.
 fn node_views(
     st: &State,
     cs: &CState,
@@ -459,6 +461,7 @@ fn node_views(
         members.retain(|m| m.this_machine);
         if let Some(mut v) = st.node_view(&st.node, now) {
             v.address = Some(c.mesh().address());
+            v.pool = c.pool_here();
             out.push(v);
         }
         return out;
@@ -468,6 +471,7 @@ fn node_views(
             if let Some(mut v) = st.node_view(&st.node, now) {
                 // Where it listens now (the records may name an older port).
                 v.address = Some(c.mesh().address());
+                v.pool = m.pool;
                 out.push(v);
             }
             continue;
@@ -481,6 +485,7 @@ fn node_views(
                     ..Default::default()
                 },
                 address: None,
+                pool: m.pool.clone(),
                 alive: false,
                 updating: false,
                 last_seen: None,
@@ -490,6 +495,7 @@ fn node_views(
                 exclusive_job: None,
             },
         };
+        v.pool = m.pool.clone();
         v.alive = c.up(&m);
         // Heard from on another version: the mesh counts that as alive for a while.
         v.updating = m.alive && !v.alive;

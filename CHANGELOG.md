@@ -18,6 +18,7 @@
   signed it for that machine and the job it was granted is the one signed. Jobs queued before
   `user init` run only on the machine they were dispatched on. See
   [A cluster](docs/cluster.md#users).
+- `potluck nodes` shows each machine's pool, in its POOL column and as `pool` with `--json`.
 - In a cluster with users, a request another member answers (`wait`, `logs`, `why` or `cancel` of
   a job dispatched elsewhere, `cp`, `hold` or `release` of a workspace elsewhere, `env NODE`) is
   signed with the command line's user key; without one, it fails saying so.

@@ -194,7 +194,7 @@ between members and what happens when one is lost.
 | `cp W:PATH DEST` | Copy a file or directory out of a workspace. |
 | `status` | Machines, running jobs, the queue in start order, recent jobs, workspaces. |
 | `why JOB` | What a queued job waits on and who holds it, or how a job ended. |
-| `nodes` | Every machine with its facts, GPUs, version and address. |
+| `nodes` | Every machine with its pool, facts, GPUs, version and address. |
 | `env [NODE]` | Print the login environment a job on NODE (default: this machine) starts from. |
 | `pair`, `pair --finish REPLY` | Ask to join a cluster, and finish joining. |
 | `admit [--pool POOL] REQUEST` | Admit a machine and print the reply; with users, signed with this command line's user key, into POOL. |

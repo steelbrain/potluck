@@ -565,6 +565,7 @@ pub fn nodes_human(nodes: &[NodeView], now: Millis) -> String {
                 } else {
                     format!("no, seen {}", ago(now, n.last_seen))
                 },
+                n.pool.clone(),
                 format!("{} {}", f.os, f.os_version),
                 or_dash(Some(f.kernel.clone())),
                 f.arch.clone(),
@@ -579,8 +580,8 @@ pub fn nodes_human(nodes: &[NodeView], now: Millis) -> String {
         .collect();
     let mut s = table(
         &[
-            "NODE", "UP", "OS", "KERNEL", "ARCH", "CPUS", "RAM", "DISPLAY", "VERSION", "ADDRESS",
-            "CPU",
+            "NODE", "UP", "POOL", "OS", "KERNEL", "ARCH", "CPUS", "RAM", "DISPLAY", "VERSION",
+            "ADDRESS", "CPU",
         ],
         &machines,
     );

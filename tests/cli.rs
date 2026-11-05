@@ -2610,6 +2610,7 @@ fn status_daemon() -> FakeDaemon {
         let node = NodeView {
             facts: facts("msi", vec![gpu.clone()]),
             address: Some("10.0.0.2:7465".into()),
+            pool: "gpu".into(),
             alive: true,
             updating: false,
             last_seen: Some(now),
@@ -2774,10 +2775,11 @@ fn status_why_and_nodes_print_plain_tables() {
 
     let r = run(potluck(fake.home()).arg("nodes"));
     assert_eq!(r.code, 0);
-    assert!(r.stdout.starts_with("NODE  UP   OS             KERNEL           ARCH    CPUS  RAM       DISPLAY  VERSION  ADDRESS        CPU\nmsi   yes  linux CachyOS  7.2.8-2-cachyos  x86_64  24    93.9 GiB  yes      0.1.0    10.0.0.2:7465  Intel(R) Core(TM) Ultra 9 275HX\n"), "{}", r.stdout);
+    assert!(r.stdout.starts_with("NODE  UP   POOL  OS             KERNEL           ARCH    CPUS  RAM       DISPLAY  VERSION  ADDRESS        CPU\nmsi   yes  gpu   linux CachyOS  7.2.8-2-cachyos  x86_64  24    93.9 GiB  yes      0.1.0    10.0.0.2:7465  Intel(R) Core(TM) Ultra 9 275HX\n"), "{}", r.stdout);
     assert!(r.stdout.contains("\nNODE  GPU                     ALIAS  NAME                                DRIVER  STATE\nmsi   10de:2c19@0000:01:00.0  5080   NVIDIA GeForce RTX 5080 Laptop GPU  nvidia  leased\n"), "{}", r.stdout);
     let doc = one_json(&run(potluck(fake.home()).args(["nodes", "--json"])).stdout);
     assert_eq!(doc["nodes"][0]["facts"]["gpus"][0]["alias"], "5080");
+    assert_eq!(doc["nodes"][0]["pool"], "gpu");
 }
 
 #[test]

@@ -5582,11 +5582,11 @@ fn after_user_init_jobs_are_signed_and_checked_where_they_run() {
     );
 }
 
-/// A job runs only on machines in the pools its signed spec names. One for pool cloud runs on d,
-/// admitted with `--pool cloud`, not on a or b (pool default); a dispatch only d could run is
-/// refused unless it is for pool cloud. A default job waiting in a's queue never reaches d: not in
-/// a's report to it, not through upload-pack, and a refuses d's claim of it. b's report holds it
-/// with who signed it, without the spec signed.
+/// A job runs only on machines in the pools its signed spec names, and `nodes` shows each
+/// machine's pool. One for pool cloud runs on d, admitted with `--pool cloud`, not on a or b (pool
+/// default); a dispatch only d could run is refused unless it is for pool cloud. A default job
+/// waiting in a's queue never reaches d: not in a's report to it, not through upload-pack, and a
+/// refuses d's claim of it. b's report holds it with who signed it, without the spec signed.
 #[test]
 fn a_job_runs_only_in_its_pools() {
     let w = World::new();
@@ -5608,6 +5608,40 @@ fn a_job_runs_only_in_its_pools() {
     wait_until("b and d see each other", || {
         b.node_alive("d") && d.node_alive("b")
     });
+    // `nodes` shows each machine's pool, on every member.
+    for n in [&a, &b, &d] {
+        let pools: BTreeMap<String, String> = n.cli_ok(&["nodes"])["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| {
+                let name = v["facts"]["node"].as_str().unwrap().to_string();
+                (name, v["pool"].as_str().unwrap().to_string())
+            })
+            .collect();
+        let want = [("a", "default"), ("b", "default"), ("d", "cloud")]
+            .map(|(k, v)| (k.to_string(), v.to_string()));
+        assert_eq!(pools, want.into(), "{}", n.name);
+    }
+    let human = Command::new(BIN)
+        .arg("nodes")
+        .env("POTLUCK_HOME", &d.paths.home)
+        .env("POTLUCK_CONFIG", &d.paths.config)
+        .env_remove("POTLUCK_USER_KEY")
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&human.stdout);
+    let row = |name: &str| {
+        text.lines()
+            .find(|l| l.split_whitespace().next() == Some(name))
+            .unwrap_or_else(|| panic!("no {name} in {text}"))
+            .split_whitespace()
+            .nth(2)
+            .map(str::to_string)
+    };
+    assert!(text.starts_with("NODE  UP   POOL"), "{text}");
+    assert_eq!(row("d").as_deref(), Some("cloud"), "{text}");
+    assert_eq!(row("a").as_deref(), Some("default"), "{text}");
 
     let cloud = a.dispatch(&["--pool", "cloud", "--", "true"]);
     let j = a.done(&cloud);

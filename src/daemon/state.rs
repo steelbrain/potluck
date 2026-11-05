@@ -628,6 +628,8 @@ impl State {
         Some(NodeView {
             facts: m.facts.clone(),
             address: None,
+            // In a cluster its admission's ([`crate::daemon::cluster::views`] sets it).
+            pool: crate::mesh::trust::DEFAULT_POOL.to_string(),
             alive: true,
             updating: false,
             last_seen: Some(if name == self.node { now } else { m.last_seen }),

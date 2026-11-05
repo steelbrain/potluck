@@ -109,9 +109,10 @@ From then on:
 - Only a user's signed record admits or removes a machine. Admissions and removals signed by
   machine keys count for nothing, and a member's daemon signs neither.
 - A machine's pool is the one its admission names: `potluck admit --pool POOL`, default `default`.
-  The members `user init` signs in are in `default`. Pool names are letters, digits, `.`, `_` and
-  `-`, not starting with `-`. A job runs only on machines in its pools (`dispatch --pool`, default
-  `default`; see [Queue and claims](#queue-and-claims)).
+  `potluck nodes` shows each machine's pool (`pool` with `--json`). The members `user init` signs
+  in are in `default`. Pool names are letters, digits, `.`, `_` and `-`, not starting with `-`. A
+  job runs only on machines in its pools (`dispatch --pool`, default `default`; see
+  [Queue and claims](#queue-and-claims)).
 - The command line signs every dispatch with its user key, for the machine it dispatches on, and
   refuses to dispatch without one. The daemon there takes a dispatch only when a user signed it,
   for that machine, within 10 minutes of the daemon's clock, and with a nonce it hasn't seen in the

@@ -296,6 +296,10 @@ pub enum Response {
 pub struct NodeView {
     pub facts: Facts,
     pub address: Option<String>,
+    /// Its pool, from the admission that made it a member ([`crate::mesh::Mesh::pool_of`]):
+    /// `default` in a cluster without users, and on a machine in no cluster.
+    #[serde(default = "default_pool")]
+    pub pool: String,
     pub alive: bool,
     /// Heard from lately, but on another potluck version (`facts.version`): one of the two is
     /// updating. Not `alive`: members talk only on the same version.
@@ -307,6 +311,10 @@ pub struct NodeView {
     /// GPU ids leased now.
     pub gpus_busy: Vec<String>,
     pub exclusive_job: Option<JobId>,
+}
+
+fn default_pool() -> String {
+    crate::mesh::trust::DEFAULT_POOL.to_string()
 }
 
 /// `potluck status`: machines, running jobs, the queue, workspaces.
