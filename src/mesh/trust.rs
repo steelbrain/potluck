@@ -56,9 +56,28 @@
 //!   removed key signs after its removal, but by a member that took them before it heard of the
 //!   removal: it holds them, void, until it is next loaded, and the others, which get them with
 //!   the removal, turn them away.
+//!
+//! **Users.** The above is a cluster without users, where members' machine keys sign admissions
+//! and removals (v2 records). A user's key, held by a command line ([`super::user`]), signs
+//! records of its own; they carry other tags in their signed bytes, so v2 records keep theirs and
+//! their ids. See [`evaluate`] for what counts:
+//!
+//! - The first user's admission (the genesis) is signed by its own key and co-signed by a
+//!   member's machine key. Once one counts, users sign what counts: a user's admission of a
+//!   machine (v3, with its pool) or removal of one, and a user's admission or removal of a user.
+//!   What members sign counts for nothing from then on; until then, what users sign does.
+//! - Users form a chain of trust from the genesis as members do from the founder: a user's
+//!   admission counts if its signer is a user, a removal lists the records of the removed user it
+//!   keeps, removals that void each other go to the user admitted first.
+//! - Of competing geneses, the one co-signed by the member admitted earliest counts. Members are
+//!   then taken as the v2 records say, without the removals the removed machine could undo, so a
+//!   machine admitted after the co-signer can't unseat the users; one admitted before it can,
+//!   with a genesis of its own, as it could remove the co-signer before users.
+//! - A machine signs nothing that counts once there are users, so a user's removal of a machine
+//!   keeps nothing and is final.
 
 use super::MeshError;
-use super::identity::{Identity, PublicKey, Signature, write_private};
+use super::identity::{Identity, PublicKey, Signature, Signer, write_private};
 use crate::types::{Millis, NodeName};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
@@ -115,7 +134,21 @@ impl<'de> Deserialize<'de> for RecordId {
     }
 }
 
-/// A member's signed statement that a machine joins the cluster.
+/// The pool of a machine whose admission names none: one a member signed (v2), and the default of
+/// `potluck admit`.
+pub const DEFAULT_POOL: &str = "default";
+
+/// Whether `pool` is usable as a pool's name: the characters of a node name.
+pub fn valid_pool(pool: &str) -> bool {
+    valid_name(pool)
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+/// A signed statement that a machine joins the cluster: by a member's machine key (v2, `pool`
+/// None), or by a user's key (v3, `pool` set; `by` is then the user's name).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Admission {
     pub node: NodeName,
@@ -130,23 +163,80 @@ pub struct Admission {
     pub clock: u64,
     /// From the pairing request, so the new machine can tell the reply is for it.
     pub nonce: String,
+    /// The machine's pool, in an admission a user signed (v3). Absent from a member's (v2), whose
+    /// records keep their bytes and ids.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool: Option<String>,
     pub sig: Signature,
 }
 
 impl Admission {
     fn signed_bytes(&self) -> Vec<u8> {
-        serde_json::to_vec(&(
-            "potluck admission v2",
-            &self.node,
-            &self.key,
-            &self.address,
-            &self.by,
-            &self.by_key,
-            self.at,
-            self.clock,
-            &self.nonce,
-        ))
+        match &self.pool {
+            None => serde_json::to_vec(&(
+                "potluck admission v2",
+                &self.node,
+                &self.key,
+                &self.address,
+                &self.by,
+                &self.by_key,
+                self.at,
+                self.clock,
+                &self.nonce,
+            )),
+            Some(pool) => serde_json::to_vec(&(
+                "potluck admission v3",
+                &self.node,
+                &self.key,
+                &self.address,
+                pool,
+                &self.by,
+                &self.by_key,
+                self.at,
+                self.clock,
+                &self.nonce,
+            )),
+        }
         .expect("serializable")
+    }
+
+    /// Whether a user signed it (v3), not a member's machine key (v2).
+    pub fn by_user(&self) -> bool {
+        self.pool.is_some()
+    }
+
+    /// The machine's pool: [`DEFAULT_POOL`] for an admission a member signed.
+    pub fn pool_name(&self) -> &str {
+        self.pool.as_deref().unwrap_or(DEFAULT_POOL)
+    }
+
+    /// Signs, with user key `user` (named `by`), an admission of `key` as `node` into `pool`, at
+    /// logical time `clock` (see [`Trust::next_clock`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn sign_by_user(
+        user: &dyn Signer,
+        by: &str,
+        node: &str,
+        key: PublicKey,
+        address: &str,
+        pool: &str,
+        nonce: &str,
+        clock: u64,
+    ) -> Admission {
+        let mut a = Admission {
+            node: node.to_string(),
+            key,
+            address: address.to_string(),
+            by: by.to_string(),
+            by_key: user.public(),
+            at: crate::types::now_ms(),
+            clock,
+            nonce: nonce.to_string(),
+            pool: Some(pool.to_string()),
+            sig: Signature([0; 64]),
+        };
+        a.sig = user.sign(&a.signed_bytes());
+        a
     }
 
     pub fn verify(&self) -> bool {
@@ -178,6 +268,7 @@ impl Admission {
             at: crate::types::now_ms(),
             clock,
             nonce: nonce.to_string(),
+            pool: None,
             sig: Signature([0; 64]),
         };
         a.sig = id.sign(&a.signed_bytes());
@@ -190,7 +281,8 @@ impl Admission {
     }
 }
 
-/// A member's signed statement that a machine is out of the cluster for good.
+/// A signed statement that a machine is out of the cluster for good: by a member's machine key
+/// (v2), or by a user's key (v3, `by_user`; `by` is then the user's name).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Removal {
     pub node: NodeName,
@@ -202,15 +294,23 @@ pub struct Removal {
     /// Logical time, as for [`Admission::clock`].
     pub clock: u64,
     /// The ids of every record signed by `key` that the remover held when it signed: these stay
-    /// valid, any other record `key` signed is void (see the module docs).
+    /// valid, any other record `key` signed is void (see the module docs). Empty in a user's
+    /// removal: a machine signs nothing that counts once there are users.
     pub kept: Vec<RecordId>,
+    /// Signed by a user (v3). Absent from a member's (v2), whose records keep their bytes and ids.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub by_user: bool,
     pub sig: Signature,
 }
 
 impl Removal {
     fn signed_bytes(&self) -> Vec<u8> {
+        let tag = match self.by_user {
+            false => "potluck removal v2",
+            true => "potluck removal v3",
+        };
         serde_json::to_vec(&(
-            "potluck removal v2",
+            tag,
             &self.node,
             &self.key,
             &self.by,
@@ -220,6 +320,30 @@ impl Removal {
             &self.kept,
         ))
         .expect("serializable")
+    }
+
+    /// Signs, with user key `user` (named `by`), a removal of machine `key` (named `node`), at
+    /// logical time `clock`.
+    pub fn sign_by_user(
+        user: &dyn Signer,
+        by: &str,
+        node: &str,
+        key: PublicKey,
+        clock: u64,
+    ) -> Removal {
+        let mut r = Removal {
+            node: node.to_string(),
+            key,
+            by: by.to_string(),
+            by_key: user.public(),
+            at: crate::types::now_ms(),
+            clock,
+            kept: Vec::new(),
+            by_user: true,
+            sig: Signature([0; 64]),
+        };
+        r.sig = user.sign(&r.signed_bytes());
+        r
     }
 
     pub fn verify(&self) -> bool {
@@ -248,6 +372,7 @@ impl Removal {
             at: crate::types::now_ms(),
             clock,
             kept,
+            by_user: false,
             sig: Signature([0; 64]),
         };
         r.sig = id.sign(&r.signed_bytes());
@@ -255,11 +380,213 @@ impl Removal {
     }
 }
 
+/// The machine key that co-signs the first user's admission: a member's, when it was signed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoSign {
+    pub node: NodeName,
+    pub key: PublicKey,
+    pub sig: Signature,
+}
+
+/// A user's signed statement that a key is a user's: a key that signs who joins the cluster and
+/// who leaves, and who else is a user. The first user's (the genesis) is signed by its own key and
+/// co-signed by a member's machine key (`machine`); every other one by a user.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserAdmission {
+    pub name: String,
+    pub key: PublicKey,
+    pub by: String,
+    pub by_key: PublicKey,
+    /// When it was signed, by the signer's clock. Shown only; nothing depends on it.
+    pub at: Millis,
+    /// Logical time, as for [`Admission::clock`].
+    pub clock: u64,
+    pub nonce: String,
+    /// The genesis only: the member whose machine key co-signed it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<CoSign>,
+    pub sig: Signature,
+}
+
+impl UserAdmission {
+    /// What the user signs, and for the genesis the machine too.
+    pub fn signed_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(&(
+            "potluck user v1",
+            &self.name,
+            &self.key,
+            &self.by,
+            &self.by_key,
+            self.at,
+            self.clock,
+            &self.nonce,
+            self.machine.as_ref().map(|m| (&m.node, &m.key)),
+        ))
+        .expect("serializable")
+    }
+
+    /// The user's signature is good, and for the genesis (which only the key it admits signs)
+    /// the machine's too.
+    pub fn verify(&self) -> bool {
+        let bytes = self.signed_bytes();
+        self.by_key.verify(&bytes, &self.sig)
+            && self
+                .machine
+                .as_ref()
+                .is_none_or(|m| self.by_key == self.key && m.key.verify(&bytes, &m.sig))
+    }
+
+    pub fn id(&self) -> RecordId {
+        RecordId::of(&self.signed_bytes())
+    }
+
+    /// Whether this is a first user's admission: signed by the key it admits, co-signed by a
+    /// machine.
+    pub fn is_genesis(&self) -> bool {
+        self.machine.is_some() && self.by_key == self.key
+    }
+
+    /// Signs, with user key `user` (named `by`), an admission of user `key` as `name`.
+    pub fn sign(user: &dyn Signer, by: &str, name: &str, key: PublicKey, clock: u64) -> Self {
+        let mut u = UserAdmission {
+            name: name.to_string(),
+            key,
+            by: by.to_string(),
+            by_key: user.public(),
+            at: crate::types::now_ms(),
+            clock,
+            nonce: nonce(),
+            machine: None,
+            sig: Signature([0; 64]),
+        };
+        u.sig = user.sign(&u.signed_bytes());
+        u
+    }
+
+    /// A first user's admission of `user`'s own key as `name`, signed by it, for the machine
+    /// `node` (key `machine`) to co-sign ([`UserAdmission::co_sign`]).
+    pub fn genesis(
+        user: &dyn Signer,
+        name: &str,
+        node: &str,
+        machine: PublicKey,
+        clock: u64,
+    ) -> Self {
+        let mut u = UserAdmission {
+            name: name.to_string(),
+            key: user.public(),
+            by: name.to_string(),
+            by_key: user.public(),
+            at: crate::types::now_ms(),
+            clock,
+            nonce: nonce(),
+            machine: Some(CoSign {
+                node: node.to_string(),
+                key: machine,
+                sig: Signature([0; 64]),
+            }),
+            sig: Signature([0; 64]),
+        };
+        u.sig = user.sign(&u.signed_bytes());
+        u
+    }
+
+    /// Co-signs a genesis with machine key `id`, which it names.
+    pub fn co_sign(&mut self, id: &Identity) -> Result<(), String> {
+        let bytes = self.signed_bytes();
+        let Some(m) = &mut self.machine else {
+            return Err("not a first user's admission".into());
+        };
+        if m.key != id.public() {
+            return Err("it names another machine's key".into());
+        }
+        m.sig = id.sign(&bytes);
+        Ok(())
+    }
+}
+
+/// A user's signed statement that a key is no user's any more.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserRemoval {
+    pub name: String,
+    pub key: PublicKey,
+    pub by: String,
+    pub by_key: PublicKey,
+    pub at: Millis,
+    pub clock: u64,
+    /// As for [`Removal::kept`]: the records `key` signed that count where it was signed stay
+    /// valid; any other record it signed is void.
+    pub kept: Vec<RecordId>,
+    pub sig: Signature,
+}
+
+impl UserRemoval {
+    fn signed_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(&(
+            "potluck user removal v1",
+            &self.name,
+            &self.key,
+            &self.by,
+            &self.by_key,
+            self.at,
+            self.clock,
+            &self.kept,
+        ))
+        .expect("serializable")
+    }
+
+    pub fn verify(&self) -> bool {
+        self.by_key.verify(&self.signed_bytes(), &self.sig)
+    }
+
+    pub fn id(&self) -> RecordId {
+        RecordId::of(&self.signed_bytes())
+    }
+
+    /// Signs, with user key `user` (named `by`), a removal of user `key` (named `name`) keeping
+    /// the records of its listed in `kept`.
+    pub fn sign(
+        user: &dyn Signer,
+        by: &str,
+        name: &str,
+        key: PublicKey,
+        kept: Vec<RecordId>,
+        clock: u64,
+    ) -> UserRemoval {
+        let mut r = UserRemoval {
+            name: name.to_string(),
+            key,
+            by: by.to_string(),
+            by_key: user.public(),
+            at: crate::types::now_ms(),
+            clock,
+            kept,
+            sig: Signature([0; 64]),
+        };
+        r.sig = user.sign(&r.signed_bytes());
+        r
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Record {
+    /// A machine's admission: v2 by a member, v3 by a user ([`Admission::by_user`]).
     Admission(Admission),
+    /// A machine's removal: v2 by a member, v3 by a user ([`Removal::by_user`]).
     Removal(Removal),
+    /// A user's admission.
+    User(UserAdmission),
+    /// A user's removal.
+    UserRemoval(UserRemoval),
+}
+
+/// Whose admission a record's signer needs, and what an admission admits: a machine's key as a
+/// member (by a v2 admission, or the founder), or a key as a user's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Tier {
+    Machine,
+    User,
 }
 
 impl Record {
@@ -268,36 +595,83 @@ impl Record {
         match self {
             Record::Admission(a) => a.at,
             Record::Removal(r) => r.at,
+            Record::User(u) => u.at,
+            Record::UserRemoval(r) => r.at,
         }
     }
     pub fn clock(&self) -> u64 {
         match self {
             Record::Admission(a) => a.clock,
             Record::Removal(r) => r.clock,
+            Record::User(u) => u.clock,
+            Record::UserRemoval(r) => r.clock,
         }
     }
     pub fn sig(&self) -> &Signature {
         match self {
             Record::Admission(a) => &a.sig,
             Record::Removal(r) => &r.sig,
+            Record::User(u) => &u.sig,
+            Record::UserRemoval(r) => &r.sig,
         }
     }
+    /// The key that signed it: a machine's for a v2 record, a user's for the others (the
+    /// genesis's own key; its co-signer is [`CoSign::key`]).
     pub fn signer(&self) -> PublicKey {
         match self {
             Record::Admission(a) => a.by_key,
             Record::Removal(r) => r.by_key,
+            Record::User(u) => u.by_key,
+            Record::UserRemoval(r) => r.by_key,
         }
     }
     pub fn id(&self) -> RecordId {
         match self {
             Record::Admission(a) => a.id(),
             Record::Removal(r) => r.id(),
+            Record::User(u) => u.id(),
+            Record::UserRemoval(r) => r.id(),
         }
     }
     pub fn verify(&self) -> bool {
         match self {
             Record::Admission(a) => a.verify(),
             Record::Removal(r) => r.verify(),
+            Record::User(u) => u.verify(),
+            Record::UserRemoval(r) => r.verify(),
+        }
+    }
+
+    /// A record a member's machine key signed (v2): what counts in a cluster without users.
+    pub fn is_legacy(&self) -> bool {
+        match self {
+            Record::Admission(a) => !a.by_user(),
+            Record::Removal(r) => !r.by_user,
+            Record::User(_) | Record::UserRemoval(_) => false,
+        }
+    }
+
+    /// The admission its signer needs held for it to be taken: the genesis's co-signer as a
+    /// member, a v2 record's signer as a member, any other's signer as a user.
+    fn needs(&self) -> (Tier, PublicKey) {
+        match self {
+            Record::User(u) if u.is_genesis() => (
+                Tier::Machine,
+                u.machine.as_ref().map(|m| m.key).unwrap_or(u.by_key),
+            ),
+            r if r.is_legacy() => (Tier::Machine, r.signer()),
+            r => (Tier::User, r.signer()),
+        }
+    }
+
+    /// Who it admits, if it admits a key that may sign: a v2 admission a member, a user's
+    /// admission a user. A user's admission of a machine (v3) admits no signer: machines sign
+    /// nothing that counts once there are users.
+    fn admits(&self) -> Option<(Tier, PublicKey)> {
+        match self {
+            Record::Admission(a) if !a.by_user() => Some((Tier::Machine, a.key)),
+            Record::User(u) => Some((Tier::User, u.key)),
+            _ => None,
         }
     }
 }
@@ -315,22 +689,295 @@ pub struct View {
     /// void records only if they are this machine's own or admit it, or turned void after it
     /// took them).
     pub known: BTreeSet<PublicKey>,
+    /// The users and the admissions that made them users, once a first user's admission counts
+    /// ([`View::genesis`]); none before.
+    pub users: BTreeMap<PublicKey, UserAdmission>,
+    /// Keys that are no users' any more, and their removals.
+    pub users_removed: BTreeMap<PublicKey, UserRemoval>,
+    /// The first user's admission that counts. From it on only what users sign makes members.
+    pub genesis: Option<RecordId>,
 }
 
 impl View {
     /// The member set `records` imply for `cluster` (see the module docs).
     pub fn compute(cluster: &PublicKey, records: &[Record]) -> View {
-        Eval::run(cluster, records, true, MAX_MEMBERS).view()
+        evaluate(cluster, records, true, MAX_MEMBERS).view
     }
 
     /// [`View::compute`] for records whose signatures were checked already (a [`Trust`]'s), with
     /// room for `limit` members ([`MAX_MEMBERS`]; tests use fewer).
     fn of_verified(cluster: &PublicKey, records: &[Record], limit: usize) -> View {
-        Eval::run(cluster, records, false, limit).view()
+        evaluate(cluster, records, false, limit).view
     }
 
     pub fn by_name(&self, name: &str) -> Option<&Admission> {
         self.members.values().find(|a| a.node == name)
+    }
+
+    /// Whether users sign what counts: a first user's admission counts.
+    pub fn users_exist(&self) -> bool {
+        self.genesis.is_some()
+    }
+
+    /// Everything a view says but [`View::known`]: what a store must not change when it drops
+    /// records.
+    fn standing(&self) -> impl PartialEq + std::fmt::Debug + '_ {
+        (
+            &self.members,
+            &self.removed,
+            &self.valid,
+            &self.users,
+            &self.users_removed,
+            &self.genesis,
+        )
+    }
+}
+
+/// What [`evaluate`] found, beside the view: what [`Trust::why_not_member`] explains with.
+struct Evaluated {
+    view: View,
+    /// For a cluster with users: each user key's lowest admission clock that counts, the
+    /// removals of users that count (what each keeps), and the machines' admissions turned away
+    /// by name or room.
+    tier: Option<MachineTier>,
+}
+
+#[derive(Default)]
+struct MachineTier {
+    user_reach: HashMap<PublicKey, u64>,
+    user_kept: HashMap<PublicKey, Vec<HashSet<RecordId>>>,
+    name_taken: HashSet<RecordId>,
+    no_room: HashSet<RecordId>,
+}
+
+impl MachineTier {
+    /// Whether a record (id `id`, at `clock`) signed by user key `by` counts as far as its
+    /// signer goes: the key is a user's (for an admission, from before `clock`), and no removal
+    /// of that user that counts voids it.
+    fn signed_ok(&self, id: RecordId, by: &PublicKey, clock: u64, admission: bool) -> bool {
+        self.user_reach
+            .get(by)
+            .is_some_and(|&c| !admission || clock > c)
+            && self
+                .user_kept
+                .get(by)
+                .is_none_or(|ks| ks.iter().all(|k| k.contains(&id)))
+    }
+}
+
+/// The view of `records` (with `verify`, those whose signature is bad left out first):
+///
+/// - Records members signed (v2) are labelled as before users ([`Eval`]). Without a first user's
+///   admission that counts, they alone decide (legacy), and what users signed counts for nothing.
+/// - A first user's admission (the genesis) counts if a member's machine key co-signed it, after
+///   that member's admission. Members here are as the v2 records say without the removals that
+///   their machine could undo (signed by a machine admitted after it): a machine admitted later
+///   can't keep the genesis from counting. Of several, the one co-signed by the machine admitted
+///   earliest counts (founder first, then by the clock and id of its first admission that
+///   counts), then the lower clock, then id; the others count for nothing.
+/// - From the genesis on, users are labelled as members were ([`Eval`], the genesis's key as
+///   founder): a user's admission counts if its signer is a user from a lower clock; a removal
+///   lists what it keeps of the removed user's records, and removals that void each other go to
+///   the user admitted first.
+/// - Then machines: a user's admission (v3) or removal of a machine counts if its signer is a user
+///   (an admission: from a lower clock) and no removal of that user that counts voids it. The
+///   members are the keys such admissions admit that no such removal removes, names unique and
+///   room for `limit` as before users. Records members signed count for nothing any more.
+fn evaluate(cluster: &PublicKey, records: &[Record], verify: bool, limit: usize) -> Evaluated {
+    let mut seen = HashSet::new();
+    let items: Vec<(RecordId, &Record)> = records
+        .iter()
+        .filter(|r| !verify || r.verify())
+        .map(|r| (r.id(), r))
+        .filter(|(id, _)| seen.insert(*id))
+        .collect();
+    let legacy_items: Vec<(RecordId, &Record)> = items
+        .iter()
+        .copied()
+        .filter(|(_, r)| r.is_legacy())
+        .collect();
+    let legacy = Eval::run_items(cluster, legacy_items.clone(), limit);
+    let mut view = legacy.view();
+    view.known.extend(items.iter().filter_map(|(_, r)| match r {
+        Record::Admission(a) => Some(a.key),
+        _ => None,
+    }));
+    let geneses: Vec<(RecordId, &UserAdmission)> = items
+        .iter()
+        .filter_map(|(id, r)| match r {
+            Record::User(u) if u.is_genesis() => Some((*id, u)),
+            _ => None,
+        })
+        .collect();
+    if geneses.is_empty() {
+        return Evaluated { view, tier: None };
+    }
+    // Members for the genesis: without the removals their machine could undo.
+    let ranks = legacy.ranks();
+    let final_items: Vec<(RecordId, &Record)> = legacy_items
+        .iter()
+        .copied()
+        .filter(|(_, r)| match r {
+            Record::Removal(rm) => {
+                matches!((ranks.get(&rm.by_key), ranks.get(&rm.key)), (Some(b), Some(k)) if b < k)
+            }
+            _ => true,
+        })
+        .collect();
+    let cand = Eval::run_items(cluster, final_items, limit);
+    let cand_view = cand.view();
+    let cand_ranks = cand.ranks();
+    let winner = geneses
+        .iter()
+        .filter_map(|&(id, g)| {
+            let m = g.machine.as_ref()?;
+            let rank = *cand_ranks.get(&m.key)?;
+            (cand_view.members.contains_key(&m.key) && g.clock > rank.0).then_some((
+                (rank, g.clock, id),
+                id,
+                g,
+            ))
+        })
+        .min_by_key(|(order, _, _)| *order);
+    let Some((_, gid, genesis)) = winner else {
+        return Evaluated { view, tier: None };
+    };
+    // Users: as members, from the genesis.
+    let mut synth: Vec<(RecordId, Record)> = Vec::new();
+    let mut real: HashMap<RecordId, &Record> = HashMap::new();
+    for &(id, r) in &items {
+        let s = match r {
+            Record::User(u) if u.is_genesis() && id != gid => continue,
+            // Only the genesis admits its own key.
+            Record::User(u) if u.by_key == u.key && id != gid => continue,
+            Record::User(u) => Record::Admission(Admission {
+                node: u.name.clone(),
+                key: u.key,
+                address: String::new(),
+                by: u.by.clone(),
+                by_key: u.by_key,
+                at: u.at,
+                clock: u.clock,
+                nonce: String::new(),
+                pool: None,
+                sig: Signature([0; 64]),
+            }),
+            Record::UserRemoval(rm) => Record::Removal(Removal {
+                node: rm.name.clone(),
+                key: rm.key,
+                by: rm.by.clone(),
+                by_key: rm.by_key,
+                at: rm.at,
+                clock: rm.clock,
+                kept: rm.kept.clone(),
+                by_user: false,
+                sig: Signature([0; 64]),
+            }),
+            _ => continue,
+        };
+        real.insert(id, r);
+        synth.push((id, s));
+    }
+    let users = Eval::run_items(
+        &genesis.key,
+        synth.iter().map(|(id, r)| (*id, r)).collect(),
+        limit,
+    );
+    let mut tier = MachineTier::default();
+    let mut valid: BTreeSet<RecordId> = cand_view.valid.clone();
+    valid.insert(gid);
+    let mut user_members = BTreeMap::new();
+    let mut user_removed = BTreeMap::new();
+    for (i, r) in users.recs.iter().enumerate() {
+        if users.lab[i] != Label::In {
+            continue;
+        }
+        let id = users.ids[i];
+        valid.insert(id);
+        match (r, real[&id]) {
+            (Record::Admission(a), Record::User(u)) => {
+                tier.user_reach.entry(a.key).or_insert(a.clock);
+                user_members.entry(a.key).or_insert_with(|| u.clone());
+            }
+            (Record::Removal(rm), Record::UserRemoval(ur)) => {
+                tier.user_kept
+                    .entry(rm.key)
+                    .or_default()
+                    .push(rm.kept.iter().copied().collect());
+                user_removed.entry(rm.key).or_insert_with(|| ur.clone());
+            }
+            _ => {}
+        }
+    }
+    user_members.retain(|k, _| !user_removed.contains_key(k));
+    // Machines: what users signed.
+    let mut machine_recs: Vec<(u64, RecordId, &Record)> = items
+        .iter()
+        .filter(|(_, r)| !r.is_legacy() && matches!(r, Record::Admission(_) | Record::Removal(_)))
+        .map(|&(id, r)| (r.clock(), id, r))
+        .collect();
+    machine_recs.sort_by_key(|&(c, id, _)| (c, id));
+    let mut removed: BTreeMap<PublicKey, Removal> = BTreeMap::new();
+    let mut released: HashMap<PublicKey, u64> = HashMap::new();
+    for &(clock, id, r) in &machine_recs {
+        if let Record::Removal(rm) = r
+            && tier.signed_ok(id, &rm.by_key, clock, false)
+        {
+            valid.insert(id);
+            removed.entry(rm.key).or_insert_with(|| rm.clone());
+            released.entry(rm.key).or_insert(clock);
+        }
+    }
+    let mut members: BTreeMap<PublicKey, Admission> = BTreeMap::new();
+    let mut by_name: HashMap<&str, Vec<PublicKey>> = HashMap::new();
+    let mut taking: HashSet<PublicKey> = HashSet::new();
+    let mut release_at: std::collections::BinaryHeap<std::cmp::Reverse<(u64, PublicKey)>> =
+        Default::default();
+    for &(clock, id, r) in &machine_recs {
+        let Record::Admission(a) = r else { continue };
+        while let Some(std::cmp::Reverse((at, k))) = release_at.peek().copied()
+            && at < clock
+        {
+            release_at.pop();
+            taking.remove(&k);
+        }
+        if !tier.signed_ok(id, &a.by_key, clock, true) {
+            continue;
+        }
+        let free = |k: &PublicKey| released.get(k).is_some_and(|&c| c < clock);
+        if by_name
+            .get(a.node.as_str())
+            .is_some_and(|ks| ks.iter().any(|k| *k != a.key && !free(k)))
+        {
+            tier.name_taken.insert(id);
+            continue;
+        }
+        if taking.len() - usize::from(taking.contains(&a.key)) >= limit {
+            tier.no_room.insert(id);
+            continue;
+        }
+        valid.insert(id);
+        let holders = by_name.entry(a.node.as_str()).or_default();
+        if !holders.contains(&a.key) {
+            holders.push(a.key);
+        }
+        if taking.insert(a.key) {
+            let at = released.get(&a.key).copied().unwrap_or(u64::MAX);
+            release_at.push(std::cmp::Reverse((at, a.key)));
+        }
+        if !removed.contains_key(&a.key) {
+            members.entry(a.key).or_insert_with(|| a.clone());
+        }
+    }
+    view.members = members;
+    view.removed = removed;
+    view.valid = valid;
+    view.users = user_members;
+    view.users_removed = user_removed;
+    view.genesis = Some(gid);
+    Evaluated {
+        view,
+        tier: Some(tier),
     }
 }
 
@@ -397,14 +1044,30 @@ struct Room {
 type Reach = HashMap<PublicKey, (u64, RecordId)>;
 
 impl<'a> Eval<'a> {
-    /// Labels `records`; with `verify`, records whose signature is bad are left out first.
+    /// Labels the records members signed (v2) among `records`; with `verify`, records whose
+    /// signature is bad are left out first.
     fn run(cluster: &PublicKey, records: &'a [Record], verify: bool, limit: usize) -> Eval<'a> {
-        let mut seen = HashSet::new();
-        let mut recs: Vec<(u64, RecordId, &Record)> = records
+        let items = records
             .iter()
-            .filter(|r| !verify || r.verify())
-            .map(|r| (r.clock(), r.id(), r))
-            .filter(|(_, id, _)| seen.insert(*id))
+            .filter(|r| r.is_legacy() && (!verify || r.verify()))
+            .map(|r| (r.id(), r))
+            .collect();
+        Eval::run_items(cluster, items, limit)
+    }
+
+    /// Labels `items` (admissions and removals, with their ids), `cluster` as founder: the
+    /// records members signed, or users' records shaped as such ([`evaluate`]).
+    fn run_items(
+        cluster: &PublicKey,
+        items: Vec<(RecordId, &'a Record)>,
+        limit: usize,
+    ) -> Eval<'a> {
+        let mut seen = HashSet::new();
+        let mut recs: Vec<(u64, RecordId, &Record)> = items
+            .into_iter()
+            .filter(|(_, r)| matches!(r, Record::Admission(_) | Record::Removal(_)))
+            .filter(|(id, _)| seen.insert(*id))
+            .map(|(id, r)| (r.clock(), id, r))
             .collect();
         recs.sort_by_key(|r| (r.0, r.1));
         let ids: Vec<RecordId> = recs.iter().map(|r| r.1).collect();
@@ -428,6 +1091,7 @@ impl<'a> Eval<'a> {
                     rem_of.entry(rm.key).or_default().push(i);
                     kept.insert(i, rm.kept.iter().copied().collect());
                 }
+                Record::User(_) | Record::UserRemoval(_) => {}
             }
         }
         let attackers = recs
@@ -468,6 +1132,20 @@ impl<'a> Eval<'a> {
 
     fn is_admission(&self, i: usize) -> bool {
         matches!(self.recs[i], Record::Admission(_))
+    }
+
+    /// Each key's first admission that counts, by clock then id: where it ranks when removals
+    /// void each other (see [`Trust::ranks`]).
+    fn ranks(&self) -> HashMap<PublicKey, (u64, RecordId)> {
+        let mut ranks = HashMap::new();
+        for (i, r) in self.recs.iter().enumerate() {
+            if let Record::Admission(a) = r
+                && self.lab[i] == Label::In
+            {
+                ranks.entry(a.key).or_insert((a.clock, self.ids[i]));
+            }
+        }
+        ranks
     }
 
     fn reach(&self, lab: &[Label], ok: impl Fn(Label) -> bool) -> Reach {
@@ -555,6 +1233,7 @@ impl<'a> Eval<'a> {
     fn room_add(&self, room: &mut Room, i: usize, lab: &[Label]) {
         match self.recs[i] {
             Record::Removal(_) => room.pending.push(i),
+            Record::User(_) | Record::UserRemoval(_) => {}
             Record::Admission(a) => {
                 if lab[i] == Label::In {
                     let n = room.adm_in.entry(a.key).or_default();
@@ -1101,12 +1780,49 @@ impl Trust {
     /// few: what a pairing reply carries (removed machines' records count for good, and the
     /// reply is pasted). The machine joining takes the rest when it first compares records with
     /// a member.
+    ///
+    /// In a cluster with users: the genesis and the admissions back from its co-signer to the
+    /// founder's (as above), every user's record that counts, and each member's admission.
     pub fn members_proof(&self) -> Vec<Record> {
+        let mut want: HashSet<RecordId>;
+        match self.genesis() {
+            None => {
+                let mut keys: Vec<PublicKey> = self.view.members.keys().copied().collect();
+                keys.push(self.cluster);
+                want = self.legacy_proof(keys);
+            }
+            Some(g) => {
+                let cosigner = g.machine.as_ref().map(|m| m.key).unwrap_or(g.key);
+                want = self.legacy_proof(vec![cosigner, self.cluster]);
+                want.extend(self.records.iter().filter_map(|r| match r {
+                    Record::User(_) | Record::UserRemoval(_) => {
+                        Some(r.id()).filter(|id| self.view.valid.contains(id))
+                    }
+                    _ => None,
+                }));
+                want.extend(self.view.members.values().map(Admission::id));
+            }
+        }
+        self.records
+            .iter()
+            .filter(|r| {
+                let id = r.id();
+                want.contains(&id)
+                    || matches!(r, Record::Admission(a) if a.key == self.cluster && a.is_founding()
+                        && self.view.valid.contains(&id))
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// The ids of the members' records (v2) that make `keys` members, as
+    /// [`Trust::members_proof`] says.
+    fn legacy_proof(&self, mut keys: Vec<PublicKey>) -> HashSet<RecordId> {
         // Each key's first admission and removal that count, by clock then id: the ones the
         // view names, and the first admission is the one its chain of signers starts from.
         let mut adm: HashMap<PublicKey, (u64, RecordId, &Admission)> = HashMap::new();
         let mut rem: HashMap<PublicKey, (u64, RecordId, &Removal)> = HashMap::new();
-        for r in &self.records {
+        for r in self.records.iter().filter(|r| r.is_legacy()) {
             let id = r.id();
             if !self.view.valid.contains(&id) {
                 continue;
@@ -1124,12 +1840,11 @@ impl Trust {
                         *e = (rm.clock, id, rm);
                     }
                 }
+                Record::User(_) | Record::UserRemoval(_) => {}
             }
         }
         let mut want: HashSet<RecordId> = HashSet::new();
         let mut seen: HashSet<PublicKey> = HashSet::new();
-        let mut keys: Vec<PublicKey> = self.view.members.keys().copied().collect();
-        keys.push(self.cluster);
         while let Some(k) = keys.pop() {
             if !seen.insert(k) {
                 continue;
@@ -1143,16 +1858,34 @@ impl Trust {
                 keys.push(rm.by_key);
             }
         }
-        self.records
-            .iter()
-            .filter(|r| {
-                let id = r.id();
-                want.contains(&id)
-                    || matches!(r, Record::Admission(a) if a.key == self.cluster && a.is_founding()
-                        && self.view.valid.contains(&id))
-            })
-            .cloned()
-            .collect()
+        want
+    }
+
+    /// The first user's admission that counts, if users exist.
+    pub fn genesis(&self) -> Option<&UserAdmission> {
+        let g = self.view.genesis?;
+        self.records.iter().find_map(|r| match r {
+            Record::User(u) if u.is_genesis() && u.id() == g => Some(u),
+            _ => None,
+        })
+    }
+
+    /// Whether users sign what counts here (a first user's admission counts): from then on only
+    /// what users sign admits or removes machines.
+    pub fn users_exist(&self) -> bool {
+        self.view.users_exist()
+    }
+
+    /// Whether `key` is a user's key that counts: admitted by a user (or the first user) and not
+    /// removed.
+    pub fn recognized_user(&self, key: &PublicKey) -> bool {
+        self.view.users.contains_key(key)
+    }
+
+    /// The pool of member `key`, from the admission that made it a member ([`DEFAULT_POOL`] for
+    /// one a member signed); None for a key that is no member.
+    pub fn pool_of(&self, key: &PublicKey) -> Option<&str> {
+        self.view.members.get(key).map(Admission::pool_name)
     }
 
     fn recompute(&mut self) {
@@ -1198,9 +1931,7 @@ impl Trust {
                 .cloned()
                 .collect();
             let view = View::of_verified(&self.cluster, &rest, self.limit);
-            if (&view.members, &view.removed, &view.valid)
-                == (&self.view.members, &self.view.removed, &self.view.valid)
-            {
+            if view.standing() == self.view.standing() {
                 self.records = rest;
                 self.view = view;
                 dropped.extend(group);
@@ -1250,12 +1981,14 @@ impl Trust {
     }
 
     /// Where each key ranks when removals void each other (lower first): its earliest admission
-    /// that counts, by clock then id, the founder's founding first. Keys no admission that
-    /// counts admits are missing.
+    /// a member signed (v2) that counts, by clock then id, the founder's founding first. Keys no
+    /// such admission that counts admits are missing.
     pub fn ranks(&self) -> HashMap<PublicKey, (u64, RecordId)> {
         let mut ranks: HashMap<PublicKey, (u64, RecordId)> = HashMap::new();
         for r in &self.records {
-            if let Record::Admission(a) = r {
+            if let Record::Admission(a) = r
+                && !a.by_user()
+            {
                 let id = a.id();
                 if self.view.valid.contains(&id) {
                     let rank = ranks.entry(a.key).or_insert((a.clock, id));
@@ -1266,26 +1999,73 @@ impl Trust {
         ranks
     }
 
-    /// Whether a removal of `key` that counts is final: signed by a member ranked before `key`,
-    /// which `key` can't undo by removing it back.
+    /// Whether a removal of `key` that counts is final: signed by a user, or by a member ranked
+    /// before `key`, which `key` can't undo by removing it back.
     pub fn removed_for_good(&self, key: &PublicKey) -> bool {
+        if self.view.removed.get(key).is_some_and(|r| r.by_user) {
+            return true;
+        }
         let ranks = self.ranks();
         let Some(rank) = ranks.get(key) else {
             return false;
         };
         self.records.iter().any(|r| match r {
-            Record::Removal(rm) => {
+            Record::Removal(rm) if !rm.by_user => {
                 rm.key == *key
                     && self.view.valid.contains(&rm.id())
                     && ranks.get(&rm.by_key).is_some_and(|by| by < rank)
             }
-            Record::Admission(_) => false,
+            _ => false,
         })
     }
 
     /// Why `key` is not a member, in plain words.
     pub fn why_not_member(&self, key: &PublicKey) -> String {
-        Eval::run(&self.cluster, &self.records, false, self.limit).why_not_member(key)
+        if !self.users_exist() {
+            return Eval::run(&self.cluster, &self.records, false, self.limit).why_not_member(key);
+        }
+        if let Some(rm) = self.view.removed.get(key) {
+            return format!("it was removed by {}", rm.by);
+        }
+        let Some(tier) = evaluate(&self.cluster, &self.records, false, self.limit).tier else {
+            return "its admission no longer counts".into();
+        };
+        let mut adms = self
+            .records
+            .iter()
+            .filter_map(|r| match r {
+                Record::Admission(a) if a.key == *key && a.by_user() => Some(a),
+                _ => None,
+            })
+            .peekable();
+        if adms.peek().is_none() {
+            return "the cluster has users, and no user admitted it".into();
+        }
+        for a in adms {
+            let id = a.id();
+            if tier.name_taken.contains(&id) {
+                return format!(
+                    "another machine was admitted under the name {} first",
+                    a.node
+                );
+            }
+            if tier.no_room.contains(&id) {
+                return format!(
+                    "the cluster had {} members, the most it can have, when {} admitted it",
+                    self.limit, a.by
+                );
+            }
+            if !tier.user_reach.contains_key(&a.by_key) {
+                return format!("{}, the user that admitted it, is no user here", a.by);
+            }
+            if !tier.signed_ok(id, &a.by_key, a.clock, true) {
+                return format!(
+                    "{} admitted it, and was removed by a user that had not seen the admission",
+                    a.by
+                );
+            }
+        }
+        "its admission no longer counts".into()
     }
 
     /// Room for this many members.
@@ -1320,13 +2100,13 @@ impl Trust {
         let known: HashSet<RecordId> = self.records.iter().map(Record::id).collect();
         let mut admitted = self.admitted();
         // Keys admitted among the records arriving, by keys admitted already, transitively.
-        let mut admits: HashMap<PublicKey, Vec<PublicKey>> = HashMap::new();
+        let mut admits: HashMap<(Tier, PublicKey), Vec<(Tier, PublicKey)>> = HashMap::new();
         for (_, r) in &incoming {
-            if let Record::Admission(a) = r {
-                admits.entry(a.by_key).or_default().push(a.key);
+            if let Some(a) = r.admits() {
+                admits.entry(r.needs()).or_default().push(a);
             }
         }
-        let mut reached: Vec<PublicKey> = admitted.iter().copied().collect();
+        let mut reached: Vec<(Tier, PublicKey)> = admitted.iter().copied().collect();
         while let Some(k) = reached.pop() {
             for key in admits.remove(&k).unwrap_or_default() {
                 if admitted.insert(key) {
@@ -1336,7 +2116,7 @@ impl Trust {
         }
         let fresh: Vec<(RecordId, Record)> = incoming
             .into_iter()
-            .filter(|(id, r)| !known.contains(id) && admitted.contains(&r.signer()))
+            .filter(|(id, r)| !known.contains(id) && admitted.contains(&r.needs()))
             .collect();
         if !fresh.is_empty() && self.refused.contains(&batch_key(&fresh)) {
             return Vec::new();
@@ -1362,13 +2142,13 @@ impl Trust {
         // A batch may carry a chain (a admits b, b admits c): a record whose signer isn't
         // admitted yet waits until a record taken admits it. In the order they came, those
         // admitted at once first, then each signer's as its admission is taken.
-        let mut waiting: HashMap<PublicKey, Vec<usize>> = HashMap::new();
+        let mut waiting: HashMap<(Tier, PublicKey), Vec<usize>> = HashMap::new();
         let mut ready: VecDeque<usize> = VecDeque::new();
         for (i, (_, r)) in pending.iter().enumerate() {
-            if admitted.contains(&r.signer()) {
+            if admitted.contains(&r.needs()) {
                 ready.push_back(i);
             } else {
-                waiting.entry(r.signer()).or_default().push(i);
+                waiting.entry(r.needs()).or_default().push(i);
             }
         }
         let mut added = Vec::new();
@@ -1377,10 +2157,10 @@ impl Trust {
             if !known.insert(*id) {
                 continue;
             }
-            if let Record::Admission(a) = r
-                && admitted.insert(a.key)
+            if let Some(a) = r.admits()
+                && admitted.insert(a)
             {
-                ready.extend(waiting.remove(&a.key).unwrap_or_default());
+                ready.extend(waiting.remove(&a).unwrap_or_default());
             }
             self.records.push(r.clone());
             added.push(*id);
@@ -1419,17 +2199,11 @@ impl Trust {
         }
     }
 
-    /// The keys a held record admits, and the founder's.
-    fn admitted(&self) -> HashSet<PublicKey> {
-        let mut admitted: HashSet<PublicKey> = self
-            .records
-            .iter()
-            .filter_map(|r| match r {
-                Record::Admission(a) => Some(a.key),
-                Record::Removal(_) => None,
-            })
-            .collect();
-        admitted.insert(self.cluster);
+    /// The keys a held record admits as signers ([`Record::admits`]), and the founder's.
+    fn admitted(&self) -> HashSet<(Tier, PublicKey)> {
+        let mut admitted: HashSet<(Tier, PublicKey)> =
+            self.records.iter().filter_map(Record::admits).collect();
+        admitted.insert((Tier::Machine, self.cluster));
         admitted
     }
 
@@ -1479,7 +2253,10 @@ impl Trust {
 /// that a removal that counts removed without keeping them, and those signed by a key no other
 /// record left admits (what a removed machine signed after its removal, and what the keys it
 /// admitted then signed). They count nowhere. Records `spare` picks are not void, nor are what
-/// they admit.
+/// they admit. Machines and users are apart: a member's removal (v2) voids what that machine
+/// signed, a user's removal what that user signed, and a record's signer must be admitted as
+/// what signs it ([`Record::needs`]). A user's removal of a machine voids nothing: machines sign
+/// nothing that counts once there are users.
 fn void_records(
     cluster: &PublicKey,
     records: &[Record],
@@ -1488,24 +2265,31 @@ fn void_records(
 ) -> HashSet<RecordId> {
     let ids: Vec<RecordId> = records.iter().map(Record::id).collect();
     // The removals that count, by the key they remove: the id, and what it keeps.
-    let mut kept: HashMap<PublicKey, Vec<(RecordId, HashSet<RecordId>)>> = HashMap::new();
+    type Kept = Vec<(RecordId, HashSet<RecordId>)>;
+    let mut kept: HashMap<(Tier, PublicKey), Kept> = HashMap::new();
     for (r, id) in records.iter().zip(&ids) {
-        if let Record::Removal(rm) = r
+        let removes = match r {
+            Record::Removal(rm) if !rm.by_user => Some(((Tier::Machine, rm.key), &rm.kept)),
+            Record::UserRemoval(rm) => Some(((Tier::User, rm.key), &rm.kept)),
+            _ => None,
+        };
+        if let Some((key, list)) = removes
             && view.valid.contains(id)
         {
-            kept.entry(rm.key)
+            kept.entry(key)
                 .or_default()
-                .push((*id, rm.kept.iter().copied().collect()));
+                .push((*id, list.iter().copied().collect()));
         }
     }
-    let mut admissions: HashMap<PublicKey, usize> = HashMap::new();
-    let mut by_signer: HashMap<PublicKey, Vec<usize>> = HashMap::new();
+    let mut admissions: HashMap<(Tier, PublicKey), usize> = HashMap::new();
+    let mut by_signer: HashMap<(Tier, PublicKey), Vec<usize>> = HashMap::new();
     for (i, r) in records.iter().enumerate() {
-        if let Record::Admission(a) = r {
-            *admissions.entry(a.key).or_default() += 1;
+        if let Some(a) = r.admits() {
+            *admissions.entry(a).or_default() += 1;
         }
-        by_signer.entry(r.signer()).or_default().push(i);
+        by_signer.entry(r.needs()).or_default().push(i);
     }
+    let founder = (Tier::Machine, *cluster);
     let mut void = vec![false; records.len()];
     let mut queue: Vec<usize> = Vec::new();
     let kill = |i: usize, void: &mut Vec<bool>, queue: &mut Vec<usize>| {
@@ -1515,23 +2299,23 @@ fn void_records(
         }
     };
     for (i, r) in records.iter().enumerate() {
-        let signer = r.signer();
+        let signer = r.needs();
         let voided = kept
             .get(&signer)
             .is_some_and(|ks| ks.iter().any(|(rm, k)| voids(*rm, k, ids[i])));
-        let unadmitted = signer != *cluster && !admissions.contains_key(&signer);
+        let unadmitted = signer != founder && !admissions.contains_key(&signer);
         if voided || unadmitted {
             kill(i, &mut void, &mut queue);
         }
     }
     while let Some(i) = queue.pop() {
-        let Record::Admission(a) = &records[i] else {
+        let Some(a) = records[i].admits() else {
             continue;
         };
-        let left = admissions.get_mut(&a.key).expect("counted");
+        let left = admissions.get_mut(&a).expect("counted");
         *left -= 1;
-        if *left == 0 && a.key != *cluster {
-            for &j in by_signer.get(&a.key).map_or(&[][..], Vec::as_slice) {
+        if *left == 0 && a != founder {
+            for &j in by_signer.get(&a).map_or(&[][..], Vec::as_slice) {
                 kill(j, &mut void, &mut queue);
             }
         }
@@ -2756,6 +3540,7 @@ mod tests {
                 at: 0,
                 clock: 0,
                 nonce: String::new(),
+                pool: None,
                 sig: Signature([0; 64]),
             })];
             for _ in 0..(3 + next(20)) {
@@ -2773,6 +3558,7 @@ mod tests {
                         at,
                         clock,
                         nonce: String::new(),
+                        pool: None,
                         sig: Signature([0; 64]),
                     }));
                 } else {
@@ -2789,6 +3575,7 @@ mod tests {
                         at,
                         clock,
                         kept,
+                        by_user: false,
                         sig: Signature([0; 64]),
                     }));
                 }
@@ -2834,5 +3621,527 @@ mod tests {
         assert_eq!(t.view.members.len(), 1_502);
         let passes = PASSES.with(std::cell::Cell::get);
         assert!(passes <= 3, "{passes} passes");
+    }
+
+    // ---- Users (two tiers of authority) ----
+
+    use super::super::user::UserKey;
+
+    struct U {
+        key: UserKey,
+        name: &'static str,
+        _dir: tempfile::TempDir,
+    }
+
+    fn user(name: &'static str) -> U {
+        let dir = tempfile::tempdir().unwrap();
+        let (key, _) = UserKey::load_or_create(&dir.path().join("user.key")).unwrap();
+        U {
+            key,
+            name,
+            _dir: dir,
+        }
+    }
+
+    /// `u`'s first-user admission, co-signed by machine `m`.
+    fn genesis(u: &U, m: &M, clock: u64) -> Record {
+        let mut g = UserAdmission::genesis(&u.key, u.name, m.name, m.id.public(), clock);
+        g.co_sign(&m.id).unwrap();
+        Record::User(g)
+    }
+
+    /// `by`'s admission (v3) of machine `who` into `pool`.
+    fn admit_v3(by: &U, who: &M, pool: &str, clock: u64) -> Record {
+        Record::Admission(Admission::sign_by_user(
+            &by.key,
+            by.name,
+            who.name,
+            who.id.public(),
+            "h:1",
+            pool,
+            "",
+            clock,
+        ))
+    }
+
+    fn remove_v3(by: &U, who: &M, clock: u64) -> Record {
+        Record::Removal(Removal::sign_by_user(
+            &by.key,
+            by.name,
+            who.name,
+            who.id.public(),
+            clock,
+        ))
+    }
+
+    fn add_user(by: &U, who: &U, clock: u64) -> Record {
+        Record::User(UserAdmission::sign(
+            &by.key,
+            by.name,
+            who.name,
+            who.key.public(),
+            clock,
+        ))
+    }
+
+    fn remove_user(t: &Trust, by: &U, who: &U, clock: u64) -> Record {
+        let kept = t.signed_by(&who.key.public());
+        Record::UserRemoval(UserRemoval::sign(
+            &by.key,
+            by.name,
+            who.name,
+            who.key.public(),
+            kept,
+            clock,
+        ))
+    }
+
+    fn user_names(v: &View) -> Vec<String> {
+        let mut n: Vec<String> = v.users.values().map(|u| u.name.clone()).collect();
+        n.sort();
+        n
+    }
+
+    /// A cluster a, b, c (a founded it, b and c in that order), and its users: `u` first, its
+    /// genesis co-signed by `cosigner`, each member signed in by `u`.
+    fn with_users(a: &M, b: &M, c: &M, u: &U, cosigner: &M) -> Trust {
+        let mut t = Trust::found(&a.id, "a", "h:1");
+        t.merge(vec![admit(a, b, 1), admit(a, c, 2)]);
+        let clock = t.next_clock();
+        let mut batch = vec![genesis(u, cosigner, clock)];
+        for m in [a, b, c] {
+            batch.push(admit_v3(u, m, DEFAULT_POOL, clock + 1));
+        }
+        let changes = t.merge(batch);
+        assert!(changes.is_empty(), "{changes:?}");
+        assert!(t.users_exist());
+        t
+    }
+
+    // Owner's design (two tiers, 2026-11-04): records signed before users keep their bytes, so
+    // their ids (which removals list in `kept`) and their JSON stay as they were.
+    #[test]
+    fn records_members_signed_keep_their_bytes_and_ids() {
+        let (a, b) = (machine("a"), machine("b"));
+        let Record::Admission(adm) = admit(&a, &b, 1) else {
+            unreachable!()
+        };
+        let v2 = serde_json::to_vec(&(
+            "potluck admission v2",
+            &adm.node,
+            &adm.key,
+            &adm.address,
+            &adm.by,
+            &adm.by_key,
+            adm.at,
+            adm.clock,
+            &adm.nonce,
+        ))
+        .unwrap();
+        assert_eq!(adm.id(), RecordId::of(&v2));
+        assert!(adm.by_key.verify(&v2, &adm.sig));
+        let json = serde_json::to_value(Record::Admission(adm.clone())).unwrap();
+        let fields: BTreeSet<&str> = json
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            fields,
+            BTreeSet::from([
+                "kind", "node", "key", "address", "by", "by_key", "at", "clock", "nonce", "sig"
+            ])
+        );
+        let t = Trust::found(&a.id, "a", "h:1");
+        let Record::Removal(rm) = remove(&t, &a, &b, 2) else {
+            unreachable!()
+        };
+        let v2 = serde_json::to_vec(&(
+            "potluck removal v2",
+            &rm.node,
+            &rm.key,
+            &rm.by,
+            &rm.by_key,
+            rm.at,
+            rm.clock,
+            &rm.kept,
+        ))
+        .unwrap();
+        assert_eq!(rm.id(), RecordId::of(&v2));
+        let json = serde_json::to_value(Record::Removal(rm.clone())).unwrap();
+        assert!(
+            json.get("by_user").is_none() && json.get("pool").is_none(),
+            "{json}"
+        );
+        // A record saved before users reads back the same.
+        let back: Record = serde_json::from_value(json).unwrap();
+        assert_eq!(back.id(), rm.id());
+        assert!(back.verify());
+        // A user's admission of a machine signs other bytes: no v2 record can pass for one.
+        let u = user("u");
+        let Record::Admission(v3) = admit_v3(&u, &b, "cloud", 1) else {
+            unreachable!()
+        };
+        let mut as_v2 = v3.clone();
+        as_v2.pool = None;
+        assert!(v3.verify() && !as_v2.verify());
+    }
+
+    // Owner's design (two tiers): the first user, signed by its own key and co-signed by a
+    // member's machine key, and its admission of every member, taken together: the members stay
+    // members. From then on what machines sign counts for nothing; before, what users sign does.
+    #[test]
+    fn once_a_user_counts_machines_sign_nothing_that_counts() {
+        let (a, b, c, d) = (machine("a"), machine("b"), machine("c"), machine("d"));
+        let u = user("u");
+        // Before users: a user's admission of d counts for nothing.
+        let mut t = Trust::found(&a.id, "a", "h:1");
+        t.merge(vec![admit(&a, &b, 1), admit(&a, &c, 2)]);
+        t.merge(vec![add_user(&u, &u, 3), admit_v3(&u, &d, DEFAULT_POOL, 4)]);
+        assert_eq!(names(&t.view), ["a", "b", "c"]);
+        assert!(!t.users_exist());
+        // A first user's admission without a machine's signature counts for nothing either.
+        let mut g = UserAdmission::genesis(&u.key, "u", "b", b.id.public(), 5);
+        t.merge(vec![Record::User(g.clone())]);
+        assert!(!t.users_exist());
+        // Nor one a machine co-signed whose name or key isn't its own.
+        g.machine.as_mut().unwrap().sig = a.id.sign(&g.signed_bytes());
+        assert!(!g.verify());
+
+        let mut t = with_users(&a, &b, &c, &u, &b);
+        assert_eq!(names(&t.view), ["a", "b", "c"]);
+        assert_eq!(user_names(&t.view), ["u"]);
+        assert!(t.recognized_user(&u.key.public()));
+        assert!(!t.recognized_user(&a.id.public()));
+        assert!(t.view.members.values().all(|m| m.by_user()));
+        // A member's admission of d, and its removal of c: nothing.
+        let clock = t.next_clock();
+        t.merge(vec![admit(&a, &d, clock), remove(&t, &a, &c, clock)]);
+        assert_eq!(names(&t.view), ["a", "b", "c"]);
+        assert!(t.view.removed.is_empty());
+        // A user's: they count.
+        let clock = t.next_clock();
+        t.merge(vec![admit_v3(&u, &d, DEFAULT_POOL, clock)]);
+        assert_eq!(names(&t.view), ["a", "b", "c", "d"]);
+        let clock = t.next_clock();
+        t.merge(vec![remove_v3(&u, &c, clock)]);
+        assert_eq!(names(&t.view), ["a", "b", "d"]);
+        assert!(t.removed_for_good(&c.id.public()));
+        // c can't come back, even by a user's admission.
+        t.merge(vec![admit_v3(&u, &c, DEFAULT_POOL, clock + 1)]);
+        assert_eq!(names(&t.view), ["a", "b", "d"]);
+        assert!(t.why_not_member(&c.id.public()).contains("removed by u"));
+        same_in_any_order(&t.cluster, t.records());
+        // The proof a pairing reply carries implies the same members and users.
+        let proof = View::compute(&t.cluster, &t.members_proof());
+        assert_eq!(proof.members, t.view.members);
+        assert_eq!(proof.users, t.view.users);
+        assert_eq!(proof.genesis, t.view.genesis);
+        let counting = View::compute(&t.cluster, &t.counting());
+        assert_eq!(counting.standing(), t.view.standing());
+    }
+
+    // Owner's design (two tiers): of first users' admissions that compete, the one co-signed by
+    // the member admitted earliest counts, whatever the clocks; a member admitted later can't
+    // keep it from counting by removing the one that co-signed it (a removal that one could
+    // undo), and a machine only users admitted co-signs nothing that counts.
+    #[test]
+    fn the_first_user_co_signed_by_the_member_admitted_first_counts() {
+        let (a, b, c, d) = (machine("a"), machine("b"), machine("c"), machine("d"));
+        let (u, v) = (user("u"), user("v"));
+        let t = with_users(&a, &b, &c, &u, &b);
+        // c, admitted after b, co-signs v's first-user admission, with an earlier clock.
+        let mut records = t.records().to_vec();
+        records.push(genesis(&v, &c, 3));
+        records.push(admit_v3(&v, &d, DEFAULT_POOL, 4));
+        let view = same_in_any_order(&t.cluster, &records);
+        assert_eq!(user_names(&view), ["u"]);
+        assert_eq!(names(&view), ["a", "b", "c"]);
+        // c removes b (as before users), not keeping b's records: b ranks before c, so for the
+        // first user that is a removal b could undo, and u still counts.
+        let mut t2 = t.clone();
+        let removal = remove_keeping(&c, &b, Vec::new(), t2.next_clock());
+        records.push(removal.clone());
+        t2.merge(vec![removal]);
+        assert_eq!(user_names(&t2.view), ["u"]);
+        assert_eq!(names(&t2.view), ["a", "b", "c"]);
+        let view = same_in_any_order(&t.cluster, &records);
+        assert_eq!(user_names(&view), ["u"]);
+        // The founder's co-signature counts before b's.
+        let w = user("w");
+        records.push(genesis(&w, &a, 50));
+        let view = same_in_any_order(&t.cluster, &records);
+        assert_eq!(user_names(&view), ["w"]);
+        assert!(view.members.is_empty(), "w signed no machine in");
+        // A machine users admitted (d) co-signs a first user: not even taken.
+        let mut t3 = t.clone();
+        let clock = t3.next_clock();
+        t3.merge(vec![admit_v3(&u, &d, DEFAULT_POOL, clock)]);
+        assert_eq!(names(&t3.view), ["a", "b", "c", "d"]);
+        let n = t3.records().len();
+        t3.merge(vec![genesis(&v, &d, clock + 1), admit(&d, &c, clock + 2)]);
+        assert_eq!(t3.records().len(), n);
+        assert_eq!(user_names(&t3.view), ["u"]);
+    }
+
+    // Owner's design (two tiers): only a user's signed record adds or removes a user; a removal
+    // keeps what the removed user signed that counted where it was signed, and voids the rest.
+    #[test]
+    fn users_add_and_remove_users() {
+        let (a, b, c, d, e) = (
+            machine("a"),
+            machine("b"),
+            machine("c"),
+            machine("d"),
+            machine("e"),
+        );
+        let (u, v, x, y) = (user("u"), user("v"), user("x"), user("y"));
+        let mut t = with_users(&a, &b, &c, &u, &a);
+        // u adds v, v adds x; x admits d.
+        let clock = t.next_clock();
+        t.merge(vec![
+            add_user(&u, &v, clock),
+            add_user(&v, &x, clock + 1),
+            admit_v3(&x, &d, DEFAULT_POOL, clock + 2),
+        ]);
+        assert_eq!(user_names(&t.view), ["u", "v", "x"]);
+        assert_eq!(names(&t.view), ["a", "b", "c", "d"]);
+        // A machine's key adds no user, nor does a key no user admitted.
+        let clock = t.next_clock();
+        let by_machine = Record::User(UserAdmission::sign(&a.id, "a", "y", y.key.public(), clock));
+        t.merge(vec![by_machine, add_user(&y, &y, clock)]);
+        assert_eq!(user_names(&t.view), ["u", "v", "x"]);
+        // u removes v, keeping what v signed: x and d stay.
+        let snapshot = t.clone();
+        let clock = t.next_clock();
+        let removal = remove_user(&t, &u, &v, clock);
+        t.merge(vec![removal]);
+        assert_eq!(user_names(&t.view), ["u", "x"]);
+        assert_eq!(names(&t.view), ["a", "b", "c", "d"]);
+        assert!(!t.recognized_user(&v.key.public()));
+        // v, removed, signs a user in and a machine in, dated before its removal: void.
+        t.merge(vec![add_user(&v, &y, 3), admit_v3(&v, &e, DEFAULT_POOL, 3)]);
+        assert_eq!(user_names(&t.view), ["u", "x"]);
+        assert_eq!(names(&t.view), ["a", "b", "c", "d"]);
+        // A removal of v that keeps none of v's records voids v's admission of x, and x's of d.
+        let mut t2 = snapshot.clone();
+        let clock = t2.next_clock();
+        t2.merge(vec![Record::UserRemoval(UserRemoval::sign(
+            &u.key,
+            "u",
+            "v",
+            v.key.public(),
+            Vec::new(),
+            clock,
+        ))]);
+        assert_eq!(user_names(&t2.view), ["u"]);
+        assert_eq!(names(&t2.view), ["a", "b", "c"]);
+        assert!(t2.why_not_member(&d.id.public()).contains("x"));
+        // u and v remove each other, neither knowing: u, the first user, wins.
+        let mut t3 = snapshot.clone();
+        let clock = t3.next_clock();
+        let u_removes_v = remove_user(&t3, &u, &v, clock);
+        let v_removes_u = remove_user(&t3, &v, &u, clock);
+        t3.merge(vec![v_removes_u, u_removes_v]);
+        assert_eq!(user_names(&t3.view), ["u", "x"]);
+        same_in_any_order(&t3.cluster, t3.records());
+        // A user name is one user's.
+        let mut t4 = snapshot;
+        let clock = t4.next_clock();
+        let twin = U {
+            name: "v",
+            ..user("v")
+        };
+        t4.merge(vec![add_user(&u, &twin, clock)]);
+        assert_eq!(user_names(&t4.view), ["u", "v", "x"]);
+        assert_eq!(
+            t4.view.users.values().find(|w| w.name == "v").unwrap().key,
+            v.key.public()
+        );
+    }
+
+    // Owner's design (two tiers): a user's admission gives a machine a pool (`default` unless
+    // given); a machine a member admitted is in `default`.
+    #[test]
+    fn a_machine_is_in_the_pool_its_admission_names() {
+        let (a, b, c, d) = (machine("a"), machine("b"), machine("c"), machine("d"));
+        let u = user("u");
+        let legacy = {
+            let mut t = Trust::found(&a.id, "a", "h:1");
+            t.merge(vec![admit(&a, &b, 1)]);
+            t
+        };
+        assert_eq!(legacy.pool_of(&b.id.public()), Some(DEFAULT_POOL));
+        let mut t = with_users(&a, &b, &c, &u, &a);
+        let clock = t.next_clock();
+        t.merge(vec![admit_v3(&u, &d, "cloud", clock)]);
+        assert_eq!(t.pool_of(&d.id.public()), Some("cloud"));
+        assert_eq!(t.pool_of(&b.id.public()), Some(DEFAULT_POOL));
+        assert_eq!(t.pool_of(&machine("z").id.public()), None);
+        let proof = View::compute(&t.cluster, &t.members_proof());
+        assert_eq!(proof.members[&d.id.public()].pool_name(), "cloud");
+        // The record and its pool round-trip.
+        let rec = t
+            .records()
+            .iter()
+            .find(|r| matches!(r, Record::Admission(a) if a.key == d.id.public()))
+            .unwrap()
+            .clone();
+        let json = serde_json::to_string(&rec).unwrap();
+        assert!(json.contains("\"pool\":\"cloud\""), "{json}");
+        let back: Record = serde_json::from_str(&json).unwrap();
+        assert!(back.verify() && back.id() == rec.id());
+        assert!(valid_pool("cloud") && !valid_pool("-x") && !valid_pool("a b"));
+    }
+
+    // A store made from what a pairing reply carries, in a cluster with users, takes the rest of
+    // the records as members exchange them.
+    #[test]
+    fn a_store_joining_a_cluster_with_users_agrees_with_it() {
+        let (a, b, c, d) = (machine("a"), machine("b"), machine("c"), machine("d"));
+        let (u, v) = (user("u"), user("v"));
+        let mut t = with_users(&a, &b, &c, &u, &b);
+        let clock = t.next_clock();
+        t.merge(vec![
+            add_user(&u, &v, clock),
+            admit_v3(&v, &d, "cloud", clock + 1),
+        ]);
+        let mut joined = Trust::found(&d.id, "d", "h:1");
+        joined.adopt(PairReply {
+            v: 1,
+            cluster: t.cluster,
+            key: d.id.public(),
+            nonce: String::new(),
+            records: t.members_proof(),
+            addresses: Vec::new(),
+        });
+        assert_eq!(joined.view.members, t.view.members);
+        assert_eq!(joined.view.users, t.view.users);
+        joined.merge(t.records().to_vec());
+        assert_eq!(joined.view.standing(), t.view.standing());
+    }
+
+    // Two tiers, random records of both: v2 admissions and removals by machines, first users
+    // co-signed by machines, users' admissions and removals of users and of machines. The view
+    // doesn't depend on the order records come in; two stores that take them in random batches
+    // and then exchange agree; and the members' proof implies the same members and users.
+    #[test]
+    fn stores_with_users_agree_once_they_exchange_records() {
+        let keys: Vec<M> = ["a", "b", "c", "d", "e", "f"]
+            .into_iter()
+            .map(machine)
+            .collect();
+        let users: Vec<U> = ["u", "v", "w"].into_iter().map(user).collect();
+        let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let names = ["a", "b", "c", "x"];
+        let mut with_users = 0;
+        for case in 0..200 {
+            let limit = [2, 3, MAX_MEMBERS][next(3) as usize];
+            let mut records: Vec<Record> = Vec::new();
+            for _ in 0..(4 + next(16)) {
+                let clock = 1 + next(10);
+                let m = &keys[next(6) as usize];
+                let subject = &keys[1 + next(5) as usize];
+                let u = &users[next(3) as usize];
+                let other = &users[next(3) as usize];
+                let r = match next(10) {
+                    0..=2 => admit_as(m, names[next(4) as usize], subject.id.public(), clock),
+                    3 => {
+                        let kept = records
+                            .iter()
+                            .filter(|r| r.signer() == subject.id.public() && next(3) > 0)
+                            .map(Record::id)
+                            .collect();
+                        remove_keeping(m, subject, kept, clock)
+                    }
+                    4 => genesis(u, m, clock),
+                    5 => add_user(u, other, clock),
+                    6 => {
+                        let kept = records
+                            .iter()
+                            .filter(|r| r.signer() == other.key.public() && next(3) > 0)
+                            .map(Record::id)
+                            .collect();
+                        Record::UserRemoval(UserRemoval::sign(
+                            &u.key,
+                            u.name,
+                            other.name,
+                            other.key.public(),
+                            kept,
+                            clock,
+                        ))
+                    }
+                    7 | 8 => Record::Admission(Admission::sign_by_user(
+                        &u.key,
+                        u.name,
+                        names[next(4) as usize],
+                        subject.id.public(),
+                        "h:1",
+                        ["default", "cloud"][next(2) as usize],
+                        "",
+                        clock,
+                    )),
+                    _ => remove_v3(u, subject, clock),
+                };
+                records.push(r);
+            }
+            let cluster = keys[0].id.public();
+            let view = same_in_any_order(&cluster, &{
+                let mut all = store(&keys[0], &keys[0], limit).records().to_vec();
+                all.extend(records.iter().cloned());
+                all
+            });
+            with_users += usize::from(view.users_exist());
+            let mut x = store(&keys[0], &keys[next(6) as usize], limit);
+            let mut y = store(&keys[0], &keys[next(6) as usize], limit);
+            y.records = x.records.clone();
+            y.recompute();
+            let (mut to_x, mut to_y) = (Vec::new(), Vec::new());
+            for r in &records {
+                match next(3) {
+                    0 => to_x.push(r.clone()),
+                    1 => to_y.push(r.clone()),
+                    _ => {
+                        to_x.push(r.clone());
+                        to_y.push(r.clone());
+                    }
+                }
+            }
+            for (t, mut rs) in [(&mut x, to_x), (&mut y, to_y)] {
+                while !rs.is_empty() {
+                    let n = 1 + next(rs.len() as u64) as usize;
+                    t.merge(rs.drain(..n).collect());
+                }
+            }
+            for _ in 0..10 {
+                let to_y = y.merge(x.records().to_vec());
+                let to_x = x.merge(y.records().to_vec());
+                if !to_y.stored && !to_x.stored {
+                    break;
+                }
+            }
+            assert_eq!(x.view.standing(), y.view.standing(), "case {case}");
+            assert!(x.view.members.len() <= limit, "case {case}");
+            let proof = View::compute(&cluster, &x.members_proof());
+            assert_eq!(
+                (&proof.members, &proof.users, &proof.genesis),
+                (&x.view.members, &x.view.users, &x.view.genesis),
+                "case {case}"
+            );
+            let counting = View::compute(&cluster, &x.counting());
+            assert_eq!(
+                (&counting.members, &counting.users, &counting.genesis),
+                (&x.view.members, &x.view.users, &x.view.genesis),
+                "case {case}"
+            );
+        }
+        assert!(with_users > 40, "{with_users} of 200 cases had users");
     }
 }

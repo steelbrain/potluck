@@ -7,7 +7,9 @@
 //! - **Pairing.** [`Mesh::pair_request`] on a new machine makes a request (its name, key, address
 //!   and a nonce, as one line of base64url); [`Mesh::admit`] on any member signs an admission and
 //!   returns a reply (the admission among all the cluster's records, and the members' addresses);
-//!   [`Mesh::pair_finish`] on the new machine stores it. Then they connect directly.
+//!   [`Mesh::pair_finish`] on the new machine stores it. Then they connect directly. In a cluster
+//!   with users ([`trust`]), a user's key signs the admission instead ([`Mesh::admit_signed`]),
+//!   and removals ([`Mesh::remove_signed`]); [`Mesh::user_init`] makes the first user.
 //! - **Chain of trust.** The admitting member announces the admission to every member; every
 //!   member accepts a key a member signed. Members compare a digest of their records on every
 //!   heartbeat and exchange them when they differ, so a member that was offline catches up when it
@@ -50,6 +52,7 @@ pub mod identity;
 mod node;
 mod tls;
 pub mod trust;
+pub mod user;
 
 #[cfg(test)]
 pub(crate) mod tests;
@@ -57,7 +60,7 @@ pub(crate) mod tests;
 pub use identity::{PublicKey, Signature};
 pub(crate) use node::release;
 pub use node::{Mesh, Stream};
-pub use trust::{Admission, Record, RecordId, Removal};
+pub use trust::{Admission, Record, RecordId, Removal, UserAdmission, UserRemoval};
 
 use crate::config::{NodeConfig, Paths};
 use crate::types::{Millis, NodeName};
@@ -141,6 +144,14 @@ pub struct Peer {
     /// The address it gave in its hello.
     pub address: String,
     pub version: String,
+    /// Its pool, from the admission that made it a member ([`trust::DEFAULT_POOL`] in a cluster
+    /// without users).
+    #[serde(default = "default_pool")]
+    pub pool: String,
+}
+
+fn default_pool() -> String {
+    trust::DEFAULT_POOL.to_string()
 }
 
 /// A member as this machine sees it.
@@ -150,15 +161,64 @@ pub struct Member {
     pub key: PublicKey,
     /// Where to reach it: the latest address it gave, or the one it joined with.
     pub address: String,
-    /// The member that admitted it (the founder admitted itself).
+    /// The member that admitted it (the founder admitted itself), or in a cluster with users the
+    /// user.
     pub admitted_by: NodeName,
     pub admitted_at: Millis,
+    /// Its pool, from the admission that made it a member ([`trust::DEFAULT_POOL`] in a cluster
+    /// without users).
+    #[serde(default = "default_pool")]
+    pub pool: String,
     pub this_machine: bool,
     /// Heard from within the down time (always true for this machine).
     pub alive: bool,
     pub last_seen: Option<Millis>,
     /// Its version, as of its last hello.
     pub version: Option<String>,
+}
+
+/// What the command line signs membership records from ([`Mesh::membership`]): this machine, the
+/// clock for a new record, the members and the users.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MembershipView {
+    /// This machine's name and machine key.
+    pub node: NodeName,
+    pub key: PublicKey,
+    /// The cluster's id (its founder's machine key).
+    pub cluster: PublicKey,
+    /// This machine is in its cluster: not removed, and its admission counts.
+    pub member: bool,
+    /// The logical clock for a record signed now ([`trust::Trust::next_clock`]).
+    pub next_clock: u64,
+    /// Users sign what counts ([`trust::Trust::users_exist`]).
+    pub users_exist: bool,
+    pub members: Vec<MemberEntry>,
+    /// The users that count (none in a cluster without users).
+    pub users: Vec<UserEntry>,
+    /// Removed machines, by name.
+    pub removed: Vec<MemberEntry>,
+    /// Without users: the members admitted before this machine, oldest first. Each can co-sign
+    /// a first user's admission that counts instead of one this machine co-signs.
+    pub elders: Vec<NodeName>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemberEntry {
+    pub name: NodeName,
+    pub key: PublicKey,
+    pub address: String,
+    pub pool: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserEntry {
+    pub name: String,
+    pub key: PublicKey,
+    /// The user that admitted it (the first user itself).
+    pub by: String,
+    pub at: Millis,
+    /// The ids of the records it signed that count: what a removal of it keeps.
+    pub signed: Vec<RecordId>,
 }
 
 /// A member as a mesh last heard it: what [`Mesh::hand_over`] passes to [`Mesh::start_on`]
@@ -189,12 +249,15 @@ pub enum Event {
     Down { node: NodeName, why: Option<String> },
     /// A machine was admitted to the cluster.
     Joined { node: NodeName, by: NodeName },
-    /// A machine left the cluster: removed by `by`, or (`by` None) dropped: the member that
-    /// admitted it was removed by a member that had not heard of the admission, or another
-    /// machine was admitted under its name first.
+    /// A machine left the cluster: removed by `by` (a member, or in a cluster with users the
+    /// user), or (`by` None) dropped: the member that admitted it was removed by a member that
+    /// had not heard of the admission, or another machine was admitted under its name first.
+    /// `here`: the removal was made on this machine ([`Mesh::remove`]).
     Removed {
         node: NodeName,
         by: Option<NodeName>,
+        #[serde(default)]
+        here: bool,
     },
     /// This machine was removed from the cluster. It must pair again (with a new key) to rejoin,
     /// unless the removal turns out void (see [`Mesh::is_removed`]).

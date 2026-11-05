@@ -1,7 +1,8 @@
 //! This machine's key pair: ed25519, one per machine, in `keys/node.key` (PKCS#8, mode 0600).
 //!
-//! The same key signs admission and removal records and authenticates TLS, through a self-signed
-//! certificate made from it at start. Peers pin the key, never the certificate.
+//! The same key signs admission and removal records (in a cluster without users; see
+//! [`super::trust`]) and authenticates TLS, through a self-signed certificate made from it at
+//! start. Peers pin the key, never the certificate.
 
 use super::MeshError;
 use base64::Engine;
@@ -113,6 +114,30 @@ impl<'de> Deserialize<'de> for Signature {
     }
 }
 
+/// A key that signs records: a machine's [`Identity`], or a user's key
+/// ([`super::user::UserKey`]).
+pub trait Signer {
+    fn public(&self) -> PublicKey;
+    fn sign(&self, msg: &[u8]) -> Signature;
+}
+
+impl Signer for Identity {
+    fn public(&self) -> PublicKey {
+        self.public
+    }
+    fn sign(&self, msg: &[u8]) -> Signature {
+        Identity::sign(self, msg)
+    }
+}
+
+/// An ed25519 signature over `msg` by `pair`.
+pub(super) fn sign_with(pair: &Ed25519KeyPair, msg: &[u8]) -> Signature {
+    let sig = pair.sign(msg);
+    let mut out = [0u8; 64];
+    out.copy_from_slice(sig.as_ref());
+    Signature(out)
+}
+
 /// This machine's key pair and the certificate made from it.
 pub struct Identity {
     pkcs8: Vec<u8>,
@@ -188,10 +213,7 @@ impl Identity {
     }
 
     pub fn sign(&self, msg: &[u8]) -> Signature {
-        let sig = self.pair.sign(msg);
-        let mut out = [0u8; 64];
-        out.copy_from_slice(sig.as_ref());
-        Signature(out)
+        sign_with(&self.pair, msg)
     }
 
     pub fn cert(&self) -> CertificateDer<'static> {
@@ -254,7 +276,7 @@ pub fn write_private(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), MeshErr
 }
 
 /// Clears group and other permission bits on `path`, if any are set.
-fn tighten(path: &Path, mode: u32) -> Result<(), MeshError> {
+pub(super) fn tighten(path: &Path, mode: u32) -> Result<(), MeshError> {
     let meta = fs::metadata(path).map_err(|e| MeshError::Identity(format!("{e}")))?;
     if meta.permissions().mode() & 0o077 != 0 {
         fs::set_permissions(path, fs::Permissions::from_mode(mode))

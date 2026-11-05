@@ -4,9 +4,13 @@
 use super::identity::{Identity, PublicKey, ensure_dir};
 use super::tls::{self, Duplex, DuplexIo};
 use super::trust::{
-    self, Admission, Changes, PairReply, PairRequest, Pending, Record, Removal, Trust, View,
+    self, Admission, Changes, PairReply, PairRequest, Pending, Record, Removal, Trust,
+    UserAdmission, View,
 };
-use super::{Event, Handler, Member, MeshConfig, MeshError, Peer, Seen, advertised_address};
+use super::{
+    Event, Handler, Member, MemberEntry, MembershipView, MeshConfig, MeshError, Peer, Seen,
+    UserEntry, advertised_address,
+};
 use crate::types::{Millis, NodeName, now_ms};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -842,11 +846,16 @@ impl Mesh {
         let (duplex, hello, reg) = self.inner.dial_limited(&t, Open::Stream { header })?;
         let _ = duplex.set_read_timeout(None);
         let _ = duplex.set_write_timeout(None);
+        let pool = lock(&self.inner.trust)
+            .pool_of(&hello.key)
+            .unwrap_or(trust::DEFAULT_POOL)
+            .to_string();
         let peer = Peer {
             name: hello.node,
             key: hello.key,
             address: hello.address,
             version: hello.version,
+            pool,
         };
         Ok(Stream::new(duplex, peer, reg))
     }
@@ -927,8 +936,20 @@ impl Mesh {
 
     /// Pairing, on any member: admits the machine that made `request` and returns the reply to
     /// paste into [`Mesh::pair_finish`] there. The admission is announced to every member. Asking
-    /// again for a machine already admitted gives a reply again.
+    /// again for a machine already admitted gives a reply again. In a cluster without users:
+    /// this machine signs the admission ([`Mesh::admit_signed`] in one with users).
     pub fn admit(&self, request: &str) -> Result<String, MeshError> {
+        self.admit_signed(request, None)
+    }
+
+    /// [`Mesh::admit`] with the admission a user signed of the machine that made `request` (v3,
+    /// its pool in it): what admits a machine in a cluster with users, where this machine signs
+    /// none. Without users, `admission` must be None: it would count for nothing.
+    pub fn admit_signed(
+        &self,
+        request: &str,
+        admission: Option<Admission>,
+    ) -> Result<String, MeshError> {
         let inner = &self.inner;
         let req = PairRequest::from_text(request)?;
         if req.v != 1 {
@@ -954,6 +975,42 @@ impl Mesh {
         let (reply, changes, announce) = {
             let mut t = lock(&inner.trust);
             let my_name = standing(&t, &me)?;
+            match (&admission, t.users_exist()) {
+                (None, true) => {
+                    return Err(MeshError::Pairing(
+                        "this cluster has users: only a user's signed admission admits a machine (`potluck admit` where a user's key is)".into(),
+                    ));
+                }
+                (Some(_), false) => {
+                    return Err(MeshError::Pairing(
+                        "this cluster has no users yet, so an admission a user signed would count for nothing; run `potluck user init` first".into(),
+                    ));
+                }
+                (Some(a), true) => {
+                    let matches = a.by_user()
+                        && a.key == req.key
+                        && a.node == req.name
+                        && a.address == req.address
+                        && a.nonce == req.nonce;
+                    if !matches {
+                        return Err(MeshError::Pairing(
+                            "the signed admission is of another request".into(),
+                        ));
+                    }
+                    if !trust::valid_pool(a.pool_name()) {
+                        return Err(MeshError::Pairing(format!(
+                            "bad pool name {:?}: use letters, digits, '.', '_' and '-', not starting with '-'",
+                            a.pool_name()
+                        )));
+                    }
+                    if !a.verify() {
+                        return Err(MeshError::Pairing(
+                            "the admission's signature is not good".into(),
+                        ));
+                    }
+                }
+                (None, false) => {}
+            }
             if req.key == me {
                 return Err(MeshError::Pairing(
                     "that request was made on this machine: run `potluck pair` on the new one"
@@ -984,16 +1041,18 @@ impl Mesh {
                     )));
                 }
                 None => {
-                    let clock = t.next_clock();
-                    let adm = Admission::sign(
-                        &id,
-                        &my_name,
-                        &req.name,
-                        req.key,
-                        &req.address,
-                        &req.nonce,
-                        clock,
-                    );
+                    let adm = match admission {
+                        Some(a) => a,
+                        None => Admission::sign(
+                            &id,
+                            &my_name,
+                            &req.name,
+                            req.key,
+                            &req.address,
+                            &req.nonce,
+                            t.next_clock(),
+                        ),
+                    };
                     let before = t.clone();
                     changes = t.merge(vec![Record::Admission(adm.clone())]);
                     if !t.view.members.contains_key(&req.key) {
@@ -1102,70 +1161,454 @@ impl Mesh {
     /// only a removal it can undo removed it and this machine was admitted before it: then this
     /// machine signs one it can't (see [`Mesh::admitted_before`]).
     pub fn remove(&self, node: &str) -> Result<(), MeshError> {
+        self.remove_signed(node, None)
+    }
+
+    /// [`Mesh::remove`] with the removal a user signed of `node` (v3): what removes a machine in a
+    /// cluster with users, where this machine signs none. Without users, `removal` must be None.
+    pub fn remove_signed(&self, node: &str, removal: Option<Removal>) -> Result<(), MeshError> {
         let inner = &self.inner;
         let id = inner.identity();
         let me = id.public();
         let (rec, changes, mut targets, notify) = {
             let mut t = lock(&inner.trust);
             let my_name = standing(&t, &me)?;
-            let target = match t.view.by_name(node) {
-                Some(a) => a.clone(),
-                None => {
-                    let Some(gone) = t.view.removed.values().find(|r| r.node == node).cloned()
-                    else {
-                        return Err(MeshError::NotMember(node.to_string()));
-                    };
-                    // Removed already: by a removal it can't undo, or by a younger member's,
-                    // which this machine makes final if it ranks before it.
-                    let ranks = t.ranks();
-                    let elder = ranks
-                        .get(&me)
-                        .is_some_and(|m| ranks.get(&gone.key).is_some_and(|g| m < g));
-                    if !elder || t.removed_for_good(&gone.key) {
-                        return Ok(());
-                    }
-                    t.records()
-                        .iter()
-                        .find_map(|r| match r {
-                            Record::Admission(a) if a.key == gone.key => Some(a.clone()),
-                            _ => None,
-                        })
-                        .ok_or_else(|| MeshError::NotMember(node.to_string()))?
+            match (&removal, t.users_exist()) {
+                (None, true) => {
+                    return Err(MeshError::Invalid(
+                        "this cluster has users: only a user's signed removal removes a machine (`potluck remove` where a user's key is)".into(),
+                    ));
                 }
-            };
-            if target.key == me {
-                return Err(MeshError::Invalid(
-                    "a machine can't remove itself: run `potluck remove` on another member".into(),
-                ));
+                (Some(_), false) => {
+                    return Err(MeshError::Invalid(
+                        "this cluster has no users yet, so a removal a user signed would count for nothing; run `potluck user init` first".into(),
+                    ));
+                }
+                _ => {}
             }
-            // Every record of the removed machine's that counts here stays valid; any other it
-            // signed is void (see `Trust::signed_by`).
-            let kept = t.signed_by(&target.key);
-            let clock = t.next_clock();
-            let rec = Removal::sign(&id, &my_name, &target.node, target.key, kept, clock);
-            let before = t.clone();
-            let changes = t.merge(vec![Record::Removal(rec.clone())]);
-            if !t.view.valid.contains(&rec.id()) {
-                *t = before;
-                return Err(MeshError::Invalid(format!(
-                    "the removal of {} did not take; nothing was changed",
-                    target.node
-                )));
+            if let Some(rm) = &removal {
+                if t.view.removed.values().any(|r| r.node == node) && t.view.by_name(node).is_none()
+                {
+                    // Removed already: by a user, so for good.
+                    return Ok(());
+                }
+                let target = t
+                    .view
+                    .by_name(node)
+                    .cloned()
+                    .ok_or_else(|| MeshError::NotMember(node.to_string()))?;
+                if target.key == me {
+                    return Err(MeshError::Invalid(
+                        "a machine can't remove itself: run `potluck remove` on another member, with a user's key".into(),
+                    ));
+                }
+                if !rm.by_user || rm.key != target.key || rm.node != target.node {
+                    return Err(MeshError::Invalid(format!(
+                        "the signed removal is not of {} as this machine knows it",
+                        target.node
+                    )));
+                }
+                if !rm.verify() {
+                    return Err(MeshError::Invalid(
+                        "the removal's signature is not good".into(),
+                    ));
+                }
+                let before = t.clone();
+                let changes = t.merge(vec![Record::Removal(rm.clone())]);
+                if !t.view.valid.contains(&rm.id()) {
+                    let why = match t.recognized_user(&rm.by_key) {
+                        true => "its signer's removal voids it".to_string(),
+                        false => format!("{} is no user here", rm.by),
+                    };
+                    *t = before;
+                    return Err(MeshError::Invalid(format!(
+                        "the removal of {} did not take ({why}); nothing was changed",
+                        target.node
+                    )));
+                }
+                save_or_undo(&mut t, before)?;
+                let notify = Target {
+                    name: target.node.clone(),
+                    key: target.key,
+                    address: t.address_of(&target.key).unwrap_or(target.address),
+                };
+                (rm.clone(), changes, Vec::new(), notify)
+            } else {
+                let target = match t.view.by_name(node) {
+                    Some(a) => a.clone(),
+                    None => {
+                        let Some(gone) = t.view.removed.values().find(|r| r.node == node).cloned()
+                        else {
+                            return Err(MeshError::NotMember(node.to_string()));
+                        };
+                        // Removed already: by a removal it can't undo, or by a younger member's,
+                        // which this machine makes final if it ranks before it.
+                        let ranks = t.ranks();
+                        let elder = ranks
+                            .get(&me)
+                            .is_some_and(|m| ranks.get(&gone.key).is_some_and(|g| m < g));
+                        if !elder || t.removed_for_good(&gone.key) {
+                            return Ok(());
+                        }
+                        t.records()
+                            .iter()
+                            .find_map(|r| match r {
+                                Record::Admission(a) if a.key == gone.key => Some(a.clone()),
+                                _ => None,
+                            })
+                            .ok_or_else(|| MeshError::NotMember(node.to_string()))?
+                    }
+                };
+                if target.key == me {
+                    return Err(MeshError::Invalid(
+                        "a machine can't remove itself: run `potluck remove` on another member"
+                            .into(),
+                    ));
+                }
+                // Every record of the removed machine's that counts here stays valid; any other it
+                // signed is void (see `Trust::signed_by`).
+                let kept = t.signed_by(&target.key);
+                let clock = t.next_clock();
+                let rec = Removal::sign(&id, &my_name, &target.node, target.key, kept, clock);
+                let before = t.clone();
+                let changes = t.merge(vec![Record::Removal(rec.clone())]);
+                if !t.view.valid.contains(&rec.id()) {
+                    *t = before;
+                    return Err(MeshError::Invalid(format!(
+                        "the removal of {} did not take; nothing was changed",
+                        target.node
+                    )));
+                }
+                save_or_undo(&mut t, before)?;
+                let notify = Target {
+                    name: target.node.clone(),
+                    key: target.key,
+                    address: t.address_of(&target.key).unwrap_or(target.address),
+                };
+                (rec, changes, Vec::new(), notify)
             }
-            save_or_undo(&mut t, before)?;
-            let notify = Target {
-                name: target.node.clone(),
-                key: target.key,
-                address: t.address_of(&target.key).unwrap_or(target.address),
-            };
-            (rec, changes, Vec::new(), notify)
         };
-        inner.apply_changes(changes, None);
+        inner.apply_changes_removing(changes, None, Some(notify.key));
         targets.extend(inner.targets_except(&[me]));
         targets.push(notify);
         inner.announce(vec![Record::Removal(rec)], targets);
         Ok(())
     }
+
+    /// Whether users sign what counts in this machine's cluster: from then on only a user's
+    /// signed admission or removal admits or removes a machine, and records members sign count
+    /// for nothing.
+    pub fn users_exist(&self) -> bool {
+        lock(&self.inner.trust).users_exist()
+    }
+
+    /// Whether `key` is the key of a user that counts here (admitted, not removed).
+    pub fn recognized_user(&self, key: &PublicKey) -> bool {
+        lock(&self.inner.trust).recognized_user(key)
+    }
+
+    /// Member `node`'s pool, from the admission that made it a member
+    /// ([`trust::DEFAULT_POOL`] in a cluster without users); None for a name no member has.
+    pub fn pool_of(&self, node: &str) -> Option<String> {
+        let t = lock(&self.inner.trust);
+        t.view.by_name(node).map(|a| a.pool_name().to_string())
+    }
+
+    /// What the command line signs membership records from.
+    pub fn membership(&self) -> MembershipView {
+        let inner = &self.inner;
+        let me = inner.key();
+        let t = lock(&inner.trust);
+        let entry = |a: &Admission| MemberEntry {
+            name: a.node.clone(),
+            key: a.key,
+            address: match a.key == me && inner.local_addr.is_some() {
+                true => inner.address.clone(),
+                false => t.address_of(&a.key).unwrap_or_else(|| a.address.clone()),
+            },
+            pool: a.pool_name().to_string(),
+        };
+        let mut members: Vec<MemberEntry> = t.view.members.values().map(entry).collect();
+        members.sort_by(|a, b| a.name.cmp(&b.name));
+        let removed = t
+            .view
+            .removed
+            .values()
+            .map(|r| MemberEntry {
+                name: r.node.clone(),
+                key: r.key,
+                address: t.address_of(&r.key).unwrap_or_default(),
+                pool: String::new(),
+            })
+            .collect::<Vec<_>>();
+        let mut users: Vec<UserEntry> = t
+            .view
+            .users
+            .values()
+            .map(|u| UserEntry {
+                name: u.name.clone(),
+                key: u.key,
+                by: u.by.clone(),
+                at: u.at,
+                signed: t.signed_by(&u.key),
+            })
+            .collect();
+        users.sort_by(|a, b| a.name.cmp(&b.name));
+        let member = t.view.members.contains_key(&me);
+        let node = t
+            .view
+            .members
+            .get(&me)
+            .map(|a| a.node.clone())
+            .unwrap_or_else(|| inner.cfg.name.clone());
+        let users_exist = t.users_exist();
+        let next_clock = t.next_clock();
+        let cluster = t.cluster;
+        drop(t);
+        MembershipView {
+            elders: match users_exist || !member {
+                true => Vec::new(),
+                false => self.admitted_before(&node),
+            },
+            node,
+            key: me,
+            cluster,
+            member,
+            next_clock,
+            users_exist,
+            members,
+            users,
+            removed,
+        }
+    }
+
+    /// The first user: `genesis`, the admission of its own key the command line signed, naming
+    /// this machine, which co-signs it here; with `admissions`, a v3 admission that user signed
+    /// of each member (as [`Mesh::membership`] lists them). Taken and announced together, so no
+    /// member drops out: from then on only users' records admit and remove machines. Refused
+    /// when the cluster has users already, or the admissions aren't of the members as they are.
+    pub fn user_init(
+        &self,
+        mut genesis: UserAdmission,
+        admissions: Vec<Admission>,
+    ) -> Result<(), MeshError> {
+        let inner = &self.inner;
+        if inner.dial_only {
+            return Err(MeshError::Invalid("a first user needs the daemon".into()));
+        }
+        let id = inner.identity();
+        let me = id.public();
+        let (records, changes) = {
+            let mut t = lock(&inner.trust);
+            let my_name = standing(&t, &me)?;
+            if t.users_exist() {
+                let names: Vec<&str> = t.view.users.values().map(|u| u.name.as_str()).collect();
+                return Err(MeshError::Invalid(format!(
+                    "this cluster has users already ({}); `potluck user add` adds another",
+                    names.join(", ")
+                )));
+            }
+            let ours = genesis
+                .machine
+                .as_ref()
+                .is_some_and(|m| m.node == my_name && m.key == me);
+            if !genesis.is_genesis() || !ours {
+                return Err(MeshError::Invalid(
+                    "not a first user's admission for this machine to co-sign".into(),
+                ));
+            }
+            if !valid_user_name(&genesis.name) {
+                return Err(MeshError::Invalid(format!(
+                    "bad user name {:?}: use letters, digits, '.', '_' and '-', not starting with '-'",
+                    genesis.name
+                )));
+            }
+            if !genesis.by_key.verify(&genesis.signed_bytes(), &genesis.sig) {
+                return Err(MeshError::Invalid(
+                    "the first user's signature is not good".into(),
+                ));
+            }
+            if let Some(m) = machine_named(&t, &genesis.key) {
+                return Err(MeshError::Invalid(format!(
+                    "that key is {m}'s machine key, which a daemon holds; a user's key is one `potluck user key` makes"
+                )));
+            }
+            genesis.co_sign(&id).map_err(MeshError::Invalid)?;
+            let members: HashMap<PublicKey, String> = t
+                .view
+                .members
+                .values()
+                .map(|a| (a.key, a.node.clone()))
+                .collect();
+            let mut covered = HashSet::new();
+            for a in &admissions {
+                if !a.by_user() || a.by_key != genesis.key || !a.verify() {
+                    return Err(MeshError::Invalid(format!(
+                        "the admission of {} is not one the first user signed",
+                        a.node
+                    )));
+                }
+                if members.get(&a.key) != Some(&a.node) || !covered.insert(a.key) {
+                    return Err(MeshError::Invalid(format!(
+                        "the members changed since they were read ({} is not a member as admitted); run `potluck user init` again",
+                        a.node
+                    )));
+                }
+            }
+            if let Some((_, name)) = members.iter().find(|(k, _)| !covered.contains(*k)) {
+                return Err(MeshError::Invalid(format!(
+                    "the members changed since they were read ({name} has no admission); run `potluck user init` again"
+                )));
+            }
+            let keys: Vec<PublicKey> = members.keys().copied().collect();
+            let mut batch = vec![Record::User(genesis.clone())];
+            batch.extend(admissions.into_iter().map(Record::Admission));
+            let before = t.clone();
+            let changes = t.merge(batch.clone());
+            let all_in = keys.iter().all(|k| t.view.members.contains_key(k));
+            if t.view.genesis != Some(genesis.id()) || !all_in {
+                let why = match t.view.genesis {
+                    Some(g) if g != genesis.id() => {
+                        "another first user's admission counts instead".to_string()
+                    }
+                    Some(_) => keys
+                        .iter()
+                        .find(|k| !t.view.members.contains_key(*k))
+                        .map(|k| {
+                            format!(
+                                "{} would not be a member: {}",
+                                members[k],
+                                t.why_not_member(k)
+                            )
+                        })
+                        .unwrap_or_default(),
+                    None => "the admission does not count".into(),
+                };
+                *t = before;
+                return Err(MeshError::Invalid(format!(
+                    "the first user did not take: {why}; nothing was changed"
+                )));
+            }
+            save_or_undo(&mut t, before)?;
+            (batch, changes)
+        };
+        inner.apply_changes(changes, None);
+        let targets = inner.targets_except(&[me]);
+        inner.announce(records, targets);
+        Ok(())
+    }
+
+    /// A user's admission or removal a user signed (`potluck user add`, `user remove`): taken if
+    /// it counts, and announced. Refused when the cluster has no users, when it doesn't count
+    /// (its signer is no user here, a name is taken), and for the removal of the last user.
+    pub fn user_record(&self, record: Record) -> Result<(), MeshError> {
+        let inner = &self.inner;
+        let me = inner.key();
+        let changes = {
+            let mut t = lock(&inner.trust);
+            standing(&t, &me)?;
+            if !t.users_exist() {
+                return Err(MeshError::Invalid(
+                    "this cluster has no users yet: `potluck user init` makes the first".into(),
+                ));
+            }
+            if !record.verify() {
+                return Err(MeshError::Invalid(
+                    "the record's signature is not good".into(),
+                ));
+            }
+            let id = record.id();
+            let before = t.clone();
+            let changes = match &record {
+                Record::User(u) if !u.is_genesis() => {
+                    if !valid_user_name(&u.name) {
+                        return Err(MeshError::Invalid(format!(
+                            "bad user name {:?}: use letters, digits, '.', '_' and '-', not starting with '-'",
+                            u.name
+                        )));
+                    }
+                    if let Some(other) = t.view.users.values().find(|o| o.name == u.name)
+                        && other.key != u.key
+                    {
+                        return Err(MeshError::Invalid(format!(
+                            "there is a user named {} already",
+                            u.name
+                        )));
+                    }
+                    if let Some(m) = machine_named(&t, &u.key) {
+                        return Err(MeshError::Invalid(format!(
+                            "that key is {m}'s machine key, which a daemon holds; a user's key is one `potluck user key` prints"
+                        )));
+                    }
+                    if t.view.users_removed.contains_key(&u.key) {
+                        return Err(MeshError::Invalid(format!(
+                            "that key was removed as user {}; a removed key is never a user again",
+                            t.view.users_removed[&u.key].name
+                        )));
+                    }
+                    let changes = t.merge(vec![record.clone()]);
+                    if !t.view.valid.contains(&id) || !t.view.users.contains_key(&u.key) {
+                        let signer = t.recognized_user(&u.by_key);
+                        *t = before;
+                        return Err(MeshError::Invalid(match signer {
+                            false => format!(
+                                "the admission of user {} did not take: {} is no user here",
+                                u.name, u.by
+                            ),
+                            true => format!("the admission of user {} did not take", u.name),
+                        }));
+                    }
+                    changes
+                }
+                Record::UserRemoval(r) => {
+                    let changes = t.merge(vec![record.clone()]);
+                    if !t.view.valid.contains(&id) || t.view.users.contains_key(&r.key) {
+                        let signer = t.recognized_user(&r.by_key);
+                        *t = before;
+                        return Err(MeshError::Invalid(match signer {
+                            false => format!(
+                                "the removal of user {} did not take: {} is no user here",
+                                r.name, r.by
+                            ),
+                            true => format!("the removal of user {} did not take", r.name),
+                        }));
+                    }
+                    if t.view.users.is_empty() {
+                        *t = before;
+                        return Err(MeshError::Invalid(format!(
+                            "{} is the last user, and a cluster with users keeps one",
+                            r.name
+                        )));
+                    }
+                    changes
+                }
+                _ => {
+                    return Err(MeshError::Invalid(
+                        "not a user's admission or removal".into(),
+                    ));
+                }
+            };
+            save_or_undo(&mut t, before)?;
+            changes
+        };
+        inner.apply_changes(changes, None);
+        let targets = inner.targets_except(&[me]);
+        inner.announce(vec![record], targets);
+        Ok(())
+    }
+}
+
+/// The name of the machine whose key `key` is, if a record admits it as a machine.
+fn machine_named(t: &Trust, key: &PublicKey) -> Option<NodeName> {
+    t.records().iter().find_map(|r| match r {
+        Record::Admission(a) if a.key == *key => Some(a.node.clone()),
+        _ => None,
+    })
+}
+
+/// User names: as node names ([`trust::valid_name`]).
+pub fn valid_user_name(name: &str) -> bool {
+    trust::valid_name(name)
 }
 
 impl Inner {
@@ -1548,6 +1991,7 @@ impl Inner {
                     address: t.address_of(&a.key).unwrap_or_else(|| a.address.clone()),
                     admitted_by: a.by.clone(),
                     admitted_at: a.at,
+                    pool: a.pool_name().to_string(),
                     this_machine: this,
                     alive: this || p.is_some_and(|p| p.up == Some(true)),
                     last_seen: if this {
@@ -1752,6 +2196,16 @@ impl Inner {
     }
 
     fn apply_changes(&self, changes: Changes, self_change: Option<SelfChange>) {
+        self.apply_changes_removing(changes, self_change, None);
+    }
+
+    /// [`Inner::apply_changes`] after this machine removed `removed` ([`Mesh::remove`]).
+    fn apply_changes_removing(
+        &self,
+        changes: Changes,
+        self_change: Option<SelfChange>,
+        removed: Option<PublicKey>,
+    ) {
         let me = self.key();
         for a in &changes.joined {
             if a.key != me {
@@ -1779,6 +2233,7 @@ impl Inner {
             self.emit(Event::Removed {
                 node: a.node.clone(),
                 by,
+                here: removed == Some(a.key),
             });
         }
         if let Some(change) = self_change {
@@ -2331,6 +2786,7 @@ impl Inner {
                 message: format!("that key was admitted as {}, not {}", a.node, hello.node),
             });
         }
+        let pool = a.pool_name().to_string();
         let mine = self.hello_with(&t);
         drop(t);
         if !super::same_version(&hello.version, &self.cfg.version) {
@@ -2343,6 +2799,7 @@ impl Inner {
             key,
             address: hello.address.clone(),
             version: hello.version.clone(),
+            pool,
         };
         (ServerHello::Ok(mine), Some(peer))
     }

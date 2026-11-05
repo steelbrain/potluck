@@ -330,6 +330,7 @@ fn a_removed_member_is_refused_everywhere_even_by_members_that_were_offline() {
         *e == Event::Removed {
             node: "b".into(),
             by: Some("a".into()),
+            here: true,
         }
     });
     // Removing it again does nothing; a can't remove itself.

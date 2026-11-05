@@ -1092,9 +1092,9 @@ fn on_event(sh: &Arc<Shared>, c: &Arc<Cluster>, ev: Event) {
             sh.log.log(format!("cluster: {by} admitted {node}"));
             c.wake();
         }
-        Event::Removed { node, by } => {
+        Event::Removed { node, by, here } => {
             // A removal this machine made (`potluck remove`): the command settled it already.
-            if by.as_deref() == Some(c.node.as_str()) {
+            if here || by.as_deref() == Some(c.node.as_str()) {
                 return;
             }
             match &by {
