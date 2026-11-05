@@ -1,0 +1,4 @@
+[build]
+# rustc's parallel front end, 8 threads per rustc. Nightly only: rust-toolchain.toml pins one.
+# A RUSTFLAGS environment variable replaces this list.
+rustflags = ["-Zthreads=8"]

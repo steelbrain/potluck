@@ -1,0 +1,17 @@
+# Weekly pull requests that move the pinned actions (their commit SHAs and version comments) and
+# the crates in Cargo.lock to newer versions. A version is proposed only once it has been out for
+# 7 days (cooldown), so a release that is compromised and pulled within days isn't picked up.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7

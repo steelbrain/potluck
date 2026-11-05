@@ -1,0 +1,5 @@
+[toolchain]
+# Nightly for -Zthreads (see .cargo/config.toml). Pinned so every machine builds with the same
+# compiler; bump the date deliberately.
+channel = "nightly-2026-09-25"
+components = ["rustfmt", "clippy"]

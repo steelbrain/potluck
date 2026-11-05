@@ -1,0 +1,123 @@
+# Checks every push to a branch and every pull request, on macOS (arm64) and Linux (x86_64 and
+# arm64): formatting, clippy, the test suite with the pinned nightly, and `cargo check` on stable
+# Rust.
+#
+# The tests need what a potluck machine needs (docs/development.md): the target directory on a
+# copy-on-write filesystem, and on Linux the systemd user manager with lingering. macOS runners
+# have APFS; .github/ci-linux-setup.sh provides both on the Ubuntu runners.
+
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read # checkout only
+
+# A newer push to the same branch or pull request cancels the run still going for the older one.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+  # Incremental data isn't reused between runs; it would only make the cache bigger.
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  check:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS arm64
+            runner: macos-15
+          - name: Linux x86_64
+            runner: ubuntu-24.04
+          # The release ships an arm64 Linux binary, and no other check builds or runs one:
+          # libc's types differ there (c_char is unsigned), and so may cgroups and systemd.
+          - name: Linux arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      # Pinned to the commit of v7.0.1: a tag can be moved to other code.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Prepare the runner (btrfs target directory, systemd user manager)
+        if: runner.os == 'Linux'
+        run: bash .github/ci-linux-setup.sh
+
+      # The toolchain rust-toolchain.toml pins (a nightly; .cargo/config.toml adds -Zthreads=8),
+      # and the latest stable for the stable check.
+      - name: Install the toolchains
+        id: toolchain
+        run: |
+          channel=$(sed -n 's/^channel *= *"\(.*\)"$/\1/p' rust-toolchain.toml)
+          test -n "$channel"
+          rustup toolchain install "$channel" --profile minimal --component rustfmt,clippy
+          rustup toolchain install stable --profile minimal
+          rustup show
+          stable=$(rustc +stable --version | cut -d ' ' -f 2)
+          echo "cache-key=cargo-$RUNNER_OS-$RUNNER_ARCH-$channel-$stable" >>"$GITHUB_OUTPUT"
+
+      # The registry and the target directory, keyed by both toolchains and Cargo.lock. It is
+      # saved once the code and tests are built, before the tests run.
+      - name: Restore the cargo cache
+        id: cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ steps.toolchain.outputs.cache-key }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ steps.toolchain.outputs.cache-key }}-
+
+      # Each check runs even when an earlier one failed, so one run reports all of them.
+      - name: cargo fmt --check
+        run: cargo fmt --check
+
+      - name: cargo clippy --all-targets -- -D warnings
+        if: ${{ !cancelled() && steps.cache.outcome == 'success' }}
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      # crates.io users build with their own toolchain; the empty RUSTFLAGS drops -Zthreads.
+      - name: RUSTFLAGS= cargo +stable check --all-targets
+        if: ${{ !cancelled() && steps.cache.outcome == 'success' }}
+        run: RUSTFLAGS='' cargo +stable check --locked --all-targets
+
+      - name: Build the tests
+        id: build
+        if: ${{ !cancelled() && steps.cache.outcome == 'success' }}
+        run: cargo test --locked --no-run
+
+      - name: Save the cargo cache
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && steps.cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ steps.cache.outputs.cache-primary-key }}
+
+      # The whole suite. `cargo test` leaves out the #[ignore] tests, which are opt-in: they
+      # install real services (a user service, a systemd unit, a LaunchAgent), leave a core file,
+      # time a large seeding, or are a manual smoke test between two machines.
+      - name: cargo test
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        timeout-minutes: 30
+        run: cargo test --locked

@@ -1,0 +1,199 @@
+# Builds the release binaries for a version tag (v0.2.0) and publishes them, with install.sh and
+# SHA256SUMS, as that tag's GitHub release. The release stays a draft until every asset is
+# uploaded, so releases/latest/download/... never points at a half-published release.
+#
+# Jobs: `draft` creates the draft release; `build` builds and checks the binaries on each runner
+# and hands them on as workflow artifacts; `publish` uploads them with install.sh and SHA256SUMS
+# and publishes the release. Only draft and publish can write to the repository; build, which
+# compiles and runs code from dependencies, gets a read-only token.
+#
+# Assets: potluck-<target> for the four targets below; install.sh from the tagged commit (the
+# README installs with releases/latest/download/install.sh); and SHA256SUMS in `sha256sum` format,
+# listing all of them. install.sh and `potluck self-update` download the binaries and SHA256SUMS
+# by these names, and look up only the line for the binary they want.
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+# Each job asks for what it needs below.
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+# GH_TOKEN (in draft and publish it can write releases and push) goes only to the steps that run
+# gh.
+env:
+  GH_REPO: ${{ github.repository }}
+  TAG: ${{ github.ref_name }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  draft:
+    name: Create the draft release
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write # creates the draft release
+    steps:
+      - name: Create the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if draft=$(gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null); then
+            # Replacing a published release's assets would serve a mix of old and new files
+            # (and SHA256SUMS) while it runs, and publishing would mark it latest again.
+            if [ "$draft" != true ]; then
+              echo "release $TAG is published already; delete it to build it again" >&2
+              exit 1
+            fi
+            echo "draft release $TAG exists already; its assets will be replaced"
+            exit 0
+          fi
+          # A tag with a suffix (v0.2.0-rc.1) is a prerelease, which releases/latest skips.
+          prerelease=()
+          if [[ $TAG == *-* ]]; then prerelease=(--prerelease); fi
+          gh release create "$TAG" --draft --verify-tag --title "$TAG" --generate-notes "${prerelease[@]}"
+
+  build:
+    name: Build ${{ matrix.targets }}
+    needs: draft
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          # Static musl binaries, built natively: rusqlite's bundled SQLite and ring are C, so
+          # each needs musl-gcc from musl-tools for its own architecture.
+          - runner: ubuntu-24.04
+            targets: x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04-arm
+            targets: aarch64-unknown-linux-musl
+          # Both macOS binaries on one Apple silicon runner; Xcode's clang builds the x86_64 C.
+          - runner: macos-15
+            targets: aarch64-apple-darwin x86_64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read # checkout only: build scripts of dependencies run in this job
+    env:
+      TARGETS: ${{ matrix.targets }}
+      CC_x86_64_unknown_linux_musl: musl-gcc
+      CC_aarch64_unknown_linux_musl: musl-gcc
+    steps:
+      # Pinned to the commit of v7.0.1: a tag can be moved to other code.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install musl-tools
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+
+      # The toolchain rust-toolchain.toml pins (a nightly; .cargo/config.toml adds -Zthreads=8).
+      - name: Install the pinned toolchain
+        run: |
+          channel=$(sed -n 's/^channel *= *"\(.*\)"$/\1/p' rust-toolchain.toml)
+          test -n "$channel"
+          rustup toolchain install "$channel" --profile minimal --component rustfmt,clippy
+          read -ra targets <<<"$TARGETS"
+          rustup target add --toolchain "$channel" "${targets[@]}"
+          rustup show
+
+      - name: Check that the tag matches Cargo.toml
+        run: |
+          version=$(sed -n 's/^version *= *"\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          if [ "v$version" != "$TAG" ]; then
+            echo "tag $TAG doesn't match Cargo.toml's version $version" >&2
+            exit 1
+          fi
+
+      - name: Build
+        run: |
+          for target in $TARGETS; do
+            cargo build --release --locked --target "$target"
+          done
+
+      - name: Check the binaries
+        run: |
+          mkdir dist
+          for target in $TARGETS; do
+            bin=target/$target/release/potluck
+            info=$(file "$bin")
+            echo "$info"
+            if [[ $target == *-linux-musl && $info != *"statically linked"* && $info != *"static-pie linked"* ]]; then
+              echo "$bin is not statically linked" >&2
+              exit 1
+            fi
+            # Every binary runs before it is published: the x86_64 macOS one under Rosetta on
+            # this Apple silicon runner (installed first if the image lacks it).
+            run=("$bin")
+            if [ "$target" = x86_64-apple-darwin ]; then
+              if ! arch -x86_64 /usr/bin/true 2>/dev/null; then
+                sudo softwareupdate --install-rosetta --agree-to-license
+              fi
+              run=(arch -x86_64 "$bin")
+            fi
+            test "$("${run[@]}" --version)" = "potluck ${TAG#v}"
+            cp "$bin" "dist/potluck-$target"
+          done
+
+      # To the publish job, which uploads them to the release. Pinned to the commit of v7.0.2.
+      - name: Hand the binaries to the publish job
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: binaries-${{ matrix.runner }}
+          path: dist/potluck-*
+          if-no-files-found: error
+          # A rerun replaces what an earlier attempt of this run uploaded.
+          overwrite: true
+          retention-days: 7
+
+  publish:
+    name: Publish the release
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write # uploads the assets and publishes the release
+    steps:
+      # For install.sh and .github/is-latest.sh. Pinned to the commit of v7.0.1: a tag can be
+      # moved to other code.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Every build job's binaries into dist/. The action checks each artifact's SHA-256 digest
+      # against the one recorded at upload. Pinned to the commit of v8.0.2.
+      - name: Get the binaries from the build jobs
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: binaries-*
+          path: dist
+          merge-multiple: true
+
+      - name: Upload the assets and publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd dist
+          for target in aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+            test -s "potluck-$target" || { echo "missing potluck-$target" >&2; exit 1; }
+          done
+          cp ../install.sh .
+          sha256sum potluck-* install.sh > SHA256SUMS
+          cat SHA256SUMS
+          gh release upload "$TAG" potluck-* install.sh SHA256SUMS --clobber
+          # Latest only if no published release has a higher version: a fix for an older version
+          # line must not become latest, or machines updating to the latest would go down to it.
+          published=$(gh api --paginate "repos/$GH_REPO/releases" \
+            --jq '.[] | select(.draft | not) | select(.prerelease | not) | .tag_name')
+          latest=$(printf '%s\n' "$published" | sh ../.github/is-latest.sh "$TAG")
+          echo "published: ${published//$'\n'/ }; $TAG latest: $latest"
+          gh release edit "$TAG" --draft=false --latest="$latest"
