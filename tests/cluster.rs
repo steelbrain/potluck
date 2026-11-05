@@ -2138,6 +2138,42 @@ fn a_second_users_key_signs_until_it_is_removed() {
     assert_eq!(users["users"].as_array().unwrap().len(), 1, "{users}");
 }
 
+/// `potluck user add NAME KEY` takes a key whose text starts with `-` (one in 64) as the key, not
+/// as an option, before `--json` or after it.
+#[test]
+fn user_add_takes_a_key_that_starts_with_a_hyphen() {
+    let w = World::new();
+    let a = w.node("a").start();
+    a.cli_ok(&["user", "init", "--name", "owner"]);
+    let dir = tempfile::tempdir().unwrap();
+    let keys: Vec<potluck::mesh::PublicKey> = (0..)
+        .map(|i| {
+            potluck::mesh::user::UserKey::load_or_create(&dir.path().join(format!("{i}.key")))
+                .unwrap()
+                .0
+                .public()
+        })
+        .filter(|k| k.to_text().starts_with('-'))
+        .take(2)
+        .collect();
+    let (first, second) = (keys[0].to_text(), keys[1].to_text());
+    let added = a.cli_ok(&["user", "add", "dash", &first]);
+    assert_eq!(added["key"], first.as_str(), "{added}");
+    let o = Command::new(BIN)
+        .args(["user", "add", "dash2", &second, "--json"])
+        .current_dir(&a.repo)
+        .env("POTLUCK_HOME", &a.paths.home)
+        .env("POTLUCK_CONFIG", &a.paths.config)
+        .env_remove("POTLUCK_USER_KEY")
+        .output()
+        .unwrap();
+    let out: Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(out["key"], second.as_str(), "{out}");
+    for k in &keys {
+        assert!(trust_of(&a).recognized_user(k), "{k}");
+    }
+}
+
 /// b can't save its records (a full disk; here its keys directory is read-only) when it hears it
 /// was removed. The mesh that replaced its listening one read the records from disk, where b is
 /// still a member: it listened again, heard of the removal again, and so on at every heartbeat.

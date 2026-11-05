@@ -187,7 +187,8 @@ pub enum UserAction {
     Add {
         /// Letters, digits, '.', '_' and '-', not starting with '-'.
         name: String,
-        /// The user's public key.
+        /// The user's public key. One in 64 starts with '-', and is still taken as the key.
+        #[arg(allow_hyphen_values = true)]
         key: String,
     },
     /// Remove user NAME: its key signs nothing that counts after. The last user stays.
