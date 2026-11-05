@@ -44,9 +44,10 @@
   to it get through, but it can't reach them: its `daemon.log` says
   `cluster: NODE reaches this machine, but this machine can't reach it: can't reach NODE: ADDRESS: No route to host (os error 65)`,
   and the kernel log has lines for potluck ending in `reason: NECP`
-  (`log show --last 10m --predicate 'eventMessage CONTAINS "potluck"' | grep NECP`). A shell,
-  local or over ssh, isn't subject to it, so `nc` from one doesn't show the block. macOS tracks the
-  permission by the binary's code signature, so a new binary may need allowing again.
+  (`/usr/bin/log show --last 10m --predicate 'eventMessage CONTAINS "potluck"' | grep NECP`; in
+  zsh a bare `log` is zsh's own builtin). A shell, local or over ssh, isn't subject to it, so `nc`
+  from one doesn't show the block. macOS tracks the permission by the binary's code signature, so
+  a new binary may need allowing again.
 
 ## install.sh
 
