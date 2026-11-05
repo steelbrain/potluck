@@ -1179,11 +1179,11 @@ impl Drop for PartDir {
 }
 
 /// A runner's mirror syncs from this machine: `git upload-pack` of this machine's own mirror of a
-/// repository a dispatch here named. A dispatch syncs that mirror from its source and pins its
-/// commits there until the job ends, so the mirror has every commit a queued job needs. The
-/// source recorded at the latest dispatch may not: worktrees of one project keep their
-/// submodules' git dirs apart, and a submodule commit made in one worktree is only in its own.
-/// The source is served only if the mirror is gone.
+/// repository a job of this machine's names ([`fetchable`]). A dispatch syncs that mirror from
+/// its source and pins its commits there until the job ends, so the mirror has every commit a
+/// queued job needs. The source recorded at the latest dispatch may not: worktrees of one project
+/// keep their submodules' git dirs apart, and a submodule commit made in one worktree is only in
+/// its own. The source is served only if the mirror is gone.
 pub(super) fn upload_pack(
     sh: &Shared,
     c: &Cluster,
@@ -1191,16 +1191,21 @@ pub(super) fn upload_pack(
     repo_id: &str,
     stream: crate::mesh::Stream,
 ) {
-    let source = c.cs().sources.get(repo_id).cloned();
+    let source = {
+        let st = sh.lock();
+        fetchable(&st, from, repo_id)
+            .then(|| c.cs().sources.get(repo_id).cloned())
+            .flatten()
+    };
     let Some(source) = source else {
         sh.log.log(format!(
-            "cluster: {from} asked for repository {repo_id}, which no dispatch here named"
+            "cluster: {from} asked for repository {repo_id}, which no job queued here, or run by {from}, names"
         ));
         // git on the runner says `fatal: remote error: <this>`.
         let _ = crate::tunnel::refuse_upload_pack(
             stream,
             &format!(
-                "{} has no repository {repo_id}: no dispatch there named it",
+                "{} has no job queued, or run by {from}, that names repository {repo_id}",
                 c.node
             ),
         );
@@ -1214,6 +1219,22 @@ pub(super) fn upload_pack(
             dir.display()
         ));
     }
+}
+
+/// Whether member `peer` may fetch repository `repo_id` from this machine: a job of this
+/// machine's names it (as its repository, a submodule's or a carried one) and is queued, for a
+/// member that may take it ([`may_take`]: a runner syncs its mirrors before it claims), or is held
+/// by `peer`. Not any repository a dispatch here ever named.
+fn fetchable(st: &State, peer: &str, repo_id: &str) -> bool {
+    st.jobs.values().any(|j| {
+        owner_of(&j.id) == st.node
+            && match j.state {
+                JobState::Queued => may_take(j, peer),
+                JobState::Starting | JobState::Running => j.node.as_deref() == Some(peer),
+                _ => false,
+            }
+            && j.spec.repo.commits().any(|(id, _, _)| id == repo_id)
+    })
 }
 
 /// Records where each repository of a dispatch comes from, for the runners' syncs.

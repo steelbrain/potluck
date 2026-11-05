@@ -14,6 +14,10 @@
   the machine that claims it, with its grant, and `potluck env NODE` brings NODE's whole login
   environment to the member that asks. A secret in either reaches that machine, over the
   connections above only. A member can read it anyway, through a job it runs on that machine.
+- A member fetches a repository from the machine that dispatched a job naming it (its own
+  repository, a submodule's or a carried one) while that job is queued, or runs on the member
+  that asks; and then any object of that machine's mirror of it, every branch and tag of the
+  source included, not only the job's commits.
 - The pairing request and reply are neither secret nor encrypted. Pairing relies on you carrying
   them between your own shells: a key you `admit` becomes a member, and the reply you give
   `pair --finish` decides which cluster the new machine joins.

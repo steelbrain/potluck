@@ -402,15 +402,19 @@ impl WorkspaceProvider for FakeWs {
     }
 }
 
-/// Syncs name their source by URL; serving git isn't needed with fake mirrors.
+/// Syncs name their source by URL; serving git isn't needed with fake mirrors. A member that asks
+/// an owner for a repository it may fetch gets `served`.
 struct FakeTunnel;
 
 impl Tunnel for FakeTunnel {
     fn fetch_url(&self, _potluck_bin: &Path, owner: &str, repo_id: &str) -> String {
         format!("fake://{owner}/{repo_id}")
     }
-    fn serve_upload_pack(&self, _git_dir: &Path, _stream: Stream) -> anyhow::Result<()> {
-        anyhow::bail!("not in these tests")
+    fn serve_upload_pack(&self, _git_dir: &Path, mut stream: Stream) -> anyhow::Result<()> {
+        use std::io::Write;
+        stream.write_all(b"served\n")?;
+        stream.close_write()?;
+        Ok(())
     }
 }
 
@@ -4476,8 +4480,8 @@ fn a_repeated_claim_is_granted_again() {
     a.done(&first);
 }
 
-/// An owner serves `git upload-pack` only for repositories a dispatch there named: a member
-/// asking for any other gets git's error, not a repository.
+/// An owner serves `git upload-pack` only for repositories its jobs name: a member asking for any
+/// other gets git's error, not a repository.
 #[test]
 fn upload_pack_is_refused_for_a_repository_no_dispatch_named() {
     use std::io::Read;
@@ -4495,7 +4499,9 @@ fn upload_pack_is_refused_for_a_repository_no_dispatch_named() {
     let mut got = String::new();
     stream.read_to_string(&mut got).unwrap();
     assert!(
-        got.ends_with("ERR a has no repository nope-0123abcd: no dispatch there named it\n"),
+        got.ends_with(
+            "ERR a has no job queued, or run by b, that names repository nope-0123abcd\n"
+        ),
         "{got:?}"
     );
     mesh.stop();
@@ -5198,4 +5204,82 @@ fn reports_tell_each_member_only_what_it_needs() {
     assert_eq!(b.get(&queued).spec.cmd, ["sleep", "60"]);
     a.cli_ok(&["cancel", &queued]);
     a.done(&queued);
+}
+
+/// What `mesh` gets from `owner` for `git upload-pack` of repository `repo_id`.
+fn upload_pack(mesh: &potluck::mesh::Mesh, owner: &str, repo_id: &str) -> String {
+    use std::io::Read;
+    let mut stream = mesh
+        .open_stream(
+            owner,
+            serde_json::json!({"kind": "upload-pack", "repo_id": repo_id}),
+        )
+        .unwrap();
+    let mut got = String::new();
+    stream.read_to_string(&mut got).unwrap();
+    got
+}
+
+/// A member fetches through an owner a repository one of the owner's jobs names: while the job is
+/// queued (any member may take it, and syncs its mirrors before it claims), or while that member
+/// holds it. Not one that only an ended job named, nor that of a job another member holds.
+#[test]
+fn upload_pack_serves_the_repositories_of_queued_jobs_and_of_the_askers_own() {
+    let w = World::new();
+    let a = w.node("a").start();
+    let mut b = w.node("b").start();
+    let c = w.node("c").start();
+    pair(&a, &b);
+    pair(&a, &c);
+    wait_until("b and c see each other", || {
+        b.node_alive("c") && c.node_alive("b")
+    });
+    let ended = a.dispatch(&["--on", "node=a", "--", "true"]);
+    let ended_repo = a.done(&ended).spec.repo.id;
+    // b takes nothing: a's job for it stays queued.
+    let as_b = b.impostor(Arc::new(Scripted::default()));
+    let other = w.another_repo("other");
+    let o = a.cli_in(
+        &other,
+        &[
+            "dispatch",
+            "--timeout",
+            "60s",
+            "--on",
+            "node=b",
+            "--",
+            "true",
+        ],
+    );
+    assert_eq!(o.code, 0, "{}\n{}", o.stdout, o.stderr);
+    let job = o.json["job"].as_str().unwrap().to_string();
+    let repo = a.get(&job).spec.repo.id;
+    assert_ne!(repo, ended_repo);
+    let as_c = client_mesh(&c);
+    let refused = |who: &str, id: &str| {
+        format!("ERR a has no job queued, or run by {who}, that names repository {id}\n")
+    };
+    assert_eq!(upload_pack(&as_b, "a", &repo), "served\n");
+    assert_eq!(upload_pack(&as_c, "a", &repo), "served\n");
+    let got = upload_pack(&as_b, "a", &ended_repo);
+    assert!(got.ends_with(&refused("b", &ended_repo)), "{got:?}");
+    // b claims it: then it is b's to fetch, not c's.
+    let claim = serde_json::json!({
+        "op": "claim",
+        "job": job,
+        "lease": {
+            "grant": {"ram_mib": 4096, "cpu": 1, "gpus": [], "exclusive": false},
+            "granted_at": now_ms(),
+            "deadline": now_ms() + 60_000,
+            "token": "t1",
+        },
+        "workspace": "b-w9",
+    });
+    let r = as_b.call("a", claim).unwrap();
+    assert_eq!(r["kind"], "granted", "{r}");
+    assert_eq!(upload_pack(&as_b, "a", &repo), "served\n");
+    let got = upload_pack(&as_c, "a", &repo);
+    assert!(got.ends_with(&refused("c", &repo)), "{got:?}");
+    as_c.stop();
+    as_b.stop();
 }

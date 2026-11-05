@@ -50,7 +50,8 @@
 //!   names): a CLI request made on another machine, answered exactly as on the socket (frames, raw
 //!   bytes after `Bytes` and `CopyEntry`).
 //! - `upload-pack` (a runner's `potluck _tunnel` to an owner): `git upload-pack` of the owner's own
-//!   mirror of a repository a dispatch there named (it holds every commit a job there needs).
+//!   mirror of a repository that one of its jobs names, queued or held by that runner (the mirror
+//!   holds every commit a job there needs).
 
 use crate::proto::ClientRequest;
 use crate::types::{

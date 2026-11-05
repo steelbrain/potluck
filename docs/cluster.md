@@ -128,7 +128,9 @@ The dispatching machine's repository is the source of truth: its commits may exi
 the other members need no access to its remotes. A member keeps a bare mirror of a repository and of
 each of its submodule repositories from the first time a job from it is queued that the member could
 run (the dispatching machine, at dispatch). Mirrors are fed from the dispatching machine over the
-cluster's connections with git's own protocol, so only the objects a mirror lacks travel. Mirrors
+cluster's connections with git's own protocol, so only the objects a mirror lacks travel. The
+dispatching machine serves a repository only while one of its jobs names it and is queued, or
+runs on the member that asks. Mirrors
 are exact copies of the source's branches and tags, force-updates and deletions included. A job that
 runs git in its workspace writes the mirror's branches and tags (a worktree shares them): a branch
 or tag that changed since the last sync is reset to the source's at the next sync. A mirror that
