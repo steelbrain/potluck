@@ -28,6 +28,9 @@
 ### Fixed
 
 - `potluck user add NAME KEY` takes a key that starts with `-` (one in 64), not as an option.
+- A member's report counts only the workspaces on that member. Workspaces it listed on other
+  machines showed in `status` and could hold a job back for the 3-second locality wait, as if the
+  member had a workspace of the job's repository.
 - Linux with systemd older than 256 (Ubuntu 24.04 has 255): a job that the kernel's OOM killer
   ended at its own `--ram` limit was reported as `failed`, "killed because the machine ran short of
   memory, under its own limit", when potluck learned of the kill only after the job's unit had

@@ -5125,6 +5125,165 @@ fn a_reconcile_answer_stops_only_the_answering_owners_jobs() {
     b.done(&own);
 }
 
+/// An impostor that answers each `report` with the report a test set, and counts the asks by
+/// member.
+struct Reporter {
+    report: Mutex<Value>,
+    asked: Mutex<BTreeMap<String, u64>>,
+}
+
+impl Reporter {
+    fn new(report: Value) -> Arc<Reporter> {
+        Arc::new(Reporter {
+            report: Mutex::new(report),
+            asked: Mutex::default(),
+        })
+    }
+
+    fn set(&self, report: Value) {
+        *self.report.lock().unwrap() = report;
+    }
+
+    fn asked(&self, by: &str) -> u64 {
+        self.asked.lock().unwrap().get(by).copied().unwrap_or(0)
+    }
+}
+
+impl Handler for Reporter {
+    fn call(&self, from: &Peer, msg: Value) -> Result<Value, String> {
+        match msg["op"].as_str().unwrap_or_default() {
+            "report" => {
+                *self
+                    .asked
+                    .lock()
+                    .unwrap()
+                    .entry(from.name.clone())
+                    .or_default() += 1;
+                let report = self.report.lock().unwrap().clone();
+                Ok(serde_json::json!({"kind": "report", "report": report}))
+            }
+            op => Err(format!("no {op} here")),
+        }
+    }
+}
+
+/// Waits until each of `askers` has asked `reporter` for its report a few more times: each has
+/// the report set now.
+fn asked_again(reporter: &Reporter, askers: &[&str]) {
+    let before: Vec<u64> = askers.iter().map(|n| reporter.asked(n)).collect();
+    wait_until("the members asked for the report again", || {
+        askers
+            .iter()
+            .zip(&before)
+            .all(|(n, b)| reporter.asked(n) >= b + 3)
+    });
+}
+
+/// c, an impostor, reports a workspace on b of a's repository. Neither a's nor b's `status` shows
+/// it, and a job b can take doesn't wait for c as for a member with a workspace of its repository
+/// (locality): b takes it at once. A workspace c reports of its own, which it doesn't have, holds
+/// a job back for the locality wait only; then b takes it.
+#[test]
+fn a_report_counts_only_the_workspaces_on_its_machine() {
+    const WAIT_MS: u64 = 10_000;
+    let w = World::new();
+    let a = w.node("a").locality(WAIT_MS).start();
+    let b = w.node("b").cpu("fast").locality(WAIT_MS).start();
+    let mut c = w.node("c").cpu("fast").locality(WAIT_MS).start();
+    pair(&a, &b);
+    pair(&a, &c);
+    wait_until("b and c see each other", || {
+        b.node_alive("c") && c.node_alive("b")
+    });
+    let other = w.another_repo("other");
+    // A workspace on a of each repository, as a reports it.
+    let here = a.dispatch(&["--on", "node=a", "--", "true"]);
+    a.done(&here);
+    let o = a.cli_in(
+        &other,
+        &[
+            "dispatch",
+            "--timeout",
+            "60s",
+            "--on",
+            "node=a",
+            "--",
+            "true",
+        ],
+    );
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    let there = o.json["job"].as_str().unwrap().to_string();
+    a.done(&there);
+    let of_a = report_to(&b, "a");
+    let ws_of = |job: &str| {
+        let repo = a.get(job).spec.repo.id;
+        of_a["workspaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|w| w["repo_id"] == repo.as_str())
+            .cloned()
+            .unwrap_or_else(|| panic!("no workspace of {repo}: {of_a}"))
+    };
+    let mut on_b = ws_of(&here);
+    (on_b["id"], on_b["node"]) = ("b-w77".into(), "b".into());
+    let mut on_c = ws_of(&there);
+    (on_c["id"], on_c["node"]) = ("c-w77".into(), "c".into());
+
+    let mut report = report_to(&b, "c");
+    report["workspaces"] = Value::Array(vec![on_b]);
+    report["seq"] = 0.into();
+    let reporter = Reporter::new(report.clone());
+    let mesh = c.impostor(reporter.clone());
+    asked_again(&reporter, &["a", "b"]);
+    for n in [&a, &b] {
+        let st = n.cli_ok(&["status"]);
+        let ids: Vec<&str> = st["workspaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|w| w["id"].as_str())
+            .collect();
+        assert!(!ids.contains(&"b-w77"), "{}: {ids:?}", n.name);
+    }
+    let job = a.dispatch(&["--on", "cpu_model=fast", "--ram", "1", "--", "true"]);
+    let j = a.done(&job);
+    assert_eq!(j.node.as_deref(), Some("b"), "{j:#?}");
+    let waited = j.started_at.unwrap() - j.submitted_at;
+    assert!(waited < WAIT_MS, "started {waited} ms after its dispatch");
+
+    // One of c's own: claimed by c, which never takes the job.
+    report["workspaces"] = Value::Array(vec![on_c]);
+    reporter.set(report);
+    asked_again(&reporter, &["a", "b"]);
+    let o = a.cli_in(
+        &other,
+        &[
+            "dispatch",
+            "--timeout",
+            "60s",
+            "--on",
+            "cpu_model=fast",
+            "--ram",
+            "1",
+            "--",
+            "true",
+        ],
+    );
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    let job = o.json["job"].as_str().unwrap().to_string();
+    wait_until("b leaves it to c for now", || {
+        a.cli_ok(&["why", &job])["lines"]
+            .to_string()
+            .contains("b could start it now, but leaves it to c")
+    });
+    let j = a.done(&job);
+    assert_eq!(j.node.as_deref(), Some("b"), "{j:#?}");
+    let waited = j.started_at.unwrap() - j.submitted_at;
+    assert!(waited >= WAIT_MS, "started {waited} ms after its dispatch");
+    mesh.stop();
+}
+
 /// `report` of `of`, as `asker` gets it.
 fn report_to(asker: &Node, of: &str) -> Value {
     let mesh = client_mesh(asker);

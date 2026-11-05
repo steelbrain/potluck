@@ -209,9 +209,10 @@ pub(super) fn received(sh: &Shared, c: &Cluster, from: &str, mut report: Machine
 }
 
 /// What a report from `from` says for its own machine, the rest dropped: its queue holds only its
-/// own queued jobs, and what runs there only jobs starting or running there. Anything else (no
-/// report of a member's holds it) would keep this machine's workspaces a job is pinned to from
-/// removal, or answer a `wait` while the job's owner is away.
+/// own queued jobs, what runs there only jobs starting or running there, and its workspaces only
+/// workspaces there. Anything else (no report of a member's holds it) would keep this machine's
+/// workspaces a job is pinned to from removal, answer a `wait` while the job's owner is away, or
+/// hold a job back for a warm workspace (locality) and show it in `status`.
 fn own_entries(from: &str, report: &mut MachineReport) {
     report
         .queue
@@ -219,6 +220,10 @@ fn own_entries(from: &str, report: &mut MachineReport) {
     report.running.retain(|j| {
         j.node.as_deref() == Some(from) && matches!(j.state, JobState::Starting | JobState::Running)
     });
+    report
+        .workspaces
+        .retain(|w| w.node == from && node_of_ws(&w.id) == from);
+    report.ws_owners.retain(|w, _| node_of_ws(w) == from);
 }
 
 /// A pull found the report held from `from` still current: it takes the numbers of the one `from`
@@ -823,6 +828,7 @@ pub(crate) fn workspace_changed(sh: &Shared, c: &Cluster, node: &str, ws: &Works
     {
         let mut cs = c.cs();
         if let Some(r) = cs.reports.get_mut(node)
+            && ws.node == node
             && let Some(w) = r.report.workspaces.iter_mut().find(|w| w.id == ws.id)
         {
             // Without its path, as in `node`'s reports.
@@ -880,5 +886,39 @@ mod tests {
         assert!(later(&report(5, 9), &report(6, 1)), "its daemon restarted");
         assert!(later(&report(5, 9), &report(0, 0)), "unnumbered");
         assert!(later(&report(0, 0), &report(5, 1)));
+    }
+
+    #[test]
+    fn a_report_keeps_only_what_it_says_of_its_own_machine() {
+        let ws = |id: &str, node: &str| WorkspaceRecord {
+            id: id.into(),
+            node: node.into(),
+            repo_id: "r".into(),
+            commit: String::new(),
+            branch: None,
+            path: PathBuf::new(),
+            state: WorkspaceState::Idle,
+            created_at: 0,
+            last_used_at: 0,
+            held_until: 0,
+            pending: 0,
+            size_bytes: None,
+            advanced_by: None,
+        };
+        let mut r = MachineReport {
+            node: "m".into(),
+            workspaces: vec![
+                ws("m-w1", "m"),
+                ws("b-w2", "b"),
+                ws("m-w3", "b"),
+                ws("b-w4", "m"),
+            ],
+            ws_owners: [("m-w1".into(), "a".into()), ("b-w2".into(), "a".into())].into(),
+            ..Default::default()
+        };
+        own_entries("m", &mut r);
+        let ids: Vec<&str> = r.workspaces.iter().map(|w| w.id.as_str()).collect();
+        assert_eq!(ids, ["m-w1"]);
+        assert_eq!(r.ws_owners.keys().collect::<Vec<_>>(), ["m-w1"]);
     }
 }

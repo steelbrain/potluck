@@ -38,8 +38,9 @@ In a cluster with users, a machine whose root is hostile can still:
   the limit from the grant and again from the runner's report that the job started, and the 10
   minutes only while it is awake and hears from the runner;
 - report false facts and workspaces of its own (facts are self-reported, so `--on` catches
-  mistakes, not lies), and so be granted a job it can't run or delay others by the wait for a
-  warm workspace;
+  mistakes, not lies), and so be granted a job it can't run, or hold a job back from machines
+  without a workspace of its repository for up to 3 seconds, the wait for a warm one; workspaces
+  it reports on other machines count for nothing;
 - withhold or delay the records and reports it passes on; it can't forge records other keys
   signed;
 - send a signed request it answered on to another machine within 5 minutes: a request names its
