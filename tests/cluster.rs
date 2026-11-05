@@ -15,7 +15,7 @@ use potluck::daemon::{
 use potluck::exec::{Executor, Launch, Sample};
 use potluck::mesh::{Handler, MeshConfig, Peer, Stream};
 use potluck::proto::{ClientContext, Request, Response};
-use potluck::tunnel::Wants;
+use potluck::tunnel::View;
 use potluck::types::{
     Facts, Gpu, Handle, JobRecord, JobState, MAX_HOLD_MS, MIN_HOLD_MS, Millis, Reminder, RepoRef,
     WorkspaceId, WorkspaceRecord, WorkspaceState, now_ms,
@@ -404,28 +404,19 @@ impl WorkspaceProvider for FakeWs {
 }
 
 /// Syncs name their source by URL; serving git isn't needed with fake mirrors. A member that asks
-/// an owner for a repository it may fetch gets `served`, what it may want (`any` object or only
-/// ref `tips`) and the names of the served git dir's refs, in their order.
+/// an owner for a repository it may fetch gets `served` and the names of the served view's refs,
+/// in their order.
 struct FakeTunnel;
 
 impl Tunnel for FakeTunnel {
     fn fetch_url(&self, _potluck_bin: &Path, owner: &str, repo_id: &str) -> String {
         format!("fake://{owner}/{repo_id}")
     }
-    fn serve_upload_pack(
-        &self,
-        git_dir: &Path,
-        wants: Wants,
-        mut stream: Stream,
-    ) -> anyhow::Result<()> {
+    fn serve_upload_pack(&self, view: &View, mut stream: Stream) -> anyhow::Result<()> {
         use std::io::Write;
-        let refs = git(git_dir, &["for-each-ref", "--format=%(refname)"]);
+        let refs = git(view.path(), &["for-each-ref", "--format=%(refname)"]);
         let refs: Vec<&str> = refs.lines().collect();
-        let wants = match wants {
-            Wants::Any => "any",
-            Wants::Tips => "tips",
-        };
-        stream.write_all(format!("served {wants}: {}\n", refs.join(" ")).as_bytes())?;
+        stream.write_all(format!("served: {}\n", refs.join(" ")).as_bytes())?;
         stream.close_write()?;
         Ok(())
     }
@@ -5530,27 +5521,16 @@ fn upload_pack(mesh: &potluck::mesh::Mesh, owner: &str, repo_id: &str) -> String
     got
 }
 
-/// A member fetches through an owner a repository one of the owner's jobs names: while the job is
-/// queued (any member may take it, and syncs its mirrors before it claims), or while that member
-/// holds it. Not one that only an ended job named, nor that of a job another member holds.
-/// Without users, the whole repository, any object of it: every branch and tag.
+/// An owner serves a member a repository one of the owner's jobs names: while the job is queued
+/// (any member may take it, and syncs its mirrors before it claims), or while that member holds
+/// it. Not one that only an ended job named, nor that of a job another member holds. Of it, only
+/// the commits of its jobs that the member may take or holds, as they stand when it asks, and the
+/// branches and tags those commits reach: not the commit of a job another member holds, nor a
+/// branch or tag none of them reaches. b and c fetch from a the repository of a's two jobs, on
+/// branches x and y of a repository that also has a branch z and a tag on it, and a tag on the
+/// commit both start from; then b claims the jobs one by one.
 #[test]
-fn upload_pack_serves_the_repositories_of_queued_jobs_and_of_the_askers_own() {
-    upload_pack_to_b_and_c(false);
-}
-
-/// With users, an owner serves a member of a repository only the commits of its jobs that the
-/// member may take or holds, as they stand when it asks, and the branches and tags those commits
-/// reach: not the commit of a job another member holds, nor a branch or tag none of them reaches.
-#[test]
-fn with_users_upload_pack_serves_the_askers_commits_and_what_they_reach() {
-    upload_pack_to_b_and_c(true);
-}
-
-/// b and c fetch from a the repository of a's two jobs, on branches x and y of a repository that
-/// also has a branch z and a tag on it, and a tag on the commit both start from; then b claims
-/// the jobs one by one.
-fn upload_pack_to_b_and_c(users: bool) {
+fn upload_pack_serves_the_askers_commits_and_what_they_reach() {
     let w = World::new();
     let a = w.node("a").start();
     let mut b = w.node("b").start();
@@ -5560,9 +5540,7 @@ fn upload_pack_to_b_and_c(users: bool) {
     wait_until("b and c see each other", || {
         b.node_alive("c") && c.node_alive("b")
     });
-    if users {
-        a.cli_ok(&["user", "init", "--name", "owner"]);
-    }
+    a.cli_ok(&["user", "init", "--name", "owner"]);
     let ended = a.dispatch(&["--on", "node=a", "--", "true"]);
     let ended_repo = a.done(&ended).spec.repo.id;
     // b takes nothing: a's jobs for it stay queued.
@@ -5610,42 +5588,25 @@ fn upload_pack_to_b_and_c(users: bool) {
     let repo = a.get(&first).spec.repo.id;
     assert_ne!(repo, ended_repo);
 
-    // What the git dir served had as refs.
-    let served = |wants: &str, refs: &[&str]| {
+    // What the view served had as refs.
+    let served = |refs: &[&str]| {
         let mut refs: Vec<String> = refs.iter().map(|r| r.to_string()).collect();
         refs.sort();
-        format!("served {wants}: {}\n", refs.join(" "))
+        format!("served: {}\n", refs.join(" "))
     };
     let branch = format!("refs/heads/{BRANCH}");
-    let everything = served(
-        "any",
-        &[
-            &branch,
-            "refs/heads/x",
-            "refs/heads/y",
-            "refs/heads/z",
-            "refs/tags/v0",
-            "refs/tags/vz",
-        ],
-    );
     let (first_ref, second_ref) = (
         format!("refs/potluck/commits/{first_commit}"),
         format!("refs/potluck/commits/{second_commit}"),
     );
-    let both = match users {
-        false => everything.clone(),
-        true => served(
-            "tips",
-            &[
-                &branch,
-                "refs/heads/x",
-                "refs/heads/y",
-                &first_ref,
-                &second_ref,
-                "refs/tags/v0",
-            ],
-        ),
-    };
+    let both = served(&[
+        &branch,
+        "refs/heads/x",
+        "refs/heads/y",
+        &first_ref,
+        &second_ref,
+        "refs/tags/v0",
+    ]);
     let as_c = client_mesh(&c);
     let refused = |who: &str, id: &str| {
         format!("ERR a has no job queued, or run by {who}, that names repository {id}\n")
@@ -5672,13 +5633,7 @@ fn upload_pack_to_b_and_c(users: bool) {
     };
     claim(&first, "t1", "b-w9");
     assert_eq!(upload_pack(&as_b, "a", &repo), both);
-    let to_c = match users {
-        false => everything.clone(),
-        true => served(
-            "tips",
-            &[&branch, "refs/heads/y", &second_ref, "refs/tags/v0"],
-        ),
-    };
+    let to_c = served(&[&branch, "refs/heads/y", &second_ref, "refs/tags/v0"]);
     assert_eq!(upload_pack(&as_c, "a", &repo), to_c);
     // And the second: nothing of the repository is c's.
     claim(&second, "t2", "b-w10");
@@ -6317,7 +6272,7 @@ fn a_job_runs_only_in_its_pools() {
     assert_eq!(
         upload_pack(&as_b, "a", &repo),
         format!(
-            "served tips: refs/heads/{BRANCH} refs/potluck/commits/{}\n",
+            "served: refs/heads/{BRANCH} refs/potluck/commits/{}\n",
             a.get(&waits).spec.repo.commit
         )
     );

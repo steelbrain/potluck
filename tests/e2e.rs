@@ -2301,9 +2301,9 @@ fn has_object(repo: &Path, sha: &str) -> bool {
         .success()
 }
 
-/// a's project with a tag v0 on its first commit and three commits from there: job B's on
-/// branch y (tagged vy), running on a; one only the tag vt has; and job A's on branch x, running on
-/// b. In a cluster with users when `users`.
+/// a's project, in a cluster with a user, with a tag v0 on its first commit and three commits from
+/// there: job B's on branch y (tagged vy), running on a; one only the tag vt has; and job A's on
+/// branch x, running on b.
 struct TwoBranches {
     /// Dropped first, while a, which owns the job b runs, is still there to take its cancel.
     b: Node,
@@ -2319,20 +2319,18 @@ struct TwoBranches {
 }
 
 impl TwoBranches {
-    fn new(users: bool) -> TwoBranches {
+    fn new() -> TwoBranches {
         let a = Node::new();
         let b = Node::new();
         pair(&a, &b);
-        if users {
-            a.cli_ok(&["user", "init", "--name", "owner"]);
-            let start = Instant::now();
-            while b.cli_ok(&["user", "list"])["users"]
-                .as_array()
-                .is_none_or(|u| u.is_empty())
-            {
-                assert!(start.elapsed() < Duration::from_secs(30), "b has no user");
-                std::thread::sleep(Duration::from_millis(100));
-            }
+        a.cli_ok(&["user", "init", "--name", "owner"]);
+        let start = Instant::now();
+        while b.cli_ok(&["user", "list"])["users"]
+            .as_array()
+            .is_none_or(|u| u.is_empty())
+        {
+            assert!(start.elapsed() < Duration::from_secs(30), "b has no user");
+            std::thread::sleep(Duration::from_millis(100));
         }
         let proj = a.proj.clone();
         let commit = |file: &str| {
@@ -2404,6 +2402,40 @@ impl TwoBranches {
     fn url(&self) -> String {
         potluck::tunnel::fetch_url(Path::new(BIN), &self.a.name, &self.job_a.spec.repo.id)
     }
+
+    /// What a answers, the refs it serves and all, to `input` from `potluck _tunnel` as b.
+    fn raw(&self, input: &str) -> Vec<u8> {
+        use std::io::Write;
+        let mut child = Command::new(BIN)
+            .args(["_tunnel", &self.a.name, &self.job_a.spec.repo.id])
+            .env("POTLUCK_HOME", &self.b.paths.home)
+            .env("POTLUCK_CONFIG", &self.b.paths.config)
+            .env_remove("GIT_EXT_SERVICE")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        // Small enough for the pipe: written, and closed, before anything is read.
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        out.stdout
+    }
+}
+
+/// `line` as a pkt-line.
+fn pkt(line: &str) -> String {
+    format!("{:04x}{line}", line.len() + 4)
 }
 
 /// `sha refname` of `repo`'s branches and tags, or of those `names` only.
@@ -2416,36 +2448,16 @@ fn branches_and_tags(repo: &Path, names: &[&str]) -> String {
     git(repo, &args)
 }
 
-/// Without users a runner's mirror is the owner's, every branch and tag, and any commit of it
-/// can be fetched through the tunnel: b, running a's job A, has job B's commit too, and the one
-/// only a tag has.
-#[test]
-fn without_users_a_runners_mirror_has_every_branch_and_tag() {
-    let t = TwoBranches::new(false);
-    assert_eq!(
-        branches_and_tags(&t.mirror, &[]),
-        branches_and_tags(&t.owners, &[])
-    );
-    for sha in [&t.job_b_commit, &t.tagged, &t.vy] {
-        assert!(has_object(&t.mirror, sha), "{sha}");
-    }
-    let out = t.as_b(&["fetch", "--quiet", &t.url(), &t.job_b_commit]);
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-}
-
-/// With users, a runner gets from the job's owner only the commits of the jobs it may run or
-/// runs and the branches and tags they reach: b, running a's job A (on branch x), has in its
-/// mirror x, the branches whose tips A's commit contains, and v0 on an ancestor of it; not y and
-/// its tag vy (job B's, running on a), nor the commit only vt has. Asked for by their ids through
-/// the tunnel as b, a refuses those. When b runs a job from another branch, w, later, its next
+/// A runner gets from the job's owner only the commits of the jobs it may run or runs and the
+/// branches and tags they reach: b, running a's job A (on branch x), has in its mirror x, the
+/// branches whose tips A's commit contains, and v0 on an ancestor of it; not y and its tag vy
+/// (job B's, running on a), nor the commit only vt has. Asked for by their ids through the tunnel
+/// as b, a refuses those; told that b has them, a answers as for an id no object has, and sends a
+/// pack with no delta against them. When b runs a job from another branch, w, later, its next
 /// sync drops x from its mirror and brings w.
 #[test]
-fn with_users_a_runner_gets_only_its_jobs_commits_and_what_they_reach() {
-    let t = TwoBranches::new(true);
+fn a_runner_gets_only_its_jobs_commits_and_what_they_reach() {
+    let t = TwoBranches::new();
     let logs = || format!("{}\n{}", t.a.daemon_log(), t.b.daemon_log());
     let branch = format!("refs/heads/{BRANCH}");
     let reached = ["refs/heads/main", &branch, "refs/heads/x", "refs/tags/v0"];
@@ -2490,6 +2502,63 @@ fn with_users_a_runner_gets_only_its_jobs_commits_and_what_they_reach() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
+
+    // b says it has one of them, and wants A's commit.
+    let have = |id: &str| {
+        t.raw(&format!(
+            "{}0000{}0000{}",
+            pkt(&format!(
+                "want {a} multi_ack_detailed thin-pack ofs-delta\n"
+            )),
+            pkt(&format!("have {id}\n")),
+            pkt("done\n")
+        ))
+    };
+    let shown = |got: &[u8]| {
+        String::from_utf8_lossy(got)
+            .chars()
+            .take(2000)
+            .collect::<String>()
+    };
+    let none = have(&"0".repeat(40));
+    for sha in [&t.job_b_commit, &t.tagged, &t.vy] {
+        let got = have(sha);
+        assert!(
+            got == none,
+            "{sha}: {}\nan unknown id: {}",
+            shown(&got),
+            shown(&none)
+        );
+    }
+    let start = none
+        .windows(4)
+        .position(|w| w == b"PACK")
+        .unwrap_or_else(|| panic!("no pack: {}", shown(&none)));
+    let into = tempfile::tempdir_in(t.b.dir.path()).unwrap();
+    git(into.path(), &["init", "-q", "--bare"]);
+    let mut index = Command::new("git")
+        .arg("-C")
+        .arg(into.path())
+        .args(["index-pack", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = index.stdin.take().unwrap();
+    let pack = none[start..].to_vec();
+    let writer = std::thread::spawn(move || {
+        use std::io::Write;
+        stdin.write_all(&pack)
+    });
+    let out = index.wait_with_output().unwrap();
+    writer.join().unwrap().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(has_object(into.path(), a));
 
     // A job from branch w on b, once A is over.
     t.a.cli_ok(&["cancel", &t.job_a.id]);

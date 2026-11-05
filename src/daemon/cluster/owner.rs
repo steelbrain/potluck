@@ -7,7 +7,6 @@ use super::{CState, Cluster, KV_CANCELS, KV_ENDINGS, KV_LOG_BASE, capable, save}
 use crate::daemon::state::State;
 use crate::daemon::{Shared, files, runner};
 use crate::proto::{Response, ServerResponse, TooLong, read_msg_within};
-use crate::tunnel::Wants;
 use crate::types::{
     EXIT_CANCELLED, EXIT_LOST, EXIT_TIMEOUT, JobId, JobRecord, JobState, Lease, Millis, NodeName,
     RepoRef, WorkspaceId,
@@ -1268,11 +1267,10 @@ impl Drop for PartDir {
     }
 }
 
-/// A runner's mirror syncs from this machine: `git upload-pack` of this machine's own mirror of a
-/// repository that its jobs the asker may fetch name ([`fetchable`]), as they stand when it asks.
-/// Without users, the whole mirror, any object of it ([`Wants::Any`]: members are trusted then).
-/// With users, a view of it made for this one fetch ([`crate::tunnel::View`]): those jobs'
-/// commits there and the branches and tags they reach, and nothing else of the mirror. A dispatch
+/// A runner's mirror syncs from this machine: `git upload-pack` of a view, made for this one fetch
+/// ([`crate::tunnel::View`]), of this machine's own mirror of a repository that its jobs the asker
+/// may fetch name ([`fetchable`]), as they stand when it asks: those jobs' commits there and the
+/// branches and tags they reach, and nothing else of the mirror. A dispatch
 /// syncs that mirror from its source and pins its commits there until the job ends, so the mirror
 /// has every commit a queued job needs. The source recorded at the latest dispatch may not:
 /// worktrees of one project keep their submodules' git dirs apart, and a submodule commit made in
@@ -1307,36 +1305,28 @@ pub(super) fn upload_pack(
     };
     let mirror = sh.paths.mirror(repo_id);
     let dir = if mirror.is_dir() { mirror } else { source };
-    let view = if taker.users {
-        static VIEWS: AtomicU64 = AtomicU64::new(0);
-        let name = format!(
-            "{}-{}.git",
-            std::process::id(),
-            VIEWS.fetch_add(1, Ordering::Relaxed)
-        );
-        let at = sh.paths.upload_pack_views().join(name);
-        match crate::tunnel::View::create(at, &dir, &commits) {
-            Ok(v) => Some(v),
-            Err(e) => {
-                sh.log.log(format!(
-                    "cluster: serving {repo_id} ({}) to {from}: {e}",
-                    dir.display()
-                ));
-                let _ = crate::tunnel::refuse_upload_pack(
-                    stream,
-                    &format!("{} can't serve repository {repo_id}: {e}", c.node),
-                );
-                return;
-            }
+    static VIEWS: AtomicU64 = AtomicU64::new(0);
+    let name = format!(
+        "{}-{}.git",
+        std::process::id(),
+        VIEWS.fetch_add(1, Ordering::Relaxed)
+    );
+    let at = sh.paths.upload_pack_views().join(name);
+    let view = match crate::tunnel::View::create(at, &dir, &commits) {
+        Ok(v) => v,
+        Err(e) => {
+            sh.log.log(format!(
+                "cluster: serving {repo_id} ({}) to {from}: {e}",
+                dir.display()
+            ));
+            let _ = crate::tunnel::refuse_upload_pack(
+                stream,
+                &format!("{} can't serve repository {repo_id}: {e}", c.node),
+            );
+            return;
         }
-    } else {
-        None
     };
-    let (git_dir, wants) = match &view {
-        Some(v) => (v.path(), Wants::Tips),
-        None => (dir.as_path(), Wants::Any),
-    };
-    if let Err(e) = c.opts.tunnel.serve_upload_pack(git_dir, wants, stream) {
+    if let Err(e) = c.opts.tunnel.serve_upload_pack(&view, stream) {
         sh.log.log(format!(
             "cluster: serving {repo_id} ({}) to {from}: {e:#}",
             dir.display()

@@ -20,21 +20,21 @@
 //!   [`refuse_upload_pack`], which git shows as `fatal: remote error: <message>`. `git
 //!   upload-pack` runs in a process group of its own and is killed with its children if either
 //!   side goes away; it is always reaped before the call returns.
-//! - **What is served.** `git upload-pack` speaks protocol v0, whatever the client asks for.
-//!   Without users, the whole mirror, and a fetch can want any object it has ([`Wants::Any`]),
-//!   as protocol v2 would take: a job's commit may be on no branch any more by the time a runner
-//!   asks for it. In a cluster with users, a [`View`] of the mirror for that one fetch, whose refs
-//!   are those jobs' commits by id and the mirror's branches and tags that they reach, and a fetch
-//!   can want only those refs' tips ([`Wants::Tips`]; `allowReachableSHA1InWant` would also take
-//!   any tree or blob by its id, and v2 any object at all).
+//! - **What is served.** `git upload-pack` speaks protocol v0, whatever the client asks for, of a
+//!   [`View`] of the mirror made for that one fetch, whose refs are those jobs' commits by id and
+//!   the mirror's branches and tags that they reach. A fetch can want only those refs' tips
+//!   (`allowReachableSHA1InWant` would also take any tree or blob by its id, and v2 any object at
+//!   all). The view reads the mirror's objects, all of them, so what the client sends goes through
+//!   a [`Filter`] first: a `have` or `shallow` line naming another object would tell the client
+//!   whether the mirror has it, and a thin pack could come as deltas against it.
 
 use crate::config::{NodeConfig, Paths};
 use crate::mesh::{Mesh, MeshConfig, Stream};
 use anyhow::{Context, bail};
 use serde_json::{Value, json};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fs::File;
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::fd::AsFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -184,26 +184,41 @@ fn err_pkt(message: &str) -> Vec<u8> {
 /// The refs of a [`View`] that name its commits: `refs/potluck/commits/<sha>`.
 const VIEW_REFS: &str = "refs/potluck/commits";
 
-/// What a fetch from [`serve_upload_pack`] may want.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Wants {
-    /// Any object the git dir has (`uploadpack.allowAnySHA1InWant`).
-    Any,
-    /// Only the tips of its refs: every `uploadpack.allow*SHA1InWant` off, on the command line,
-    /// after every config file, so no config can let more through.
-    Tips,
+/// An object id, as bytes: SHA-1's 20, or SHA-256's 32.
+type Oid = [u8; 32];
+
+/// The object id that `hex` starts with, `len` hex digits in either case, as git reads one
+/// (`get_oid_hex`: whatever follows is left alone). `None` if it doesn't start with one.
+fn parse_oid(hex: &[u8], len: usize) -> Option<Oid> {
+    let digits = hex.get(..len)?;
+    let mut oid = [0u8; 32];
+    for (byte, pair) in oid.iter_mut().zip(digits.chunks(2)) {
+        let hi = char::from(pair[0]).to_digit(16)?;
+        let lo = char::from(pair[1]).to_digit(16)?;
+        *byte = (hi << 4 | lo) as u8;
+    }
+    Some(oid)
+}
+
+/// `oid` as `len` lowercase hex digits.
+fn oid_hex(oid: &Oid, len: usize) -> String {
+    oid[..len / 2].iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// A git dir that serves some commits of a repository and what they reach, for
-/// [`serve_upload_pack`] with [`Wants::Tips`]. Its refs are those commits
-/// (`refs/potluck/commits/<sha>`) and the repository's branches and tags whose tips they reach
-/// (an annotated tag's own object is its ref's tip), and it reads the repository's objects
-/// through `objects/info/alternates`, so nothing is copied and nothing is written into the
-/// repository. A fetch from it gets those refs and what they reach, and no other branch, tag
-/// or object of the repository. Removed with everything in it when dropped.
+/// [`serve_upload_pack`]. Its refs are those commits (`refs/potluck/commits/<sha>`) and the
+/// repository's branches and tags whose tips they reach (an annotated tag's own object is its
+/// ref's tip), and it reads the repository's objects through `objects/info/alternates`, so nothing
+/// is copied and nothing is written into the repository. A fetch from it gets those refs and what
+/// they reach, and no other branch, tag or object of the repository. Removed with everything in
+/// it when dropped.
 #[derive(Debug)]
 pub struct View {
     dir: PathBuf,
+    /// The objects its refs name: all that a fetch may want.
+    tips: HashSet<Oid>,
+    /// Hex digits in an object id: 40 (SHA-1) or 64 (SHA-256).
+    hex_len: usize,
 }
 
 impl View {
@@ -244,6 +259,11 @@ impl View {
         // `packed-refs` must be sorted by name, as git compares them (bytes).
         refs.sort();
         let sha256 = commits.first().is_some_and(|c| c.len() == 64);
+        let hex_len = if sha256 { 64 } else { 40 };
+        let tips = refs
+            .iter()
+            .filter_map(|(_, oid)| parse_oid(oid.as_bytes(), hex_len))
+            .collect();
         // The repository's own default branch, if it names one.
         let head = std::fs::read_to_string(git_dir.join("HEAD"))
             .ok()
@@ -254,7 +274,7 @@ impl View {
             std::fs::create_dir_all(parent)?;
         }
         std::fs::create_dir(&dir)?;
-        let view = View { dir };
+        let view = View { dir, tips, hex_len };
         let d = &view.dir;
         std::fs::create_dir_all(d.join("objects/info"))?;
         std::fs::create_dir_all(d.join("refs"))?;
@@ -340,32 +360,209 @@ fn reached_refs(git_dir: &Path, commits: &[String]) -> io::Result<Vec<(String, S
         .collect())
 }
 
-/// Runs `git upload-pack` on `git_dir` with its stdin and stdout piped through `stream`, until
-/// the fetch is done or either side goes away, for the daemon's [`crate::mesh::Handler::stream`].
-/// The client can want what `wants` says.
+/// The longest pkt-line git sends (`LARGE_PACKET_MAX`), its 4-digit length included.
+const MAX_PKT: usize = 65520;
+
+/// What a client may tell `git upload-pack` serving a [`View`], read as git's pkt-lines
+/// (protocol v0) and passed on line by line. A line that names an object passes only if the
+/// client may fetch that object, so nothing upload-pack answers, and no pack it sends, depends on
+/// an object outside the view, nor on whether the repository has one:
+/// - `want <id>`: only an object one of the view's refs names. Any other refuses the fetch with
+///   git's own error, `upload-pack: not our ref <id>` (upload-pack would refuse it too, but sooner
+///   for an object the repository lacks than for one it has).
+/// - `have <id>` and `shallow <id>`: only a commit the view's refs reach (`git rev-list --all` in
+///   the view, the first time a line needs it); any other line is left out, so upload-pack never
+///   sees it, whether the repository has the object or not. It answers as for a client that
+///   doesn't have that object, which it can't then use as a delta base either.
+/// - Any other line names no object (`deepen-not` names a ref, of the view's) and passes as it is.
+///   `filter sparse:oid=<blob>` would read a blob: upload-pack runs with that filter banned.
+///
+/// A line that isn't a pkt-line, or a `want`, `have` or `shallow` without an object id after it,
+/// refuses the fetch.
+struct Filter {
+    view: PathBuf,
+    tips: HashSet<Oid>,
+    hex_len: usize,
+    /// The commits the view's refs reach, once a line needs them.
+    reached: Option<HashSet<Oid>>,
+    /// What came of a line that hasn't all come yet.
+    pending: Vec<u8>,
+}
+
+/// What [`Filter`] does with a line.
+enum Pass {
+    /// Passes as it came.
+    Same,
+    /// Passes as this line, the object id written as upload-pack reads it.
+    As(String),
+    /// Is left out.
+    Drop,
+}
+
+impl Filter {
+    fn new(view: &View) -> Filter {
+        Filter {
+            view: view.dir.clone(),
+            tips: view.tips.clone(),
+            hex_len: view.hex_len,
+            reached: None,
+            pending: Vec::new(),
+        }
+    }
+
+    /// Takes `bytes` from the client: what passes, as pkt-lines, or why the fetch is refused.
+    fn feed(&mut self, bytes: &[u8]) -> Result<Vec<u8>, String> {
+        let mut pending = std::mem::take(&mut self.pending);
+        pending.extend_from_slice(bytes);
+        let mut out = Vec::new();
+        let mut at = 0;
+        while let Some(head) = pending.get(at..at + 4) {
+            let len = std::str::from_utf8(head)
+                .ok()
+                .filter(|h| h.bytes().all(|b| b.is_ascii_hexdigit()))
+                .and_then(|h| usize::from_str_radix(h, 16).ok())
+                .ok_or_else(|| {
+                    format!(
+                        "protocol error: bad pkt-line length {:?}",
+                        String::from_utf8_lossy(head)
+                    )
+                })?;
+            // A flush, a delimiter or a response end: no line.
+            if len <= 2 {
+                out.extend_from_slice(head);
+                at += 4;
+                continue;
+            }
+            if !(4..=MAX_PKT).contains(&len) {
+                return Err(format!("protocol error: bad pkt-line length {len}"));
+            }
+            let Some(packet) = pending.get(at..at + len) else {
+                break;
+            };
+            match self.line(&packet[4..])? {
+                Pass::Same => out.extend_from_slice(packet),
+                Pass::As(line) => {
+                    out.extend_from_slice(format!("{:04x}{line}", line.len() + 4).as_bytes())
+                }
+                Pass::Drop => {}
+            }
+            at += len;
+        }
+        pending.drain(..at);
+        self.pending = pending;
+        Ok(out)
+    }
+
+    fn line(&mut self, line: &[u8]) -> Result<Pass, String> {
+        let (kind, rest) = if let Some(rest) = line.strip_prefix(b"want ") {
+            ("want", rest)
+        } else if let Some(rest) = line.strip_prefix(b"have ") {
+            ("have", rest)
+        } else if let Some(rest) = line.strip_prefix(b"shallow ") {
+            ("shallow", rest)
+        } else {
+            return Ok(Pass::Same);
+        };
+        let oid = parse_oid(rest, self.hex_len)
+            .ok_or_else(|| format!("protocol error: no object id in a {kind} line"))?;
+        if kind == "want" {
+            return match self.tips.contains(&oid) {
+                // upload-pack reads the same id from it, and the capabilities after it.
+                true => Ok(Pass::Same),
+                false => Err(format!(
+                    "upload-pack: not our ref {}",
+                    oid_hex(&oid, self.hex_len)
+                )),
+            };
+        }
+        Ok(match self.reached()?.contains(&oid) {
+            true => Pass::As(format!("{kind} {}\n", oid_hex(&oid, self.hex_len))),
+            false => Pass::Drop,
+        })
+    }
+
+    /// The commits the view's refs reach.
+    fn reached(&mut self) -> Result<&HashSet<Oid>, String> {
+        if self.reached.is_none() {
+            let commits = rev_list_all(&self.view, self.hex_len).map_err(|e| {
+                format!("can't list the commits {} serves: {e}", self.view.display())
+            })?;
+            self.reached = Some(commits);
+        }
+        Ok(self.reached.as_ref().expect("set above"))
+    }
+}
+
+/// `git rev-list --all` in the git dir at `dir`: every commit its refs reach.
+fn rev_list_all(dir: &Path, hex_len: usize) -> io::Result<HashSet<Oid>> {
+    let mut child = crate::gitinfo::git(dir)
+        .args(["rev-list", "--all"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let stderr = child.stderr.take().expect("piped stderr");
+    let err = thread::spawn(move || read_capped(stderr, MAX_STDERR));
+    let mut commits = HashSet::new();
+    let mut bad = None;
+    // Read to the end, or until reading fails, before the wait: the pipe is closed by then.
+    let read: io::Result<()> = BufReader::new(child.stdout.take().expect("piped stdout"))
+        .split(b'\n')
+        .try_for_each(|line| {
+            let line = line?;
+            match parse_oid(&line, hex_len).filter(|_| line.len() == hex_len) {
+                Some(oid) => {
+                    commits.insert(oid);
+                }
+                None => bad = Some(String::from_utf8_lossy(&line).into_owned()),
+            }
+            Ok(())
+        });
+    let status = child.wait()?;
+    let err = err.join().unwrap_or_default();
+    if !status.success() {
+        return Err(io::Error::other(format!(
+            "git rev-list {status}: {}",
+            err.trim()
+        )));
+    }
+    read?;
+    if let Some(line) = bad {
+        return Err(io::Error::other(format!("git rev-list printed {line:?}")));
+    }
+    Ok(commits)
+}
+
+/// Runs `git upload-pack` on `view` with its stdin and stdout piped through `stream`, what comes
+/// in through a [`Filter`], until the fetch is done or either side goes away, for the daemon's
+/// [`crate::mesh::Handler::stream`]. The client can want only the tips of the view's refs: every
+/// `uploadpack.allow*SHA1InWant` is off, on the command line, after every config file, so no
+/// config can let more through.
 ///
 /// The process (and anything it started) is killed if the stream breaks or stops taking bytes
-/// for five minutes, and is reaped before this returns. If `git upload-pack` fails before it
-/// sends anything, the client gets its error as a git error packet. `Err` when the stream broke,
-/// or `git upload-pack` couldn't run or failed (with its stderr).
-pub fn serve_upload_pack(mut stream: Stream, git_dir: &Path, wants: Wants) -> io::Result<()> {
+/// for five minutes, or the filter refuses the fetch, and is reaped before this returns. If `git
+/// upload-pack` fails before it sends anything, the client gets its error as a git error packet,
+/// as it gets the filter's refusal. `Err` when the stream broke, the filter refused, or `git
+/// upload-pack` couldn't run or failed (with its stderr).
+pub fn serve_upload_pack(mut stream: Stream, view: &View) -> io::Result<()> {
     // Before anything is started: these fail on a socket the other side has reset (macOS
     // refuses setsockopt then), and returning after the spawn would leave the child unreaped.
     let reader = stream.try_clone()?;
     reader.set_read_timeout(Some(POLL))?;
     stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
+    let git_dir = view.path();
+    let filter = Filter::new(view);
     let mut cmd = crate::gitinfo::git(git_dir);
-    match wants {
-        Wants::Any => cmd.args(["-c", "uploadpack.allowAnySHA1InWant=true"]),
-        Wants::Tips => cmd.args([
-            "-c",
-            "uploadpack.allowAnySHA1InWant=false",
-            "-c",
-            "uploadpack.allowReachableSHA1InWant=false",
-            "-c",
-            "uploadpack.allowTipSHA1InWant=false",
-        ]),
-    };
+    cmd.args([
+        "-c",
+        "uploadpack.allowAnySHA1InWant=false",
+        "-c",
+        "uploadpack.allowReachableSHA1InWant=false",
+        "-c",
+        "uploadpack.allowTipSHA1InWant=false",
+        // A `sparse:oid` filter reads the blob it names, any blob of the repository.
+        "-c",
+        "uploadpackfilter.sparse:oid.allow=false",
+    ]);
     cmd.args(["upload-pack", &format!("--timeout={UPLOAD_PACK_TIMEOUT_S}")])
         .arg(git_dir)
         // Protocol v0, whatever the daemon's environment says: the header carries no version.
@@ -392,9 +589,10 @@ pub fn serve_upload_pack(mut stream: Stream, git_dir: &Path, wants: Wants) -> io
     });
 
     let state = Arc::new(AtomicU8::new(RUNNING));
+    let refused = Arc::new(Mutex::new(None));
     let inbound = {
-        let (proc, state) = (proc.clone(), state.clone());
-        thread::spawn(move || pump_in(reader, stdin, &proc, &state))
+        let (proc, state, refused) = (proc.clone(), state.clone(), refused.clone());
+        thread::spawn(move || pump_in(reader, stdin, filter, &proc, &state, &refused))
     };
 
     let mut sent = 0u64;
@@ -424,13 +622,18 @@ pub fn serve_upload_pack(mut stream: Stream, git_dir: &Path, wants: Wants) -> io
     let stderr = err_rx
         .recv_timeout(Duration::from_secs(2))
         .unwrap_or_default();
-    let failed = match &status {
-        Ok(s) if s.success() => None,
-        Ok(s) => Some(format!("git upload-pack {}: {}", s, stderr.trim())),
-        Err(e) => Some(format!("git upload-pack: {e}")),
+    // Set before the filter killed the process, so before its output ended.
+    let refusal = refused.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let failed = match (&refusal, &status) {
+        (Some(r), _) => Some(format!("refused the fetch: {r}")),
+        (None, Ok(s)) if s.success() => None,
+        (None, Ok(s)) => Some(format!("git upload-pack {}: {}", s, stderr.trim())),
+        (None, Err(e)) => Some(format!("git upload-pack: {e}")),
     };
     if out.is_ok() {
-        if sent == 0
+        if let Some(r) = &refusal {
+            let _ = stream.write_all(&err_pkt(r));
+        } else if sent == 0
             && let Some(f) = &failed
         {
             let _ = stream.write_all(&err_pkt(f));
@@ -454,9 +657,17 @@ const DONE: u8 = 1;
 /// The transfer failed: the reading side stops.
 const ABORT: u8 = 2;
 
-/// Copies what the client sends to `git upload-pack`'s stdin, and closes that when the client
-/// closes. If the client goes away, kills the process.
-fn pump_in(mut reader: Stream, stdin: ChildStdin, proc: &Proc, state: &AtomicU8) -> io::Result<()> {
+/// Copies what the client sends to `git upload-pack`'s stdin, through `filter`, and closes that
+/// when the client closes. If the client goes away, kills the process; if the filter refuses the
+/// fetch, says why in `refused` and kills the process, and takes in the rest unread.
+fn pump_in(
+    mut reader: Stream,
+    stdin: ChildStdin,
+    mut filter: Filter,
+    proc: &Proc,
+    state: &AtomicU8,
+    refused: &Mutex<Option<String>>,
+) -> io::Result<()> {
     let mut stdin = Some(stdin);
     let mut buf = vec![0u8; 64 * 1024];
     let mut done_at: Option<Instant> = None;
@@ -475,11 +686,21 @@ fn pump_in(mut reader: Stream, stdin: ChildStdin, proc: &Proc, state: &AtomicU8)
         match reader.read(&mut buf) {
             Ok(0) => return Ok(()),
             Ok(n) => {
-                if let Some(s) = stdin.as_mut()
-                    && s.write_all(&buf[..n]).is_err()
-                {
-                    // It stopped reading (it exited, or is sending its pack): drop the rest.
-                    stdin = None;
+                if let Some(s) = stdin.as_mut() {
+                    match filter.feed(&buf[..n]) {
+                        Ok(pass) => {
+                            // It stopped reading (it exited, or is sending its pack): drop the
+                            // rest.
+                            if s.write_all(&pass).is_err() {
+                                stdin = None;
+                            }
+                        }
+                        Err(why) => {
+                            *refused.lock().unwrap_or_else(|e| e.into_inner()) = Some(why);
+                            proc.kill();
+                            stdin = None;
+                        }
+                    }
                 }
             }
             Err(e)
@@ -786,6 +1007,15 @@ mod tests {
             format!("{}\n", objects.display())
         );
         assert_eq!(read(&view, "HEAD"), "ref: refs/heads/y\n");
+        // What a fetch may want: the objects its refs name, the tag's own included.
+        let oids = |ids: &[&String]| -> HashSet<Oid> {
+            ids.iter()
+                .map(|id| parse_oid(id.as_bytes(), 40).unwrap())
+                .collect()
+        };
+        assert_eq!(view.tips, oids(&[&base, &a, &v0]));
+        // And the commits those reach.
+        assert_eq!(rev_list_all(view.path(), 40).unwrap(), oids(&[&base, &a]));
         // Never made over another.
         assert!(View::create(at.clone(), &git_dir, [&a]).is_err());
         drop(view);
@@ -818,6 +1048,96 @@ mod tests {
         );
         assert!(gone.unwrap_err().to_string().contains("can't read"));
         assert!(!tmp.path().join("views/4.git").exists());
+    }
+
+    #[test]
+    fn the_filter_passes_only_lines_that_name_what_the_view_serves() {
+        let id = |c: char| c.to_string().repeat(40);
+        let (tip, reached, other) = (id('a'), id('b'), id('c'));
+        let oid = |h: &str| parse_oid(h.as_bytes(), 40).unwrap();
+        let filter = || Filter {
+            view: PathBuf::from("/nonexistent"),
+            tips: HashSet::from([oid(&tip)]),
+            hex_len: 40,
+            reached: Some(HashSet::from([oid(&tip), oid(&reached)])),
+            pending: Vec::new(),
+        };
+        let pkt = |l: &str| format!("{:04x}{l}", l.len() + 4);
+        let passed = |f: &mut Filter, input: &str| {
+            String::from_utf8(f.feed(input.as_bytes()).unwrap()).unwrap()
+        };
+
+        // A want of a tip, capabilities and all, as it came, in pieces as they come.
+        let mut f = filter();
+        let input = format!(
+            "{}0000",
+            pkt(&format!("want {} thin-pack\n", tip.to_uppercase()))
+        );
+        let (one, two) = input.split_at(7);
+        assert_eq!(passed(&mut f, one), "");
+        assert_eq!(passed(&mut f, two), input);
+        // A have or shallow of a commit it reaches, its id as git reads it; of any other, nothing.
+        let input = [
+            pkt(&format!("have {}{}\n", reached.to_uppercase(), id('d'))),
+            pkt(&format!("have {other}\n")),
+            pkt(&format!("shallow {other}\n")),
+            pkt(&format!("shallow {tip}")),
+            "0000".into(),
+            pkt("done\n"),
+        ]
+        .concat();
+        let want = [
+            pkt(&format!("have {reached}\n")),
+            pkt(&format!("shallow {tip}\n")),
+            "0000".into(),
+            pkt("done\n"),
+        ]
+        .concat();
+        assert_eq!(passed(&mut f, &input), want);
+        // Lines that name no object pass as they are.
+        let input = [
+            pkt("deepen 1\n"),
+            pkt("deepen-not refs/heads/main\n"),
+            pkt("filter blob:none\n"),
+            "0001".into(),
+            pkt(&"x".repeat(MAX_PKT - 4)),
+        ]
+        .concat();
+        assert_eq!(passed(&mut f, &input), input);
+
+        // Anything else refuses the fetch.
+        for (input, why) in [
+            (
+                pkt(&format!("want {reached}\n")),
+                format!("upload-pack: not our ref {reached}"),
+            ),
+            (
+                pkt(&format!("want {other} thin-pack\n")),
+                format!("upload-pack: not our ref {other}"),
+            ),
+            (
+                pkt(&format!("have {}\n", &reached[..39])),
+                "protocol error: no object id in a have line".into(),
+            ),
+            (
+                pkt("shallow \n"),
+                "protocol error: no object id in a shallow line".into(),
+            ),
+            (
+                "zzzz".into(),
+                "protocol error: bad pkt-line length \"zzzz\"".into(),
+            ),
+            (
+                "0003".into(),
+                "protocol error: bad pkt-line length 3".into(),
+            ),
+            (
+                "fff1".into(),
+                "protocol error: bad pkt-line length 65521".into(),
+            ),
+        ] {
+            assert_eq!(filter().feed(input.as_bytes()), Err(why), "{input}");
+        }
     }
 
     #[test]

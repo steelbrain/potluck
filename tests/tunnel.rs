@@ -10,7 +10,7 @@ mod common;
 
 use potluck::config::Paths;
 use potluck::mesh::{Handler, Mesh, MeshConfig, Peer, Stream};
-use potluck::tunnel::{self, Wants};
+use potluck::tunnel;
 use potluck::workspace::{SyncReport, Workspaces};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -18,7 +18,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
@@ -229,14 +229,38 @@ impl Proxy {
 }
 
 /// What the source serves: repository id to git dir, and each serve's outcome. A repository is
-/// served as a daemon in a cluster without users serves its mirrors (all of it, any object), or,
-/// with commits in `views`, as one with users does: a [`tunnel::View`] of those commits, made in
-/// `view_root` for that one fetch.
+/// served as a daemon serves its mirrors: a [`tunnel::View`] made in `view_root` for that one
+/// fetch, of the commits `views` names for it, or with none there, of every commit its branches
+/// and tags name. `view_config` is added to each view's config; with `spoil` set, the view's
+/// directory is gone before `git upload-pack` starts on it.
 struct Source {
     repos: Mutex<HashMap<String, PathBuf>>,
     views: Mutex<HashMap<String, Vec<String>>>,
     view_root: PathBuf,
+    view_config: Mutex<String>,
+    spoil: AtomicBool,
     served: Mutex<Sender<(String, Result<(), String>)>>,
+}
+
+/// The commits that the branches and tags of the git dir at `dir` name (none if it can't say).
+fn tip_commits(dir: &Path) -> Vec<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args([
+            "for-each-ref",
+            "--format=%(if)%(*objectname)%(then)%(*objectname)%(else)%(objectname)%(end)",
+            "refs/heads",
+            "refs/tags",
+        ])
+        .output();
+    out.map(|o| {
+        String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect()
+    })
+    .unwrap_or_default()
 }
 
 impl Handler for Source {
@@ -256,15 +280,25 @@ impl Handler for Source {
             return;
         };
         let commits = self.views.lock().unwrap().get(&id).cloned();
-        let result = match commits {
-            None => tunnel::serve_upload_pack(stream, &dir, Wants::Any),
-            Some(commits) => {
-                static N: AtomicU64 = AtomicU64::new(0);
-                let at = self
-                    .view_root
-                    .join(format!("{}.git", N.fetch_add(1, Ordering::SeqCst)));
-                tunnel::View::create(at, &dir, &commits)
-                    .and_then(|view| tunnel::serve_upload_pack(stream, view.path(), Wants::Tips))
+        let commits = commits.unwrap_or_else(|| tip_commits(&dir));
+        static N: AtomicU64 = AtomicU64::new(0);
+        let at = self
+            .view_root
+            .join(format!("{}.git", N.fetch_add(1, Ordering::SeqCst)));
+        let result = match tunnel::View::create(at, &dir, &commits) {
+            Ok(view) => {
+                let config = view.path().join("config");
+                let mut text = std::fs::read_to_string(&config).unwrap();
+                text.push_str(&self.view_config.lock().unwrap());
+                std::fs::write(&config, text).unwrap();
+                if self.spoil.load(Ordering::SeqCst) {
+                    std::fs::remove_dir_all(view.path()).unwrap();
+                }
+                tunnel::serve_upload_pack(stream, &view)
+            }
+            Err(e) => {
+                let _ = tunnel::refuse_upload_pack(stream, &format!("can't serve {id}: {e}"));
+                Err(e)
             }
         };
         let _ = self
@@ -332,6 +366,8 @@ fn cluster() -> Cluster {
         repos: Mutex::new(HashMap::from([(repo_id.clone(), repo.join(".git"))])),
         views: Mutex::new(HashMap::new()),
         view_root: root.path().join("views"),
+        view_config: Mutex::new(String::new()),
+        spoil: AtomicBool::new(false),
         served: Mutex::new(tx),
     });
     let source = Mesh::start(
@@ -467,7 +503,8 @@ fn processes(needles: &[&str]) -> Vec<String> {
         .collect()
 }
 
-/// The process group of the `git upload-pack` serving `repo` (it leads a group of its own).
+/// The process group of the `git upload-pack` serving a git dir in `repo` (it leads a group of
+/// its own).
 fn upload_pack_group(repo: &Path) -> String {
     let out = Command::new("ps")
         .args(["-A", "-ww", "-o", "pgid=", "-o", "args="])
@@ -617,6 +654,11 @@ fn a_mirror_syncs_over_the_mesh() {
         repo,
         &["commit-tree", &tree, "-p", "HEAD", "-m", "detached"],
     );
+    c.handler
+        .views
+        .lock()
+        .unwrap()
+        .insert(c.repo_id.clone(), vec![loose.clone()]);
     let (paths, id, url, sha) = (
         c.runner_paths.clone(),
         c.repo_id.clone(),
@@ -875,6 +917,365 @@ fn a_view_serves_its_commits_and_what_they_reach() {
     c.assert_no_processes();
 }
 
+/// The source's repository for the filter's tests: on main, `root` and `base`; on branch x, `a`,
+/// which the view serves; on branch y, `b`, tagged `vy`, which it doesn't. Both add one big file,
+/// a little different on each: a good delta base for the other.
+struct TwoBranches {
+    /// An ancestor of `a` that no ref names.
+    root: String,
+    base: String,
+    a: String,
+    a_blob: String,
+    b: String,
+    b_tree: String,
+    b_blob: String,
+    vy: String,
+    /// An id no object has.
+    unknown: String,
+}
+
+impl TwoBranches {
+    fn new(c: &Cluster) -> TwoBranches {
+        let repo = &c.repo;
+        let root = commit_file(repo, "root.txt", b"root\n", "root");
+        let base = commit_file(repo, "base.txt", b"base\n", "base");
+        let mut big = noise(256 << 10);
+        git(repo, &["checkout", "-q", "-b", "x"]);
+        big.extend_from_slice(b"on x\n");
+        let a = commit_file(repo, "big.bin", &big, "a");
+        git(repo, &["checkout", "-q", "-b", "y", "main"]);
+        big.extend_from_slice(b"and on y\n");
+        let b = commit_file(repo, "big.bin", &big, "b");
+        git(repo, &["tag", "-a", "-m", "on b", "vy"]);
+        git(repo, &["checkout", "-q", "main"]);
+        c.handler
+            .views
+            .lock()
+            .unwrap()
+            .insert(c.repo_id.clone(), vec![a.clone()]);
+        let rev = |r: &str| git(repo, &["rev-parse", r]);
+        let unknown = "0123456789abcdef".repeat(3)[..40].to_string();
+        assert!(!has(repo, &unknown));
+        TwoBranches {
+            a_blob: rev("x:big.bin"),
+            b_tree: rev("y^{tree}"),
+            b_blob: rev("y:big.bin"),
+            vy: rev("vy"),
+            root,
+            base,
+            a,
+            b,
+            unknown,
+        }
+    }
+
+    /// The objects of the repository the view doesn't serve.
+    fn others(&self) -> [(&'static str, &str); 4] {
+        [
+            ("a commit on another branch", &self.b),
+            ("its tree", &self.b_tree),
+            ("its blob", &self.b_blob),
+            ("a tag on it", &self.vy),
+        ]
+    }
+}
+
+/// What the source answers, the view's refs and all, to `input` from `_tunnel` as the runner.
+fn answer(c: &Cluster, input: &str) -> Vec<u8> {
+    let out = run(
+        &mut c.tunnel_cmd(&c.runner_paths, &c.repo_id),
+        input.as_bytes(),
+        LIMIT,
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out.stdout
+}
+
+/// Where the pack starts in an answer without side-band (refs never contain `PACK`).
+fn pack_start(answer: &[u8]) -> Option<usize> {
+    answer.windows(4).position(|w| w == b"PACK")
+}
+
+/// The pkt-lines of an answer before its pack, as text.
+fn before_pack(answer: &[u8]) -> String {
+    let end = pack_start(answer).unwrap_or(answer.len());
+    String::from_utf8_lossy(&answer[..end]).into_owned()
+}
+
+/// A view's objects are the whole repository's (through its alternates), but a client that names
+/// any other object in a `have` or `shallow` line learns nothing of it: it gets what an id that
+/// no object has gets, byte for byte (here a commit on another branch, its tree, its blob and a
+/// tag on it), and a pack with no delta against it, which `git index-pack` takes as it is (no
+/// `--fix-thin`). A commit the view reaches passes: the source acknowledges it as one both have,
+/// and unshallows it.
+#[test]
+fn haves_and_shallows_of_other_objects_get_what_an_unknown_id_gets() {
+    let c = cluster();
+    let t = TwoBranches::new(&c);
+    let want = pkt(&format!(
+        "want {} multi_ack_detailed thin-pack ofs-delta\n",
+        t.a
+    ));
+    let mut serves = 0;
+
+    // The client says it has the object, and wants a. And that it has root but not its parents
+    // (it has none): with that, a thin pack's deltas may be against any commit it has, not only
+    // against the parents of what it gets.
+    let have = |id: &str| {
+        let got = answer(
+            &c,
+            &format!(
+                "{want}{}0000{}0000{}",
+                pkt(&format!("shallow {}\n", t.root)),
+                pkt(&format!("have {id}\n")),
+                pkt("done\n")
+            ),
+        );
+        assert!(pack_start(&got).is_some(), "{id}: {}", before_pack(&got));
+        got
+    };
+    let none = have(&t.unknown);
+    serves += 1;
+    for (what, id) in t.others() {
+        let got = have(id);
+        serves += 1;
+        assert!(
+            got == none,
+            "{what}: {}\nan unknown id: {}",
+            before_pack(&got),
+            before_pack(&none)
+        );
+    }
+    let pack = &none[pack_start(&none).unwrap()..];
+    let into = c.bare("indexed.git");
+    let mut index = Command::new("git");
+    index.arg("-C").arg(&into).args(["index-pack", "--stdin"]);
+    let out = run(&mut index, pack, LIMIT);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    for sha in [&t.a, &t.base, &t.root, &t.a_blob] {
+        assert!(has(&into, sha), "{sha}");
+    }
+    let got = have(&t.base);
+    serves += 1;
+    assert!(
+        before_pack(&got).contains(&format!("ACK {} common\n", t.base)),
+        "{}",
+        before_pack(&got)
+    );
+
+    // The client says it has the object but not its parents, and wants all of a's history: the
+    // source tells it which of those it can now have whole.
+    let shallow = |id: &str| {
+        answer(
+            &c,
+            &format!(
+                "{want}{}{}0000{}",
+                pkt(&format!("shallow {id}\n")),
+                pkt("deepen 2147483647\n"),
+                pkt("done\n")
+            ),
+        )
+    };
+    let none = shallow(&t.unknown);
+    serves += 1;
+    assert!(pack_start(&none).is_some(), "{}", before_pack(&none));
+    for (what, id) in t.others() {
+        let got = shallow(id);
+        serves += 1;
+        assert!(
+            got == none,
+            "{what}: {}\nan unknown id: {}",
+            before_pack(&got),
+            before_pack(&none)
+        );
+    }
+    let got = shallow(&t.base);
+    serves += 1;
+    assert!(
+        before_pack(&got).contains(&format!("unshallow {}", t.base)),
+        "{}",
+        before_pack(&got)
+    );
+
+    assert!(c.served(serves).iter().all(Result::is_ok));
+    c.assert_no_processes();
+}
+
+/// A `want` of anything but an object one of the view's refs names refuses the fetch at once,
+/// with git upload-pack's own error, whether the repository has the object or not (git
+/// upload-pack refuses an object it lacks at once, and one it has only once the client's wants
+/// end): an ancestor of the view's commit, a commit on another branch, its tree, a tag on it, or
+/// no object at all. So does what isn't a pkt-line.
+#[test]
+fn a_want_of_anything_but_a_tip_is_refused_at_once() {
+    let c = cluster();
+    let t = TwoBranches::new(&c);
+    // Sent with no flush after it, on a connection left open.
+    let first_line = |line: &[u8]| {
+        let mut tunnel = c
+            .tunnel_cmd(&c.runner_paths, &c.repo_id)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = tunnel.stdin.take().unwrap();
+        stdin.write_all(line).unwrap();
+        let mut stdout = tunnel.stdout.take().unwrap();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let mut got = Vec::new();
+            let _ = stdout.read_to_end(&mut got);
+            let _ = tx.send(got);
+        });
+        let got = rx.recv_timeout(Duration::from_secs(10));
+        let _ = tunnel.kill();
+        let _ = tunnel.wait();
+        drop(stdin);
+        let got = got.expect("no answer before the client's flush");
+        let last = pkt_lines(&got).into_iter().flatten().last().unwrap();
+        String::from_utf8_lossy(&last).trim().to_string()
+    };
+    let mut ids: Vec<&str> = t.others().iter().map(|(_, id)| *id).collect();
+    ids.extend([t.root.as_str(), &t.unknown]);
+    for id in &ids {
+        let line = pkt(&format!("want {id} multi_ack_detailed side-band-64k\n"));
+        assert_eq!(
+            first_line(line.as_bytes()),
+            format!("ERR upload-pack: not our ref {id}")
+        );
+    }
+    let got = first_line(b"zzzzwant");
+    assert_eq!(got, "ERR protocol error: bad pkt-line length \"zzzz\"");
+
+    for r in c.served(ids.len() + 1) {
+        let e = r.unwrap_err();
+        assert!(e.starts_with("refused the fetch: "), "{e}");
+    }
+    c.assert_no_processes();
+}
+
+/// A `sparse:oid` filter reads the blob it names, and so would say what any blob of the
+/// repository holds: it is refused, whatever it names, also where upload-pack is let take
+/// filters.
+#[test]
+fn a_sparse_filter_is_refused_whatever_it_names() {
+    let c = cluster();
+    let t = TwoBranches::new(&c);
+    *c.handler.view_config.lock().unwrap() = "[uploadpack]\n\tallowFilter = true\n".into();
+    let filter = |id: &str| {
+        let got = answer(
+            &c,
+            &format!(
+                "{}{}0000{}",
+                pkt(&format!("want {} filter ofs-delta\n", t.a)),
+                pkt(&format!("filter sparse:oid={id}\n")),
+                pkt("done\n")
+            ),
+        );
+        assert!(pack_start(&got).is_none(), "{id}: {}", before_pack(&got));
+        let lines = pkt_lines(&got);
+        let last = lines.iter().flatten().last().unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(last).trim(),
+            "ERR filter 'sparse:oid' not supported"
+        );
+        got
+    };
+    let none = filter(&t.unknown);
+    for id in [&t.b_blob, &t.a_blob] {
+        assert!(filter(id) == none, "{id}");
+    }
+    assert!(c.served(3).iter().all(Result::is_err));
+    c.assert_no_processes();
+}
+
+/// A runner whose mirror has a commit the source no longer serves still syncs: here branch x is
+/// rebased onto a main that moved on. The runner's `have` of x's old commit is left out, so the
+/// big file that commit shares with the new one comes again, whole. (With a bitmap index, as
+/// here, git upload-pack would otherwise count it as the runner's; without one, it counts only
+/// what the parents of the commits it sends reach, and sends the file again too.) A sync where
+/// every commit the runner has is still served moves only what is new.
+#[test]
+fn a_runner_syncs_on_when_its_commits_stop_being_served() {
+    let c = cluster();
+    let repo = &c.repo;
+    commit_file(repo, "base.txt", b"base\n", "base");
+    git(repo, &["checkout", "-q", "-b", "x"]);
+    let big = 1 << 20;
+    let a = commit_file(repo, "big.bin", &noise(big), "a");
+    let view_of = |commit: &str| {
+        c.handler
+            .views
+            .lock()
+            .unwrap()
+            .insert(c.repo_id.clone(), vec![commit.to_string()]);
+    };
+    view_of(&a);
+    let url = c.url();
+    let mirror = c.bare("mirror.git");
+    // As a runner's daemon syncs; how many bytes came.
+    let sync = || {
+        let before = c.proxy.bytes();
+        let out = c.runner_git(
+            &mirror,
+            &[
+                "fetch",
+                "--quiet",
+                "--prune",
+                "--no-tags",
+                &url,
+                "+refs/heads/*:refs/heads/*",
+                "+refs/tags/*:refs/tags/*",
+            ],
+        );
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        c.proxy.bytes() - before
+    };
+    let first = sync();
+    assert_eq!(refs(&mirror), refs(repo));
+
+    // main moves on, and x is rebased onto it: a is on no branch.
+    git(repo, &["checkout", "-q", "main"]);
+    commit_file(repo, "main.txt", b"main moves on\n", "main 2");
+    git(repo, &["checkout", "-q", "x"]);
+    git(repo, &["rebase", "-q", "main"]);
+    let rebased = git(repo, &["rev-parse", "HEAD"]);
+    git(repo, &["repack", "-adq", "--write-bitmap-index"]);
+    view_of(&rebased);
+    let after_rebase = sync();
+    assert_eq!(refs(&mirror), refs(repo));
+    assert!(has(&mirror, &rebased));
+
+    // A commit on top of it.
+    let next = commit_file(repo, "small.txt", b"small\n", "next");
+    view_of(&next);
+    let incremental = sync();
+    assert_eq!(refs(&mirror), refs(repo));
+    eprintln!(
+        "first sync: {first} bytes; after the rebase: {after_rebase}; incremental: {incremental}"
+    );
+    assert!(
+        after_rebase < (big + (64 << 10)) as u64,
+        "{after_rebase} bytes after the rebase"
+    );
+    assert!(incremental < 64 << 10, "{incremental} bytes");
+    assert!(c.served(3).iter().all(Result::is_ok));
+    c.assert_no_processes();
+}
+
 #[test]
 fn an_unknown_repository_is_refused_clearly() {
     let c = cluster();
@@ -907,7 +1308,7 @@ fn an_unknown_repository_is_refused_clearly() {
         )]
     );
 
-    // A known id whose git dir is gone: git upload-pack's own error comes back.
+    // A known id whose git dir is gone: no view of it can be made, and the source says why.
     let gone = c.root.path().join("gone");
     c.handler
         .repos
@@ -919,12 +1320,26 @@ fn an_unknown_repository_is_refused_clearly() {
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(!out.status.success());
     assert!(
-        err.contains("remote error: git upload-pack") && err.contains(gone.to_str().unwrap()),
+        err.contains("remote error: can't serve gone-00000000: can't read")
+            && err.contains(gone.to_str().unwrap()),
         "{err}"
     );
     let (id, result) = c.served.recv_timeout(LIMIT).unwrap();
     assert_eq!(id, "gone-00000000");
     assert!(result.is_err());
+
+    // A view gone before git upload-pack starts on it: its own error comes back.
+    c.handler.spoil.store(true, Ordering::SeqCst);
+    let out = c.fetch(&into, &c.url());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(
+        err.contains("remote error: git upload-pack")
+            && err.contains(c.handler.view_root.to_str().unwrap()),
+        "{err}"
+    );
+    let served = c.served(1);
+    assert!(served[0].is_err(), "{served:?}");
     c.assert_no_processes();
 }
 
@@ -1186,8 +1601,8 @@ fn half_fetch(c: &Cluster) -> HalfFetch {
         "{:?}",
         String::from_utf8_lossy(&refs)
     );
-    // The git dir's upload-pack is running.
-    assert!(!processes(&[c.repo.to_str().unwrap()]).is_empty());
+    // The view's upload-pack is running.
+    assert!(!processes(&[c.handler.view_root.to_str().unwrap()]).is_empty());
     HalfFetch {
         child,
         _stdout: stdout,
@@ -1214,7 +1629,7 @@ fn upload_pack_and_its_children_die_when_the_runner_goes_away_mid_pack() {
     // Far more than every socket and pipe buffer on the way can hold.
     let head = commit_file(&c.repo, "big.bin", &noise(64 << 20), "big");
     let mut tunnel = half_fetch(&c);
-    let pgid = upload_pack_group(&c.repo);
+    let pgid = upload_pack_group(&c.handler.view_root);
     let wants = format!(
         "{}0000{}",
         pkt(&format!("want {head} side-band-64k ofs-delta\n")),
