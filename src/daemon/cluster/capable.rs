@@ -32,9 +32,10 @@ pub(crate) struct Known {
 }
 
 impl Known {
-    fn snap(&self) -> MachineSnap {
+    fn snap(&self, pool: &str) -> MachineSnap {
         MachineSnap {
             facts: self.facts.clone(),
+            pool: pool.to_string(),
             ram_capacity_mib: self.ram_capacity_mib,
             running: Vec::new(),
         }
@@ -123,10 +124,14 @@ pub(crate) enum Verdict {
 
 /// The machines as this machine sees them now. `cluster` is None on one machine.
 pub(crate) fn machines(st: &State, cluster: Option<(&Cluster, &CState)>) -> Machines {
+    let pool_here = match cluster {
+        Some((c, _)) => c.pool_here(),
+        None => crate::mesh::trust::DEFAULT_POOL.to_string(),
+    };
     let mut up: Vec<(NodeName, MachineSnap)> = st
-        .snaps()
+        .local_snap(&pool_here)
+        .map(|s| (st.node.clone(), s))
         .into_iter()
-        .filter(|(n, _)| *n == st.node)
         .collect();
     let mut others = Vec::new();
     let Some((c, cs)) = cluster else {
@@ -154,8 +159,8 @@ pub(crate) fn machines(st: &State, cluster: Option<(&Cluster, &CState)>) -> Mach
         let snap = cs
             .reports
             .get(&m.name)
-            .map(|r| snap_of(&r.report))
-            .or_else(|| cs.known.get(&m.name).map(Known::snap));
+            .map(|r| snap_of(&r.report, &m.pool))
+            .or_else(|| cs.known.get(&m.name).map(|k| k.snap(&m.pool)));
         let away = if c.up(m) {
             match snap {
                 Some(s) => {
@@ -187,7 +192,8 @@ pub(crate) fn machines(st: &State, cluster: Option<(&Cluster, &CState)>) -> Mach
         if *n != st.node && !members.iter().any(|m| m.name == *n) {
             others.push(Other {
                 node: n.clone(),
-                snap: Some(k.snap()),
+                // Its pool went with its membership.
+                snap: Some(k.snap(crate::mesh::trust::DEFAULT_POOL)),
                 away: Away::Left,
             });
         }

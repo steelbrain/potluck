@@ -41,6 +41,8 @@ fn job(cmd: &[&str]) -> JobRecord {
             kill_on_stall: false,
             recipe: None,
             submitted_from: "test".into(),
+            pools: Vec::new(),
+            auth: None,
         },
         state: JobState::Running,
         submitted_at: 0,

@@ -5375,3 +5375,433 @@ fn a_wait_while_the_owner_is_away_takes_no_third_members_word() {
         "{error}"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// Signed jobs and pools
+
+/// The user key `node`'s command line holds (user.key beside its node.toml).
+fn user_key(node: &Node) -> potluck::mesh::user::UserKey {
+    potluck::mesh::user::UserKey::load(&node.dir.join("user.key"))
+        .unwrap()
+        .unwrap()
+}
+
+/// The spec `owner`'s command line sent for `job`, its signature with it: what a replay of that
+/// dispatch sends.
+fn sent_spec(owner: &Node, job: &str) -> potluck::types::JobSpec {
+    let auth = owner.get(job).spec.auth.expect("a signed job");
+    potluck::types::JobSpec {
+        auth: Some(auth.clone()),
+        ..potluck::jobauth::open(&auth).unwrap()
+    }
+}
+
+/// What `node`'s daemon answers a dispatch of `spec` made straight to its socket.
+fn dispatched(node: &Node, spec: potluck::types::JobSpec) -> Result<String, String> {
+    match node.client().call(Request::Dispatch {
+        spec: Box::new(spec),
+    }) {
+        Ok(Response::Dispatched { job, .. }) => Ok(job),
+        Ok(other) => panic!("{other:?}"),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// After `potluck user init` a's command line signs what it dispatches, and a job runs on another
+/// member, which checks the signature first; queued again when that runner is lost, the same
+/// signed job runs on a third. A dispatch without a user's signature is refused: from c's command
+/// line, which has no user key, and sent straight to a's daemon. So is a replay of one of a's, and
+/// one signed by a key no user has, for another machine, or long ago.
+#[test]
+fn after_user_init_jobs_are_signed_and_checked_where_they_run() {
+    let w = World::new();
+    let a = w.node("a").start();
+    let mut b = w.node("b").cpu("fast").start();
+    pair(&a, &b);
+    a.cli_ok(&["user", "init", "--name", "owner"]);
+    for n in [&a, &b] {
+        wait_until(&format!("{} has the user", n.name), || {
+            trust_of(n).users_exist()
+        });
+    }
+    let user = user_key(&a);
+    let cmd = "echo on $POTLUCK_NODE; if [ $POTLUCK_NODE = b ]; then sleep 60; fi";
+    let job = a.dispatch(&["--on", "cpu_model=fast", "--", "sh", "-c", cmd]);
+    let signed = a.get(&job).spec;
+    let auth = signed.auth.clone().unwrap();
+    assert_eq!(auth.key, user.public());
+    assert_eq!(potluck::jobauth::open(&auth).unwrap().submitted_from, "a");
+    a.running_on(&job, "b");
+    assert_eq!(b.get(&job).spec.auth.unwrap().key, user.public());
+    wait_until("a has b's line", || output_of(&a, &job).contains("on b"));
+
+    // b is lost: c, admitted since with the user's key, runs the same signed job.
+    let c = w.node("c").cpu("fast").start();
+    pair(&a, &c);
+    b.stop();
+    let j = a.done(&job);
+    assert_eq!(
+        (j.state, j.node.as_deref()),
+        (JobState::Succeeded, Some("c")),
+        "{j:#?}"
+    );
+    assert_eq!(j.spec, signed);
+    assert_eq!(c.get(&job).spec.auth, Some(auth.clone()));
+    assert!(output_of(&a, &job).contains("requeued: b was lost"));
+
+    // c's command line has no user key.
+    let o = c.cli(&["dispatch", "--timeout", "60s", "--", "true"]);
+    assert!(
+        o.code == 2
+            && error_of(&o).starts_with(
+                "this cluster has users, so a dispatch is signed with a user's key, and there is none at"
+            ),
+        "{}",
+        o.stdout
+    );
+    // Unsigned, to the socket.
+    let sent = sent_spec(&a, &job);
+    let unsigned = potluck::types::JobSpec {
+        auth: None,
+        ..sent.clone()
+    };
+    let e = dispatched(&a, unsigned.clone()).unwrap_err();
+    assert!(
+        e.contains("this cluster has users, so a dispatch is signed with a user's key, and this one is unsigned"),
+        "{e}"
+    );
+    // a's dispatch again, as it was signed.
+    let e = dispatched(&a, sent).unwrap_err();
+    assert!(
+        e.contains("this signed dispatch was made here before"),
+        "{e}"
+    );
+    // A key no user has.
+    let stranger = tempfile::tempdir().unwrap();
+    let other = potluck::mesh::user::UserKey::load_or_create(&stranger.path().join("k"))
+        .unwrap()
+        .0;
+    let e = dispatched(&a, potluck::jobauth::sign(&unsigned, &other, now_ms())).unwrap_err();
+    assert!(e.contains("which is no user of this cluster"), "{e}");
+    // The user's key, for another machine.
+    let for_c = potluck::types::JobSpec {
+        submitted_from: "c".into(),
+        ..unsigned.clone()
+    };
+    let e = dispatched(&a, potluck::jobauth::sign(&for_c, &user, now_ms())).unwrap_err();
+    assert!(
+        e.contains("signed for machine \"c\", not this one, a"),
+        "{e}"
+    );
+    // Eleven minutes ago.
+    let e = dispatched(
+        &a,
+        potluck::jobauth::sign(&unsigned, &user, now_ms() - 660_000),
+    )
+    .unwrap_err();
+    assert!(e.contains("more than 10m from this machine's clock"), "{e}");
+    // Signed now, it runs.
+    let again = dispatched(&a, potluck::jobauth::sign(&unsigned, &user, now_ms())).unwrap();
+    let j = a.done(&again);
+    assert_eq!(
+        (j.state, j.node.as_deref()),
+        (JobState::Succeeded, Some("c")),
+        "{j:#?}"
+    );
+}
+
+/// A job runs only on machines in the pools its signed spec names. One for pool cloud runs on d,
+/// admitted with `--pool cloud`, not on a or b (pool default); a dispatch only d could run is
+/// refused unless it is for pool cloud. A default job waiting in a's queue never reaches d: not in
+/// a's report to it, not through upload-pack, and a refuses d's claim of it. b's report holds it
+/// with who signed it, without the spec signed.
+#[test]
+fn a_job_runs_only_in_its_pools() {
+    let w = World::new();
+    let a = w.node("a").start();
+    let b = w.node("b").start();
+    pair(&a, &b);
+    a.cli_ok(&["user", "init", "--name", "owner"]);
+    let d = w.node("d").start();
+    let request = d.cli_ok(&["pair"])["text"].as_str().unwrap().to_string();
+    let reply = a.cli_ok(&["admit", "--pool", "cloud", &request]);
+    d.cli_ok(&["pair", "--finish", reply["text"].as_str().unwrap()]);
+    wait_until("a and d meet", || a.node_alive("d") && d.node_alive("a"));
+    let dk = key_of(&d);
+    for n in [&a, &b, &d] {
+        wait_until(&format!("{} has d in pool cloud", n.name), || {
+            trust_of(n).pool_of(&dk) == Some("cloud")
+        });
+    }
+    wait_until("b and d see each other", || {
+        b.node_alive("d") && d.node_alive("b")
+    });
+
+    let cloud = a.dispatch(&["--pool", "cloud", "--", "true"]);
+    let j = a.done(&cloud);
+    assert_eq!(
+        (j.state, j.node.as_deref()),
+        (JobState::Succeeded, Some("d")),
+        "{j:#?}"
+    );
+    assert_eq!(j.spec.pools, ["cloud"]);
+    let o = a.cli(&[
+        "dispatch",
+        "--timeout",
+        "60s",
+        "--on",
+        "node=d",
+        "--",
+        "true",
+    ]);
+    assert!(
+        o.code == 2 && error_of(&o).contains("d: in pool cloud, not the job's pool default"),
+        "{}",
+        o.stdout
+    );
+    let o = a.cli(&[
+        "dispatch",
+        "--timeout",
+        "60s",
+        "--pool",
+        "cloud",
+        "--on",
+        "node=b",
+        "--",
+        "true",
+    ]);
+    assert!(
+        o.code == 2 && error_of(&o).contains("b: in pool default, not the job's pool cloud"),
+        "{}",
+        o.stdout
+    );
+    let o = a.cli(&[
+        "dispatch",
+        "--timeout",
+        "60s",
+        "--pool",
+        "a/b",
+        "--",
+        "true",
+    ]);
+    assert!(
+        o.code == 2 && error_of(&o).contains("--pool: bad pool name \"a/b\""),
+        "{}",
+        o.stdout
+    );
+
+    // A default job waits for b, which runs an exclusive one.
+    let busy = a.dispatch(&["--on", "node=b", "--exclusive", "--", "sleep", "60"]);
+    a.running_on(&busy, "b");
+    let waits = a.dispatch(&["--on", "node=b", "--", "true"]);
+    let repo = a.get(&waits).spec.repo.id;
+    let to_b = entry_of(&report_to(&b, "a"), "queue", &waits);
+    assert_eq!(to_b["spec"]["cmd"], serde_json::json!([]), "{to_b}");
+    assert_eq!(
+        to_b["spec"]["auth"]["key"],
+        user_key(&a).public().to_text(),
+        "{to_b}"
+    );
+    assert!(to_b["spec"]["auth"].get("signed_spec").is_none(), "{to_b}");
+    let to_d = report_to(&d, "a");
+    assert!(
+        !to_d["queue"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|j| j["id"] == waits.as_str()),
+        "{to_d}"
+    );
+    let as_d = client_mesh(&d);
+    let as_b = client_mesh(&b);
+    let got = upload_pack(&as_d, "a", &repo);
+    assert!(
+        got.ends_with(&format!(
+            "ERR a has no job queued, or run by d, that names repository {repo}\n"
+        )),
+        "{got:?}"
+    );
+    assert_eq!(upload_pack(&as_b, "a", &repo), "served\n");
+    let claim = serde_json::json!({
+        "op": "claim",
+        "job": waits,
+        "lease": {
+            "grant": {"ram_mib": 4096, "cpu": 1, "gpus": [], "exclusive": false},
+            "granted_at": now_ms(),
+            "deadline": now_ms() + 60_000,
+            "token": "t1",
+        },
+        "workspace": "d-w9",
+    });
+    let r = as_d.call("a", claim).unwrap();
+    assert_eq!(r["kind"], "refused", "{r}");
+    assert_eq!(
+        r["reason"],
+        format!("{waits} is not for d: it runs in pool default, and d is in pool cloud"),
+        "{r}"
+    );
+    as_d.stop();
+    as_b.stop();
+    assert_eq!(a.get(&waits).state, JobState::Queued);
+    a.cli_ok(&["cancel", &busy]);
+    let j = a.done(&waits);
+    assert_eq!(
+        (j.state, j.node.as_deref()),
+        (JobState::Succeeded, Some("b")),
+        "{j:#?}"
+    );
+    assert!(d.exec.launch_of(&waits).is_none());
+    assert!(a.exec.launch_of(&cloud).is_none() && b.exec.launch_of(&cloud).is_none());
+}
+
+/// An impostor owner: its report's queue holds the jobs a test made, and it grants each to the
+/// member that claims it. It counts the claims, by member and job.
+struct Forger {
+    report: Value,
+    jobs: BTreeMap<String, Value>,
+    claims: Mutex<BTreeMap<(String, String), u64>>,
+}
+
+impl Forger {
+    fn claims(&self, by: &str, job: &str) -> u64 {
+        let key = (by.to_string(), job.to_string());
+        self.claims.lock().unwrap().get(&key).copied().unwrap_or(0)
+    }
+}
+
+impl Handler for Forger {
+    fn call(&self, from: &Peer, msg: Value) -> Result<Value, String> {
+        match msg["op"].as_str().unwrap_or_default() {
+            "report" => Ok(serde_json::json!({"kind": "report", "report": self.report})),
+            "claim" => {
+                let id = msg["job"].as_str().unwrap_or_default().to_string();
+                *self
+                    .claims
+                    .lock()
+                    .unwrap()
+                    .entry((from.name.clone(), id.clone()))
+                    .or_default() += 1;
+                let mut rec = self.jobs.get(&id).cloned().ok_or("no such job")?;
+                rec["state"] = "starting".into();
+                rec["node"] = from.name.clone().into();
+                rec["lease"] = msg["lease"].clone();
+                rec["workspace"] = msg["workspace"].clone();
+                Ok(serde_json::json!({"kind": "granted", "job": rec, "reported": null}))
+            }
+            op => Err(format!("no {op} here")),
+        }
+    }
+}
+
+/// c, an impostor, queues jobs for b and grants them. b claims none that is unsigned or signed by
+/// a key no user has, and runs none whose grant doesn't verify: a's signed job passed off as c's,
+/// and a job the user signed for c with another command granted. Each refused one is claimed once.
+/// One the user signed for c, granted as signed, runs.
+#[test]
+fn a_forged_or_unsigned_job_from_another_owner_is_never_run() {
+    use potluck::jobauth;
+    let w = World::new();
+    let a = w.node("a").start();
+    let b = w.node("b").start();
+    let mut c = w.node("c").start();
+    pair(&a, &b);
+    pair(&a, &c);
+    wait_until("b and c see each other", || {
+        b.node_alive("c") && c.node_alive("b")
+    });
+    a.cli_ok(&["user", "init", "--name", "owner"]);
+    for n in [&a, &b, &c] {
+        wait_until(&format!("{} has the user", n.name), || {
+            trust_of(n).users_exist()
+        });
+    }
+    let user = user_key(&a);
+    let theirs = a.dispatch(&["--on", "node=b", "--", "true"]);
+    assert_eq!(a.done(&theirs).state, JobState::Succeeded);
+    let record = serde_json::to_value(a.get(&theirs)).unwrap();
+    // What a's command line signed, for c.
+    let signed_for_c = potluck::types::JobSpec {
+        submitted_from: "c".into(),
+        ..jobauth::open(a.get(&theirs).spec.auth.as_ref().unwrap()).unwrap()
+    };
+    let stranger = tempfile::tempdir().unwrap();
+    let other = potluck::mesh::user::UserKey::load_or_create(&stranger.path().join("k"))
+        .unwrap()
+        .0;
+    let held = |spec: &potluck::types::JobSpec| JobRecord {
+        // As c would hold it: its ids salted with c's name.
+        spec: potluck::types::JobSpec {
+            auth: spec.auth.clone(),
+            ..jobauth::owned("c", spec, false)
+        },
+        ..serde_json::from_value(record.clone()).unwrap()
+    };
+    let unsigned = held(&signed_for_c);
+    let by_stranger = held(&jobauth::sign(&signed_for_c, &other, now_ms()));
+    // a's job as a holds it, signed for a.
+    let replayed: JobRecord = serde_json::from_value(record.clone()).unwrap();
+    let mut changed = held(&jobauth::sign(&signed_for_c, &user, now_ms()));
+    changed.spec.cmd = vec!["sh".into(), "-c".into(), "echo forged".into()];
+    let fine = held(&jobauth::sign(&signed_for_c, &user, now_ms()));
+    let mut jobs = BTreeMap::new();
+    let mut queue = Vec::new();
+    for (id, mut rec) in [
+        ("c-901", unsigned),
+        ("c-902", by_stranger),
+        ("c-903", replayed),
+        ("c-904", changed),
+        ("c-905", fine),
+    ] {
+        rec.id = id.into();
+        rec.state = JobState::Queued;
+        (rec.node, rec.lease, rec.workspace) = (None, None, None);
+        (rec.started_at, rec.ended_at, rec.exit_code) = (None, None, None);
+        rec.spec.key = None;
+        let v = serde_json::to_value(&rec).unwrap();
+        jobs.insert(id.to_string(), v.clone());
+        queue.push(v);
+    }
+    let mut report = report_to(&b, "c");
+    report["queue"] = Value::Array(queue);
+    report["seq"] = 0.into();
+    let forger = Arc::new(Forger {
+        report,
+        jobs,
+        claims: Mutex::default(),
+    });
+    let mesh = c.impostor(forger.clone());
+    wait_until("b runs c-905", || b.exec.launch_of("c-905").is_some());
+    wait_until("b claimed c-903 and c-904", || {
+        forger.claims("b", "c-903") >= 1 && forger.claims("b", "c-904") >= 1
+    });
+    // Refused once, never claimed again.
+    std::thread::sleep(Duration::from_secs(2));
+    let log = b.daemon_log();
+    for (id, claims) in [
+        ("c-901", 0),
+        ("c-902", 0),
+        ("c-903", 1),
+        ("c-904", 1),
+        ("c-905", 1),
+    ] {
+        assert_eq!(forger.claims("b", id), claims, "{id}\n{log}");
+        assert_eq!(forger.claims("a", id), 0, "{id}");
+        if id != "c-905" {
+            assert!(b.exec.launch_of(id).is_none(), "{id}\n{log}");
+        }
+    }
+    assert!(
+        log.contains(
+            "WARNING: c-903: granted by c, but not run here: it was signed for \"a\", not for c, which granted it"
+        ),
+        "{log}"
+    );
+    assert!(
+        log.contains(
+            "WARNING: c-904: granted by c, but not run here: its cmd is not what its signature covers"
+        ),
+        "{log}"
+    );
+    assert_eq!(b.get("c-905").spec.cmd, ["true"]);
+    mesh.stop();
+}

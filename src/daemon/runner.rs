@@ -519,6 +519,7 @@ fn tick(sh: &Arc<Shared>, up: &mut Upkeep) {
         refresh_sizes(sh);
         retry_removals(sh);
         retry_cleanups(sh);
+        super::server::forget_nonces(&mut sh.lock(), crate::types::now_ms());
         // Not at the first: a member's queue may not have arrived yet.
         if up.upkeep_at.is_some() {
             remove_unsalted(sh);
@@ -1167,6 +1168,11 @@ fn plan_and_start(sh: &Arc<Shared>, now: Millis) {
     // Other machines' jobs this plan starts (claimed from their owners), and passes over them.
     let mut claims = Vec::new();
     let mut passed = Vec::new();
+    // In a cluster, this machine runs only jobs for its pool.
+    let pool = match &cluster {
+        Some(c) => c.pool_here(),
+        None => crate::mesh::trust::DEFAULT_POOL.to_string(),
+    };
     {
         let mut guard = sh.lock();
         let st = &mut *guard;
@@ -1183,8 +1189,7 @@ fn plan_and_start(sh: &Arc<Shared>, now: Millis) {
                     st.reservation = None;
                     break 'plan;
                 }
-                let snaps = st.snaps();
-                let Some((_, local)) = snaps.iter().find(|(n, _)| *n == st.node) else {
+                let Some(local) = st.local_snap(&pool) else {
                     break 'plan;
                 };
                 let plan = sh.parts.scheduler.plan(now, &local.view(), &queue);
@@ -2569,6 +2574,8 @@ mod tests {
             kill_on_stall: false,
             recipe: None,
             submitted_from: "here".into(),
+            pools: Vec::new(),
+            auth: None,
         };
         let mut job = new_record("here-1".into(), spec, 0);
         job.state = JobState::Running;

@@ -176,6 +176,8 @@ pub fn spec(cmd: &[&str]) -> JobSpec {
         kill_on_stall: false,
         recipe: None,
         submitted_from: "studio".into(),
+        pools: Vec::new(),
+        auth: None,
     }
 }
 

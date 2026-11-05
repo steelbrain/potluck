@@ -57,6 +57,7 @@ pub(super) fn queued_of(st: &State, j: &JobRecord) -> Queued {
             let busy = node == st.node && st.ws_busy(w);
             (w.clone(), node, busy)
         }),
+        pools: j.spec.pools.clone(),
     }
 }
 
@@ -106,12 +107,14 @@ pub(crate) fn adjust_queue(sh: &Shared, st: &State, queue: &mut Vec<Queued>, now
         return;
     };
     let mesh = c.mesh();
-    let alive: BTreeSet<NodeName> = mesh
-        .members()
-        .into_iter()
+    let members = mesh.members();
+    let alive: BTreeSet<NodeName> = members
+        .iter()
         .filter(|m| c.up(m) && !m.this_machine)
-        .map(|m| m.name)
+        .map(|m| m.name.clone())
         .collect();
+    // Each member's pool, from its admission.
+    let pools: BTreeMap<NodeName, String> = members.into_iter().map(|m| (m.name, m.pool)).collect();
     // Owners this machine takes jobs from: back from being away, it first compares membership
     // records with the other members (an owner may have been removed meanwhile).
     let owners: BTreeSet<&NodeName> = alive.iter().filter(|n| mesh.caught_up_for(n)).collect();
@@ -128,10 +131,14 @@ pub(crate) fn adjust_queue(sh: &Shared, st: &State, queue: &mut Vec<Queued>, now
         cs.unsynced.clear();
         return;
     }
-    let local: MachineSnap = match st.snaps().into_iter().find(|(n, _)| *n == st.node) {
-        Some((_, s)) => s,
+    let pool_here = c.pool_here();
+    let local: MachineSnap = match st.local_snap(&pool_here) {
+        Some(s) => s,
         None => return,
     };
+    // In a cluster with users, only jobs a user this machine recognizes signed are taken from
+    // other machines (a grant is checked whole before the job runs: [`verify_grant`]).
+    let users = mesh.users_exist();
     let view = local.view();
     for s in cs.syncs.values_mut() {
         s.wants.clear();
@@ -169,7 +176,17 @@ pub(crate) fn adjust_queue(sh: &Shared, st: &State, queue: &mut Vec<Queued>, now
                 || held
                 || cs.outbox.contains_key(id)
                 || cs.rejected.contains_key(id)
+                || cs.refused.contains_key(id)
             {
+                continue;
+            }
+            let signed_by_user = || {
+                rec.spec
+                    .auth
+                    .as_ref()
+                    .is_some_and(|a| mesh.recognized_user(&a.key))
+            };
+            if users && !signed_by_user() {
                 continue;
             }
             let q = queued_of(st, rec);
@@ -219,6 +236,13 @@ pub(crate) fn adjust_queue(sh: &Shared, st: &State, queue: &mut Vec<Queued>, now
         }
     }
     queue.extend(added);
+    // A job refused here stays refused while its owner queues it.
+    let queued: BTreeSet<&JobId> = cs
+        .reports
+        .values()
+        .flat_map(|r| r.report.queue.iter().map(|j| &j.id))
+        .collect();
+    cs.refused.retain(|id, _| queued.contains(id));
 
     // Locality: a machine without a workspace of the repository leaves the job to a live member
     // with one that could start it within the wait, for that long.
@@ -242,7 +266,9 @@ pub(crate) fn adjust_queue(sh: &Shared, st: &State, queue: &mut Vec<Queued>, now
                 alive.contains(*n)
                     && !r.report.removed
                     && r.report.workspaces.iter().any(|w| w.repo_id == *repo)
-                    && could_start_soon(&snap_of(&r.report).view(), q, now, wait)
+                    && pools.get(*n).is_some_and(|pool| {
+                        could_start_soon(&snap_of(&r.report, pool).view(), q, now, wait)
+                    })
             })
             .map(|(n, _)| n.as_str())
             .collect();
@@ -395,6 +421,15 @@ fn claim(sh: &Arc<Shared>, id: &str, passed: Vec<JobId>) {
     );
     match r {
         Ok(PeerResponse::Granted { job, reported }) => {
+            if let Err(why) = verify_grant(sh, &c, id, &job) {
+                sh.log.log(format!(
+                    "WARNING: {id}: granted by {owner}, but not run here: {why}"
+                ));
+                c.cs().refused.insert(id.to_string(), why.clone());
+                let back = format!("{} did not run it: {why}", c.node);
+                undo(sh, &c, id, Some(back));
+                return;
+            }
             {
                 let mut guard = sh.lock();
                 let st = &mut *guard;
@@ -471,6 +506,34 @@ fn claim(sh: &Arc<Shared>, id: &str, passed: Vec<JobId>) {
             );
         }
     }
+}
+
+/// What a runner checks of job `id` its owner granted, before it runs it. In a cluster with users:
+/// a user this machine recognizes signed it, for its owner, and the spec granted is the one signed
+/// as its owner holds it ([`crate::jobauth::verify_grant`]); and it runs in this machine's pool,
+/// on this machine's facts (`--on`). Without users, any grant (as before users).
+fn verify_grant(sh: &Shared, c: &Cluster, id: &str, job: &JobRecord) -> Result<(), String> {
+    if job.id != id {
+        return Err(format!("the grant is of job {}", job.id));
+    }
+    let mesh = c.mesh();
+    if !mesh.users_exist() {
+        return Ok(());
+    }
+    let signed =
+        crate::jobauth::verify_grant(&job.spec, owner_of(id), |k| mesh.recognized_user(k))?;
+    let pool = c.pool_here();
+    if !signed.runs_in(&pool) {
+        return Err(format!(
+            "it runs in {}, and this machine is in pool {pool}",
+            crate::types::fmt_pools(&signed.pools)
+        ));
+    }
+    let facts = sh.lock().local().facts.clone();
+    if let Some(unmet) = facts.unmet(&signed.on) {
+        return Err(format!("it {unmet}"));
+    }
+    Ok(())
 }
 
 /// Undoes a reservation whose claim did not go through: the record, its lease, the workspace it

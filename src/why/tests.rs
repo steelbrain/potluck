@@ -34,6 +34,8 @@ fn record(id: &str, state: JobState) -> JobRecord {
             kill_on_stall: false,
             recipe: None,
             submitted_from: "studio".into(),
+            pools: Vec::new(),
+            auth: None,
         },
         state,
         submitted_at: m(-30),

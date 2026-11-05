@@ -78,6 +78,20 @@ $ potluck dispatch --timeout 10m --ram 100 -- cargo test
 potluck: no machine could ever run this job (studio: needs 100 GiB RAM, its capacity is 57.6 GiB)
 ```
 
+In a cluster with [users](cluster.md#users), the command line signs each dispatch with its user
+key (`$POTLUCK_USER_KEY`, else `user.key` beside `node.toml`), for the machine it dispatches on.
+Without a user key there, `dispatch` fails before anything is sent:
+
+```console
+mini$ potluck dispatch --timeout 10m -- cargo test
+potluck: this cluster has users, so a dispatch is signed with a user's key, and there is none at /Users/me/.config/potluck/user.key (dispatch from the machine where a user's key is; or make one here with `potluck user key` and have a user run `potluck user add NAME KEY`)
+```
+
+The daemon refuses a dispatch signed with a key that is no user's, signed for another machine,
+signed more than 10 minutes from its clock, or sent before (each signature's nonce is kept a
+day). Without users, a dispatch is signed when the command line has a user key, and taken unsigned
+when it has none.
+
 ## Run limit
 
 `--timeout` is required, on the command line or in the recipe. Durations need units: `600s`, `5m`,
@@ -180,6 +194,17 @@ each machine has, and `potluck nodes` lists every machine's facts:
 ```console
 $ potluck dispatch --timeout 10m --on linux=7.2 -- cargo test
 potluck: no machine could ever run this job (studio: needs linux=7.2 (this machine: macOS 27.0.1))
+```
+
+`--pool POOL`, repeatable, runs the job only on machines in pool POOL, or in any of the pools
+given. A machine's pool is the one its admission names (`potluck admit --pool POOL`, see
+[Users](cluster.md#users)); without `--pool`, a job runs only in the pool `default`, which every
+machine is in until a user admits one into another. A dispatch no machine in those pools could run
+is refused, with each machine's reason:
+
+```console
+$ potluck dispatch --timeout 10m --pool cloud --on node=mini -- cargo test
+potluck: no machine could ever run this job (studio: in pool default, not the job's pool cloud; mini: in pool default, not the job's pool cloud; rented: needs node=mini (this machine: node=rented))
 ```
 
 `--workspace W` runs the job in the existing workspace W, on W's machine, at W's commit. With
@@ -317,9 +342,10 @@ with the job, as do processes the command leaves running when it exits. Its envi
 with the request's env on top and without the variables it unsets (`--unset-env`, a recipe's
 `unset_env`), except potluck's own variables, which stay the job's. A request that
 doesn't fit fails at once with exit code 2, and so does one with `--keep`, `--hold`, `--key`,
-`--label`, `--no-rerun`, `--kill-on-stall`, `--without-submodule`, `--carry` or `--advance`, which
-only mean something for a job of its own; a recipe's `keep`, `hold` and `without_submodules` are
-left out, and `dispatch` says so. It never waits for the job's own resources, so a job can't deadlock on
+`--label`, `--no-rerun`, `--kill-on-stall`, `--without-submodule`, `--carry`, `--advance` or
+`--pool`, which only mean something for a job of its own; a recipe's `keep`, `hold`,
+`without_submodules` and `pools` are left out, and `dispatch` says so. Nothing is signed: no job is
+dispatched. It never waits for the job's own resources, so a job can't deadlock on
 itself; for the same reason `potluck wait` and `potluck logs -f` of the job's own id fail at once
 inside it, with exit code 2. The job runs the
 `potluck` its `PATH` finds, and that `PATH` comes from the login environment, so potluck's directory
@@ -362,9 +388,10 @@ $ potluck dispatch gpu-tests --timeout 1h -- cargo test --features gpu -- render
 ```
 
 A recipe's fields are `cmd` (required), `timeout`, `priority`, `ram`, `cpu`, `gpu`, `exclusive`,
-`on`, `hold`, `keep`, `without_submodules` (a list of `--without-submodule` patterns), `env` and
-`unset_env` (a list of variable names, as `--unset-env` takes them). Unknown fields are refused, so a misspelled option can't be dropped
-silently. `on` is a table, as above, or a list in `--on`'s form: `on = ["macos=27", "gpu=apple"]`.
+`on`, `hold`, `keep`, `without_submodules` (a list of `--without-submodule` patterns), `env`,
+`unset_env` (a list of variable names, as `--unset-env` takes them) and `pools` (a list of pools, as
+`--pool` takes them; `--pool` replaces it). Unknown fields are refused, so a misspelled option can't
+be dropped silently. `on` is a table, as above, or a list in `--on`'s form: `on = ["macos=27", "gpu=apple"]`.
 Options on the command line replace the recipe's; `on` and `env` merge key by key, the command line
 last, with `os`, `macos` and `linux` counting as one key, so `--on macos` replaces a recipe's
 `os = "linux"`. `env` and `unset_env` merge the same way, as one set of keys: the recipe's

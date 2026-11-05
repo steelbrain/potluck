@@ -135,7 +135,7 @@ pub fn check(
 /// `--priority` and `--cpu` aren't among them: in place a command starts at once and shares the
 /// job's CPU.
 pub fn refused_option(args: &DispatchArgs, job: &str) -> Option<(&'static str, String)> {
-    let checks: [(bool, &'static str, String); 9] = [
+    let checks: [(bool, &'static str, String); 10] = [
         (
             !args.keep.is_empty(),
             "--keep",
@@ -185,6 +185,11 @@ pub fn refused_option(args: &DispatchArgs, job: &str) -> Option<(&'static str, S
             "--advance",
             format!("it runs in job {job}'s workspace, which stays at the commit job {job} runs"),
         ),
+        (
+            !args.pools.is_empty(),
+            "--pool",
+            format!("it runs on job {job}'s machine, in the pools job {job}'s dispatch named"),
+        ),
     ];
     checks
         .into_iter()
@@ -192,8 +197,8 @@ pub fn refused_option(args: &DispatchArgs, job: &str) -> Option<(&'static str, S
         .map(|(_, flag, why)| (flag, why))
 }
 
-/// What of the recipe's settings a dispatch run in place doesn't use: its `keep`, `hold` and
-/// `without_submodules`.
+/// What of the recipe's settings a dispatch run in place doesn't use: its `keep`, `hold`,
+/// `without_submodules` and `pools`.
 pub fn recipe_ignored(file: &ProjectFile, recipe: Option<&str>) -> Vec<&'static str> {
     let Some(r) = recipe.and_then(|name| file.recipe.get(name)) else {
         return Vec::new();
@@ -207,6 +212,9 @@ pub fn recipe_ignored(file: &ProjectFile, recipe: Option<&str>) -> Vec<&'static 
     }
     if !r.without_submodules.is_empty() {
         ignored.push("without_submodules");
+    }
+    if !r.pools.is_empty() {
+        ignored.push("pools");
     }
     ignored
 }

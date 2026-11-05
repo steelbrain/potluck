@@ -11,7 +11,7 @@ use crate::gitinfo::short;
 use crate::proto::{ClientContext, ClientRequest, Request, Response, StatusView, read_msg};
 use crate::sched::{MachineView, Queued};
 use crate::types::{
-    EXIT_CANCELLED, JobRecord, JobSpec, JobState, MAX_HOLD_MS, Reminder, WorkspaceRecord,
+    EXIT_CANCELLED, JobRecord, JobSpec, JobState, MAX_HOLD_MS, Millis, Reminder, WorkspaceRecord,
     WorkspaceState, now_ms,
 };
 use crate::why::Snapshot;
@@ -495,6 +495,15 @@ fn validate(spec: &JobSpec) -> Result<(), String> {
         );
     }
     crate::types::check_on(&spec.on).map_err(|e| format!("--on: {e}"))?;
+    if let Some(bad) = spec
+        .pools
+        .iter()
+        .find(|p| !crate::mesh::trust::valid_pool(p))
+    {
+        return Err(format!(
+            "--pool: bad pool name {bad:?}: use letters, digits, '.', '_' and '-', not starting with '-'"
+        ));
+    }
     // A glob that can't match inside the workspace would only be dropped when the job ends.
     for g in &spec.keep {
         files::check_keep(g).map_err(|e| format!("--keep {e}"))?;
@@ -539,8 +548,83 @@ fn check_carried(repo: &crate::types::RepoRef) -> Result<(), String> {
     Ok(())
 }
 
+/// Bookkeeping key prefix of the nonces of signed dispatches taken: `job-nonce/<nonce>`, its
+/// value when it was taken (this machine's clock). Kept [`crate::jobauth::NONCE_KEEP_MS`].
+pub(crate) const NONCE_PREFIX: &str = "job-nonce/";
+
+/// Who signed a dispatch ([`crate::jobauth`]). In a cluster with users a dispatch is signed, by a
+/// user this machine recognizes, for this machine, within [`crate::jobauth::MAX_SKEW_MS`] of its
+/// clock, with a nonce not seen in the day before. Without users an unsigned dispatch is taken,
+/// and a signed one is checked the same way but for who signed it.
+fn check_signed(sh: &Shared, spec: &JobSpec) -> Result<(), String> {
+    let mesh = sh.cluster().map(|c| c.mesh());
+    let users = mesh.as_ref().is_some_and(|m| m.users_exist());
+    if spec.auth.is_none() {
+        return match users {
+            true => Err("this cluster has users, so a dispatch is signed with a user's key, and this one is unsigned (the command line signs with the key at $POTLUCK_USER_KEY, or user.key beside its node.toml)".into()),
+            false => Ok(()),
+        };
+    }
+    let now = now_ms();
+    let node = sh.lock().node.clone();
+    let auth = crate::jobauth::check_dispatch(spec, &node, now)
+        .map_err(|e| format!("the dispatch's signature is refused: {e}"))?;
+    if users && !mesh.as_ref().is_some_and(|m| m.recognized_user(&auth.key)) {
+        return Err(format!(
+            "the dispatch is signed with key {0}, which is no user of this cluster; a user adds it with `potluck user add NAME {0}`",
+            auth.key
+        ));
+    }
+    take_nonce(&mut sh.lock(), &auth.nonce, now)
+}
+
+/// Takes the nonce of a signed dispatch: refused when it was taken before (a replay).
+pub(crate) fn take_nonce(
+    st: &mut super::state::State,
+    nonce: &str,
+    now: Millis,
+) -> Result<(), String> {
+    let key = format!("{NONCE_PREFIX}{nonce}");
+    let seen = match st.unsaved_kv.get(&key) {
+        Some(v) => v.is_some(),
+        None => st
+            .store
+            .kv(&key)
+            .map_err(|e| format!("store: {e:#}"))?
+            .is_some(),
+    };
+    if seen {
+        return Err(
+            "the dispatch's signature is refused: this signed dispatch was made here before (its nonce was seen); a dispatch is signed anew each time".into(),
+        );
+    }
+    st.save_kv(&key, Some(now.to_string()));
+    Ok(())
+}
+
+/// Forgets the nonces of signed dispatches taken more than [`crate::jobauth::NONCE_KEEP_MS`]
+/// ago: one that old is refused for its signing time anyway.
+pub(crate) fn forget_nonces(st: &mut super::state::State, now: Millis) {
+    let rows = match st.store.kv_prefixed(NONCE_PREFIX) {
+        Ok(rows) => rows,
+        Err(e) => {
+            st.log.log(format!("store: {e:#}"));
+            return;
+        }
+    };
+    for (key, at) in rows {
+        let old = at.parse::<Millis>().map_or(true, |at| {
+            now.saturating_sub(at) > crate::jobauth::NONCE_KEEP_MS
+        });
+        if old {
+            st.save_kv(&key, None);
+        }
+    }
+}
+
 /// Queues a job, or returns the job its key already names.
 fn dispatch(sh: &Arc<Shared>, spec: &JobSpec) -> Result<Response, String> {
+    check_signed(sh, spec)?;
     validate(spec)?;
     if let Some(key) = &spec.key {
         let mut st = sh.lock();
@@ -686,6 +770,7 @@ fn feasible_somewhere(
                 .unwrap_or_else(|| super::cluster::peer::node_of_ws(w).to_string());
             (w.clone(), node, st.ws_busy(w))
         }),
+        pools: spec.pools.clone(),
     };
     // Only machines that are up count: a job none of them can run is refused now, not queued
     // for a machine that may never come back. A member updating counts as up.
@@ -735,17 +820,11 @@ fn owned_spec(
         .workspace
         .as_ref()
         .and_then(|w| remote_ws.or_else(|| st.workspaces.get(w)));
-    if pinned_to.is_some_and(|ws| {
+    let pre_salting = pinned_to.is_some_and(|ws| {
         ws.repo_id == spec.repo.id && crate::types::is_unsalted_repo_id(&ws.repo_id)
-    }) {
-        let mut spec = spec.clone();
-        spec.repo.carried = crate::gitinfo::owned_carried(&st.node, &spec.repo.carried);
-        return spec;
-    }
-    JobSpec {
-        repo: crate::gitinfo::owned_repo(&st.node, &spec.repo),
-        ..spec.clone()
-    }
+    });
+    // The one function a runner derives the spec with from a signed one, too.
+    crate::jobauth::owned(&st.node, spec, pre_salting)
 }
 
 /// Whether a dispatch's commit descends from the commit `from` its workspace is at, as the

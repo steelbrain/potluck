@@ -395,8 +395,44 @@ pub struct JobSpec {
     /// End the job early when it stalls (otherwise it is only marked stalled).
     pub kill_on_stall: bool,
     pub recipe: Option<String>,
-    /// The machine that dispatched it.
+    /// The machine that dispatched it: the one that owns it. In a signed spec, this machine's
+    /// name as its daemon told the command line, so the signature binds the owner.
     pub submitted_from: NodeName,
+    /// The pools of the machines that may run it (`--pool`, a recipe's `pools`): a machine runs
+    /// it only when its admission put it in one of them. Empty: the default pool
+    /// ([`crate::mesh::trust::DEFAULT_POOL`]), which every machine is in in a cluster without
+    /// users. Empty in records from before pools.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pools: Vec<String>,
+    /// The user's signature over the spec as the command line sent it ([`crate::jobauth`]).
+    /// None for an unsigned dispatch, and in records from before signed jobs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<crate::jobauth::JobAuth>,
+}
+
+impl JobSpec {
+    /// Whether a machine in pool `pool` may run it: `pool` is one of its [`JobSpec::pools`], or
+    /// the default pool when it names none.
+    pub fn runs_in(&self, pool: &str) -> bool {
+        runs_in(&self.pools, pool)
+    }
+}
+
+/// Whether a job for `pools` ([`JobSpec::pools`]) may run on a machine in pool `pool`.
+pub fn runs_in(pools: &[String], pool: &str) -> bool {
+    match pools {
+        [] => pool == crate::mesh::trust::DEFAULT_POOL,
+        some => some.iter().any(|p| p == pool),
+    }
+}
+
+/// [`JobSpec::pools`] in words: "pool default", "pools cloud, gpu".
+pub fn fmt_pools(pools: &[String]) -> String {
+    match pools {
+        [] => format!("pool {}", crate::mesh::trust::DEFAULT_POOL),
+        [one] => format!("pool {one}"),
+        many => format!("pools {}", many.join(", ")),
+    }
 }
 
 /// A job's state.
@@ -1026,6 +1062,9 @@ mod tests {
         .unwrap();
         assert!(spec.unset_env.is_empty());
         assert_eq!(spec.env["A"], "1");
+        // Nor pools nor a signature: the default pool, unsigned.
+        assert!(spec.pools.is_empty() && spec.auth.is_none());
+        assert!(spec.runs_in("default") && !spec.runs_in("cloud"));
     }
 
     #[test]

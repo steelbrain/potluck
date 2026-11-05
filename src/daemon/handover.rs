@@ -1701,6 +1701,8 @@ mod tests {
                 kill_on_stall: false,
                 recipe: None,
                 submitted_from: "lone".into(),
+                pools: Vec::new(),
+                auth: None,
             };
             let mut j = crate::daemon::runner::new_record(id.into(), spec, crate::types::now_ms());
             j.state = state;

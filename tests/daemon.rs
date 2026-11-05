@@ -827,6 +827,8 @@ fn spec(cmd: &str) -> JobSpec {
         kill_on_stall: false,
         recipe: None,
         submitted_from: String::new(),
+        pools: Vec::new(),
+        auth: None,
     }
 }
 

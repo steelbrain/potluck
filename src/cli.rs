@@ -253,6 +253,10 @@ pub struct DispatchArgs {
     /// potluck's own variables (POTLUCK_JOB, TMPDIR, ...) can't be left out.
     #[arg(long = "unset-env", value_name = "K")]
     pub unset_env: Vec<String>,
+    /// Run only on machines in pool POOL (`potluck admit --pool`). Repeatable: any of them.
+    /// Default: the default pool. Replaces the recipe's `pools`.
+    #[arg(long = "pool", value_name = "POOL")]
+    pub pools: Vec<String>,
     /// Run inside this existing workspace (on its machine).
     #[arg(long)]
     pub workspace: Option<String>,
@@ -765,9 +769,13 @@ impl Cx<'_> {
             kill_on_stall: args.kill_on_stall,
             recipe: r.recipe,
             // The daemon names it: it numbers the job and owns it, with the node.toml it read
-            // when it started (this process may read another, or one edited since).
+            // when it started (this process may read another, or one edited since). A signed
+            // dispatch names it as the daemon says, so the signature binds the owner.
             submitted_from: String::new(),
+            pools: r.pools,
+            auth: None,
         };
+        let spec = self.signed(spec)?;
         let (job, existing) = match self.call_slow(Req::Dispatch {
             spec: Box::new(spec.clone()),
         })? {
@@ -850,6 +858,30 @@ impl Cx<'_> {
         })
     }
 
+    /// The dispatch `spec`, signed with this command line's user key when it has one, for the
+    /// local daemon to own (its name, asked first, is the spec's `submitted_from`). Without a
+    /// key it goes unsigned, unless the cluster has users: then it is refused here.
+    fn signed(&mut self, mut spec: crate::types::JobSpec) -> anyhow::Result<crate::types::JobSpec> {
+        let path = crate::mesh::user::key_path(&self.env.paths);
+        let Some(key) = UserKey::load(&path)? else {
+            if self
+                .membership_for_signing()?
+                .is_some_and(|m| m.users_exist)
+            {
+                anyhow::bail!(
+                    "this cluster has users, so a dispatch is signed with a user's key, and there is none at {} (dispatch from the machine where a user's key is; or make one here with `potluck user key` and have a user run `potluck user add NAME KEY`)",
+                    path.display()
+                );
+            }
+            return Ok(spec);
+        };
+        spec.submitted_from = match self.call(Req::Ping)? {
+            Response::Pong { node, .. } => node,
+            other => return Err(unexpected("ping", &other)),
+        };
+        Ok(crate::jobauth::sign(&spec, &key, crate::types::now_ms()))
+    }
+
     fn dispatch_nested(
         &mut self,
         args: &DispatchArgs,
@@ -906,7 +938,11 @@ impl Cx<'_> {
                     self.err,
                     "potluck: inside job {job}: recipe {}'s {} don't apply in place; job {job}'s own do",
                     r.recipe.as_deref().unwrap_or_default(),
-                    ignored.join(" and ")
+                    match ignored.split_last() {
+                        Some((last, [])) => last.to_string(),
+                        Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
+                        None => String::new(),
+                    }
                 );
             }
         }

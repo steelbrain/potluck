@@ -162,6 +162,7 @@ fn queued_from(r: &JobRecord, jobs: &[JobRecord]) -> Queued {
         on: r.spec.on.clone(),
         timeout_ms: r.spec.timeout_ms,
         workspace,
+        pools: r.spec.pools.clone(),
     }
 }
 

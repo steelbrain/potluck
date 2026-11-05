@@ -380,6 +380,8 @@ impl Node {
             .env("E2E_CALLER", "leaked")
             .env_remove("POTLUCK_JOB")
             .env_remove("POTLUCK_LEASE")
+            // The user key, once a test makes one, is user.key beside node.toml.
+            .env_remove("POTLUCK_USER_KEY")
             .stdin(Stdio::null())
             .output()
             .unwrap();
@@ -1726,6 +1728,35 @@ fn recipes_come_from_the_committed_file() {
             .as_str()
             .unwrap()
             .contains("only committed work runs"),
+        "{}",
+        o.json
+    );
+}
+
+/// After `potluck user init` (here a cluster of one, with this command line's key as its user),
+/// the command line signs each dispatch: the job runs as before, and its record says who signed
+/// it. Without the key, a dispatch is refused before it is sent.
+#[test]
+fn a_dispatch_after_user_init_is_signed_and_runs() {
+    let n = Node::new();
+    let user = n.cli_ok(&["user", "init", "--name", "me"]);
+    let job = n.dispatch(&["hello"]);
+    let (code, j, out) = n.wait(&job);
+    assert_eq!(code, 0, "{j}");
+    assert!(out.contains("recipe toml"), "{out}");
+    let auth = n.get(&job).spec.auth.expect("signed");
+    assert_eq!(auth.key.to_text(), user["key"].as_str().unwrap());
+    let signed = potluck::jobauth::open(&auth).unwrap();
+    assert_eq!(signed.submitted_from, n.name);
+    assert_eq!(signed.recipe.as_deref(), Some("hello"));
+    let file = PathBuf::from(user["file"].as_str().unwrap());
+    std::fs::rename(&file, file.with_extension("aside")).unwrap();
+    let o = n.cli(&["dispatch", "hello"]);
+    assert_eq!(o.code, 2, "{}", o.json);
+    assert!(
+        o.json["error"].as_str().unwrap().starts_with(
+            "this cluster has users, so a dispatch is signed with a user's key, and there is none at"
+        ),
         "{}",
         o.json
     );

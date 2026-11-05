@@ -80,15 +80,16 @@ fn build_report(st: &State, cs: &CState) -> MachineReport {
 
 /// What this machine's `report` tells member `to`: what it plans with and `status`, `why` and
 /// `nodes` show, and no more. No lease tokens. Of a job running here that `to` doesn't own, no
-/// command, environment, kept-file globs, labels or source paths; of a queued job, no command,
-/// environment or source paths (the machine that claims it gets the whole spec with its grant);
-/// only the queued jobs `to` may take ([`super::owner::may_take`]); and no workspace paths.
-pub(super) fn for_member(mut report: MachineReport, to: &str) -> MachineReport {
+/// command, environment, kept-file globs, labels, source paths or signed spec; of a queued job,
+/// no command, environment, source paths or signed spec (the machine that claims it gets the
+/// whole spec with its grant), only who signed it; only the queued jobs `to` may take
+/// ([`super::owner::may_take`]); and no workspace paths.
+pub(super) fn for_member(mut report: MachineReport, to: &super::owner::Taker) -> MachineReport {
     for j in &mut report.running {
         if let Some(l) = &mut j.lease {
             l.token.clear();
         }
-        if owner_of(&j.id) != to {
+        if owner_of(&j.id) != to.name {
             let spec = &mut j.spec;
             spec.cmd.clear();
             spec.env.clear();
@@ -96,6 +97,7 @@ pub(super) fn for_member(mut report: MachineReport, to: &str) -> MachineReport {
             spec.keep.clear();
             spec.labels.clear();
             no_sources(&mut spec.repo);
+            no_signed_spec(spec);
         }
     }
     report.queue.retain(|j| super::owner::may_take(j, to));
@@ -105,11 +107,20 @@ pub(super) fn for_member(mut report: MachineReport, to: &str) -> MachineReport {
         spec.env.clear();
         spec.unset_env.clear();
         no_sources(&mut spec.repo);
+        no_signed_spec(spec);
     }
     for w in &mut report.workspaces {
         w.path = PathBuf::new();
     }
     report
+}
+
+/// A spec's signature without the spec it covers (which holds all the spec holds): who signed it
+/// stays.
+fn no_signed_spec(spec: &mut crate::types::JobSpec) {
+    if let Some(a) = &mut spec.auth {
+        a.signed_spec.clear();
+    }
 }
 
 /// A dispatch's repositories without where they are on the dispatching machine.
@@ -271,8 +282,9 @@ pub(super) fn pulls_and_pushes(sh: &Arc<Shared>, c: &Arc<Cluster>, now: u64) {
     }
     if !pushes.is_empty() {
         let report = own_report(sh, c);
+        let mesh = c.mesh();
         for n in pushes {
-            let report = for_member(report.clone(), &n);
+            let report = for_member(report.clone(), &super::owner::Taker::of(&mesh, &n));
             sh.spawn_worker(&format!("push-{n}"), move |sh| {
                 let Some(c) = sh.cluster() else {
                     return;
@@ -345,10 +357,12 @@ fn refresh_unknown_of(sh: &Arc<Shared>, c: &Cluster, members: Vec<Member>) {
     });
 }
 
-/// A member's machine as the scheduler sees it, from its report.
-pub(super) fn snap_of(r: &MachineReport) -> MachineSnap {
+/// A member's machine as the scheduler sees it, from its report, in pool `pool` (its admission's,
+/// [`crate::mesh::Mesh::pool_of`]: not something it reports).
+pub(super) fn snap_of(r: &MachineReport, pool: &str) -> MachineSnap {
     MachineSnap {
         facts: r.facts.clone(),
+        pool: pool.to_string(),
         ram_capacity_mib: r.ram_capacity_mib,
         running: r
             .running
@@ -376,7 +390,7 @@ fn alive_members(c: &Cluster) -> BTreeSet<NodeName> {
 }
 
 fn view_of(r: &MachineReport) -> NodeView {
-    let snap = snap_of(r);
+    let snap = snap_of(r, crate::mesh::trust::DEFAULT_POOL);
     let mut gpus_busy: Vec<String> = snap
         .running
         .iter()
@@ -578,15 +592,11 @@ pub(crate) fn why(sh: &Shared, c: &Cluster, id: &str) -> Result<Response, String
         .filter(|n| !mesh.caught_up_for(n))
         .cloned()
         .collect();
+    let pool_here = c.pool_here();
     let st = sh.lock();
     let cs = c.cs();
     let job = st.job(id).ok_or_else(|| format!("no job {id}"))?;
-    let mut snaps: Vec<MachineSnap> = st
-        .snaps()
-        .into_iter()
-        .filter(|(n, _)| *n == st.node)
-        .map(|(_, s)| s)
-        .collect();
+    let mut snaps: Vec<MachineSnap> = st.local_snap(&pool_here).into_iter().collect();
     let mut jobs: Vec<JobRecord> = st
         .jobs
         .values()
@@ -643,7 +653,10 @@ pub(crate) fn why(sh: &Shared, c: &Cluster, id: &str) -> Result<Response, String
                 "is back from being away and compares membership records with the other members first".into()
             });
         }
-        let mut snap = snap_of(&r.report);
+        let pool = mesh
+            .pool_of(n)
+            .unwrap_or_else(|| crate::mesh::trust::DEFAULT_POOL.to_string());
+        let mut snap = snap_of(&r.report, &pool);
         // A claim this machine hasn't granted (it still has the job queued) holds nothing yet:
         // the job would show as waiting on what it reserved itself.
         snap.running.retain(|x| {

@@ -59,6 +59,7 @@ pub(crate) fn job(id: &str) -> Queued {
         on: BTreeMap::new(),
         timeout_ms: 10 * MINUTE_MS,
         workspace: None,
+        pools: Vec::new(),
     }
 }
 
@@ -106,6 +107,10 @@ pub(crate) trait Q: Sized {
         self.q().workspace = Some((ws.into(), node.into(), busy));
         self
     }
+    fn pools(mut self, pools: &[&str]) -> Self {
+        self.q().pools = pools.iter().map(|p| p.to_string()).collect();
+        self
+    }
 }
 
 impl Q for Queued {
@@ -138,6 +143,7 @@ pub(crate) fn run_excl(id: &str, gib: u64, gpus: &[&str], until: i64) -> Running
 /// A machine fixture that lends out a [`MachineView`].
 pub(crate) struct Machine {
     pub facts: Facts,
+    pub pool: String,
     pub cap_gib: u64,
     pub running: Vec<Running>,
 }
@@ -146,6 +152,7 @@ impl Machine {
     pub fn new(node: &str, cap_gib: u64, gpus: Vec<Gpu>) -> Self {
         Machine {
             facts: facts(node, gpus),
+            pool: crate::mesh::trust::DEFAULT_POOL.into(),
             cap_gib,
             running: Vec::new(),
         }
@@ -154,6 +161,7 @@ impl Machine {
     pub fn view(&self) -> MachineView<'_> {
         MachineView {
             facts: &self.facts,
+            pool: &self.pool,
             ram_capacity_mib: self.cap_gib * 1024,
             running: &self.running,
         }
@@ -164,6 +172,10 @@ impl Machine {
 fn feasibility() {
     let msi = Machine::new("msi", 56, vec![nv()]);
     let two = Machine::new("ms01", 56, vec![nv(), amd()]);
+    let cloud = Machine {
+        pool: "cloud".into(),
+        ..Machine::new("rented", 56, vec![])
+    };
     let cases: Vec<(&str, &Machine, Queued, Result<(), &str>)> = vec![
         ("plain job", &msi, job("a"), Ok(())),
         ("facts met", &msi, job("a").on("os", "linux"), Ok(())),
@@ -229,6 +241,36 @@ fn feasibility() {
             &msi,
             job("a").ws("studio-w1", "studio", false),
             Err("pinned to workspace studio-w1 on studio"),
+        ),
+        (
+            "in the default pool",
+            &msi,
+            job("a").pools(&["default"]),
+            Ok(()),
+        ),
+        (
+            "in one of its pools",
+            &cloud,
+            job("a").pools(&["gpu", "cloud"]),
+            Ok(()),
+        ),
+        (
+            "for another pool",
+            &msi,
+            job("a").pools(&["cloud"]),
+            Err("in pool default, not the job's pool cloud"),
+        ),
+        (
+            "for no pool, in another",
+            &cloud,
+            job("a"),
+            Err("in pool cloud, not the job's pool default"),
+        ),
+        (
+            "for pools, in none of them",
+            &cloud,
+            job("a").pools(&["default", "gpu"]),
+            Err("in pool cloud, not the job's pools default, gpu"),
         ),
     ];
     for (name, machine, q, want) in cases {
@@ -874,6 +916,7 @@ fn huge_grants_dont_overflow() {
     ];
     let view = MachineView {
         facts: &f,
+        pool: "default",
         ram_capacity_mib: 1024,
         running: &running,
     };

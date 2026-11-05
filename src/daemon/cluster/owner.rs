@@ -90,7 +90,9 @@ pub(super) fn claim(
     let reported = || (c.started_at, c.report_seq.load(Ordering::SeqCst));
     // Back from being away, this machine first compares membership records with the others: the
     // claiming machine may have been removed meanwhile.
-    let caught_up = c.mesh().caught_up_for(from);
+    let mesh = c.mesh();
+    let caught_up = mesh.caught_up_for(from);
+    let taker = Taker::of(&mesh, from);
     let (rec, reported) = {
         let mut guard = sh.lock();
         let st = &mut *guard;
@@ -131,6 +133,20 @@ pub(super) fn claim(
         {
             return refused(format!("{id} is pinned to workspace {w}"));
         }
+        if let Some(why) = why_not_take(j, &taker) {
+            return refused(format!("{id} is not for {from}: {why}"));
+        }
+        let facts = {
+            let cs = c.cs();
+            cs.reports
+                .get(from)
+                .map(|r| r.report.facts.clone())
+                .or_else(|| cs.known.get(from).map(|k| k.facts.clone()))
+                .filter(|f| !f.os.is_empty())
+        };
+        if let Some(why) = unmet_on(j, from, facts.as_ref()) {
+            return refused(format!("{id} is not for {from}: {why}"));
+        }
         j.state = JobState::Starting;
         j.node = Some(from.to_string());
         j.workspace = Some(workspace.clone());
@@ -165,11 +181,66 @@ pub(super) fn claim(
     }
 }
 
-/// Whether member `peer` may take this machine's queued job `j`: it sees the job in this machine's
-/// reports, and fetches the repositories the job names (before it claims the job, its mirrors
-/// sync). Any member, for now.
-pub(super) fn may_take(_j: &JobRecord, _peer: &str) -> bool {
-    true
+/// A member that asks for this machine's queued jobs, as this machine knows it: its pool from its
+/// admission (None: no member has that name), and whether the cluster has users.
+pub(super) struct Taker {
+    pub name: NodeName,
+    pub pool: Option<String>,
+    pub users: bool,
+}
+
+impl Taker {
+    pub fn of(mesh: &crate::mesh::Mesh, peer: &str) -> Taker {
+        Taker {
+            name: peer.to_string(),
+            pool: mesh.pool_of(peer),
+            users: mesh.users_exist(),
+        }
+    }
+}
+
+/// Whether member `t` may take this machine's queued job `j`: it sees the job in this machine's
+/// reports, fetches the repositories the job names (before it claims the job, its mirrors sync),
+/// and is granted it. See [`why_not_take`].
+pub(super) fn may_take(j: &JobRecord, t: &Taker) -> bool {
+    why_not_take(j, t).is_none()
+}
+
+/// Why member `t` may not take queued job `j`: it isn't in one of the job's pools; or the cluster
+/// has users and the job is unsigned (dispatched before the first user: only this machine, its
+/// owner, runs it). None when it may.
+pub(super) fn why_not_take(j: &JobRecord, t: &Taker) -> Option<String> {
+    let Some(pool) = &t.pool else {
+        return Some(format!("{} is not a member", t.name));
+    };
+    if t.users && j.spec.auth.is_none() {
+        return Some(
+            "it was dispatched unsigned, before the cluster had users: only the machine it was dispatched on runs it"
+                .into(),
+        );
+    }
+    if !j.spec.runs_in(pool) {
+        return Some(format!(
+            "it runs in {}, and {} is in pool {pool}",
+            crate::types::fmt_pools(&j.spec.pools),
+            t.name
+        ));
+    }
+    None
+}
+
+/// Why the job `j` can't run on member `from` by its `--on`, if it can't: `facts` is what `from`
+/// last reported (None when no report of it reached this machine yet: nothing is checked). The
+/// facts are its own word: this catches mistakes, not a member that lies. `node` is its name in
+/// the cluster, whatever it reports.
+fn unmet_on(j: &JobRecord, from: &str, facts: Option<&crate::types::Facts>) -> Option<String> {
+    let facts = crate::types::Facts {
+        node: from.to_string(),
+        ..facts?.clone()
+    };
+    facts
+        .unmet(&j.spec.on)
+        .map(|u| u.replacen("(this machine: ", &format!("({from}: "), 1))
 }
 
 /// A runner passed over these queued jobs: one pass each.
@@ -1191,9 +1262,10 @@ pub(super) fn upload_pack(
     repo_id: &str,
     stream: crate::mesh::Stream,
 ) {
+    let taker = Taker::of(&c.mesh(), from);
     let source = {
         let st = sh.lock();
-        fetchable(&st, from, repo_id)
+        fetchable(&st, &taker, repo_id)
             .then(|| c.cs().sources.get(repo_id).cloned())
             .flatten()
     };
@@ -1225,12 +1297,12 @@ pub(super) fn upload_pack(
 /// machine's names it (as its repository, a submodule's or a carried one) and is queued, for a
 /// member that may take it ([`may_take`]: a runner syncs its mirrors before it claims), or is held
 /// by `peer`. Not any repository a dispatch here ever named.
-fn fetchable(st: &State, peer: &str, repo_id: &str) -> bool {
+fn fetchable(st: &State, peer: &Taker, repo_id: &str) -> bool {
     st.jobs.values().any(|j| {
         owner_of(&j.id) == st.node
             && match j.state {
                 JobState::Queued => may_take(j, peer),
-                JobState::Starting | JobState::Running => j.node.as_deref() == Some(peer),
+                JobState::Starting | JobState::Running => j.node.as_deref() == Some(&peer.name),
                 _ => false,
             }
             && j.spec.repo.commits().any(|(id, _, _)| id == repo_id)
@@ -1250,4 +1322,130 @@ pub(crate) fn dispatched(st: &mut State, c: &Cluster, repo: &RepoRef) {
     cs.push_due = true;
     drop(cs);
     c.wake();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::Facts;
+
+    fn queued(pools: &[&str], signed: bool, on: &[(&str, &str)]) -> JobRecord {
+        let tmp = tempfile::tempdir().unwrap();
+        let key = crate::mesh::user::UserKey::load_or_create(&tmp.path().join("user.key"))
+            .unwrap()
+            .0;
+        let mut spec = crate::types::JobSpec {
+            key: None,
+            labels: Default::default(),
+            priority: 3,
+            request: Default::default(),
+            on: on
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            repo: RepoRef {
+                id: "proj-1234abcd".into(),
+                source: "/src/proj/.git".into(),
+                commit: "0".repeat(40),
+                branch: None,
+                submodules: Vec::new(),
+                carried: Vec::new(),
+            },
+            workspace: None,
+            advance: false,
+            cmd: vec!["true".into()],
+            env: Default::default(),
+            unset_env: Default::default(),
+            timeout_ms: 60_000,
+            hold_ms: None,
+            keep: Vec::new(),
+            rerun_if_lost: true,
+            kill_on_stall: false,
+            recipe: None,
+            submitted_from: "a".into(),
+            pools: pools.iter().map(|p| p.to_string()).collect(),
+            auth: None,
+        };
+        if signed {
+            spec = crate::jobauth::sign(&spec, &key, now());
+        }
+        crate::daemon::runner::new_record("a-1".into(), spec, now())
+    }
+
+    fn taker(pool: Option<&str>, users: bool) -> Taker {
+        Taker {
+            name: "b".into(),
+            pool: pool.map(str::to_string),
+            users,
+        }
+    }
+
+    /// A member takes a queued job (sees it, fetches its repositories, is granted it) only in one
+    /// of the job's pools; once the cluster has users, only a signed one.
+    #[test]
+    fn a_member_takes_only_jobs_for_its_pool_and_signed_once_there_are_users() {
+        let cases = [
+            (queued(&[], false, &[]), taker(Some("default"), false), None),
+            (queued(&[], true, &[]), taker(Some("default"), true), None),
+            (
+                queued(&[], false, &[]),
+                taker(Some("default"), true),
+                Some(
+                    "it was dispatched unsigned, before the cluster had users: only the machine it was dispatched on runs it",
+                ),
+            ),
+            (
+                queued(&[], true, &[]),
+                taker(Some("cloud"), true),
+                Some("it runs in pool default, and b is in pool cloud"),
+            ),
+            (
+                queued(&["cloud"], true, &[]),
+                taker(Some("cloud"), true),
+                None,
+            ),
+            (
+                queued(&["cloud", "gpu"], true, &[]),
+                taker(Some("default"), true),
+                Some("it runs in pools cloud, gpu, and b is in pool default"),
+            ),
+            (
+                queued(&["default", "cloud"], true, &[]),
+                taker(Some("default"), true),
+                None,
+            ),
+            (
+                queued(&[], true, &[]),
+                taker(None, true),
+                Some("b is not a member"),
+            ),
+        ];
+        for (i, (j, t, want)) in cases.iter().enumerate() {
+            assert_eq!(why_not_take(j, t).as_deref(), *want, "case {i}");
+            assert_eq!(may_take(j, t), want.is_none(), "case {i}");
+        }
+    }
+
+    /// A claim's `--on` is checked against the claimant's last reported facts, under its name in
+    /// the cluster; with none reported yet, it isn't.
+    #[test]
+    fn a_claims_on_is_checked_against_the_claimants_facts() {
+        let facts = Facts {
+            node: "liar".into(),
+            os: "linux".into(),
+            ..Default::default()
+        };
+        let j = queued(&[], true, &[("os", "linux")]);
+        assert_eq!(unmet_on(&j, "b", Some(&facts)), None);
+        assert_eq!(unmet_on(&j, "b", None), None);
+        let j = queued(&[], true, &[("os", "macos")]);
+        assert_eq!(
+            unmet_on(&j, "b", Some(&facts)).as_deref(),
+            Some("needs os=macos (b: linux)")
+        );
+        let j = queued(&[], true, &[("node", "b")]);
+        assert_eq!(unmet_on(&j, "b", Some(&facts)), None);
+        let j = queued(&[], true, &[("node", "liar")]);
+        assert!(unmet_on(&j, "b", Some(&facts)).is_some());
+    }
 }

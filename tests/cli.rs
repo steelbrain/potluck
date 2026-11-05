@@ -2440,6 +2440,10 @@ fn nested_dispatch_refuses_options_it_cannot_honour() {
             &["--advance", "--workspace", "msi-w3"][..],
             "which stays at the commit job studio-9 runs",
         ),
+        (
+            &["--pool", "cloud"][..],
+            "it runs on job studio-9's machine, in the pools job studio-9's dispatch named",
+        ),
     ] {
         let mut args = vec!["dispatch", "--timeout", "1m"];
         args.extend_from_slice(extra);
@@ -2470,15 +2474,15 @@ fn nested_dispatch_refuses_options_it_cannot_honour() {
     ]));
     assert_eq!(r.code, 0, "{}", r.stderr);
 
-    // A recipe's keep and hold: it runs, and says they don't apply.
+    // A recipe's keep, hold and pools: it runs, and says they don't apply.
     let repo = repo_with(
-        "[recipe.t]\ncmd = [\"true\"]\ntimeout = \"1m\"\nkeep = [\"out/*\"]\nhold = \"1h\"\n",
+        "[recipe.t]\ncmd = [\"true\"]\ntimeout = \"1m\"\nkeep = [\"out/*\"]\nhold = \"1h\"\npools = [\"cloud\"]\n",
     );
     let r = run(inside_job(&fake, repo.path()).args(["dispatch", "t"]));
     assert_eq!(r.code, 0, "{}", r.stderr);
     assert!(
         r.stderr.contains(
-            "potluck: inside job studio-9: recipe t's keep and hold don't apply in place; job studio-9's own do"
+            "potluck: inside job studio-9: recipe t's keep, hold and pools don't apply in place; job studio-9's own do"
         ),
         "{}",
         r.stderr
@@ -2486,7 +2490,7 @@ fn nested_dispatch_refuses_options_it_cannot_honour() {
     let r = run(inside_job(&fake, repo.path()).args(["--json", "dispatch", "t"]));
     assert_eq!(r.code, 0, "{}", r.stderr);
     let doc = one_json(&r.stdout);
-    assert_eq!(doc["ignored"], serde_json::json!(["keep", "hold"]));
+    assert_eq!(doc["ignored"], serde_json::json!(["keep", "hold", "pools"]));
 }
 
 #[test]

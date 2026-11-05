@@ -293,6 +293,9 @@ pub(crate) struct Ending {
 /// What the scheduler gets for one machine, owned so views can borrow it.
 pub(crate) struct MachineSnap {
     pub facts: Facts,
+    /// Its pool, from its admission ([`crate::mesh::Mesh::pool_of`]); the default pool unless a
+    /// cluster with users says otherwise.
+    pub pool: String,
     pub ram_capacity_mib: u64,
     pub running: Vec<Running>,
 }
@@ -301,6 +304,7 @@ impl MachineSnap {
     pub fn view(&self) -> MachineView<'_> {
         MachineView {
             facts: &self.facts,
+            pool: &self.pool,
             ram_capacity_mib: self.ram_capacity_mib,
             running: &self.running,
         }
@@ -502,6 +506,14 @@ impl State {
             .collect()
     }
 
+    /// This machine as the scheduler sees it, in pool `pool` (its cluster's word for it:
+    /// [`crate::daemon::cluster::Cluster::pool_here`]).
+    pub fn local_snap(&self, pool: &str) -> Option<MachineSnap> {
+        let (_, mut snap) = self.snaps().into_iter().find(|(n, _)| *n == self.node)?;
+        snap.pool = pool.to_string();
+        Some(snap)
+    }
+
     /// Every machine as the scheduler sees it, by name.
     pub fn snaps(&self) -> Vec<(NodeName, MachineSnap)> {
         self.machines
@@ -511,6 +523,8 @@ impl State {
                     name.clone(),
                     MachineSnap {
                         facts: m.facts.clone(),
+                        // This machine's, in a cluster: [`State::local_snap`].
+                        pool: crate::mesh::trust::DEFAULT_POOL.into(),
                         ram_capacity_mib: m.ram_capacity_mib,
                         running: self.running_on(name),
                     },
@@ -554,6 +568,7 @@ impl State {
                     .unwrap_or_else(|| super::cluster::peer::node_of_ws(w).to_string());
                 (w.clone(), node, self.ws_busy(w))
             }),
+            pools: j.spec.pools.clone(),
         }
     }
 

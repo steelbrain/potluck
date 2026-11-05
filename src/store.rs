@@ -474,6 +474,8 @@ mod tests {
                 kill_on_stall: false,
                 recipe: None,
                 submitted_from: "here".into(),
+                pools: Vec::new(),
+                auth: None,
             },
             state,
             submitted_at: submitted,

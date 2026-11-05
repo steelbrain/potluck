@@ -15,6 +15,7 @@ pub mod envcapture;
 pub mod exec;
 pub mod facts;
 pub mod gitinfo;
+pub mod jobauth;
 pub mod mesh;
 pub mod preflight;
 pub mod proto;

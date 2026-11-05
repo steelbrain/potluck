@@ -8,9 +8,10 @@
 //!   grant is the RAM it asked for. While it runs nothing else starts there.
 //! - **All at once.** A job gets every resource it asks for in one grant, or none. Each GPU selector
 //!   gets its own GPU; when several assignments work, the first in the machine's GPU order wins.
-//! - **Feasibility.** Facts (`on`) must match, the RAM must fit the capacity, the selectors must fit
-//!   the machine's GPUs, and a job pinned to a workspace runs only on that workspace's machine. A job
-//!   this machine can never run is skipped: it is neither blocked here nor passed over.
+//! - **Feasibility.** The machine must be in one of the job's pools, facts (`on`) must match, the
+//!   RAM must fit the capacity, the selectors must fit the machine's GPUs, and a job pinned to a
+//!   workspace runs only on that workspace's machine. A job this machine can never run is skipped:
+//!   it is neither blocked here nor passed over.
 //! - **Workspaces.** One invocation at a time runs in a workspace, and invocations dispatched into
 //!   it run first come, first served, whatever their priorities: a later one doesn't start while
 //!   an earlier one waits. A pinned job waiting for its own workspace (an invocation runs in it, or
@@ -61,12 +62,16 @@ pub struct Queued {
     pub timeout_ms: u64,
     /// Pinned to a workspace: (id, its machine, whether an invocation runs in it now).
     pub workspace: Option<(WorkspaceId, NodeName, bool)>,
+    /// The pools it runs in ([`crate::types::JobSpec::pools`]; empty: the default pool).
+    pub pools: Vec<String>,
 }
 
 /// One machine as the scheduler sees it.
 #[derive(Clone, Debug)]
 pub struct MachineView<'a> {
     pub facts: &'a Facts,
+    /// Its pool, from the admission that made it a member (not from what it reports).
+    pub pool: &'a str,
     pub ram_capacity_mib: u64,
     pub running: &'a [Running],
 }
@@ -89,13 +94,20 @@ pub struct Reservation {
     pub at: Millis,
 }
 
-/// Whether this machine could ever run the job (facts, RAM capacity, GPUs that exist, pinning).
-/// `Err` says why not, in plain words.
+/// Whether this machine could ever run the job (pool, facts, RAM capacity, GPUs that exist,
+/// pinning). `Err` says why not, in plain words.
 pub fn feasible(machine: &MachineView, job: &Queued) -> Result<(), String> {
     if let Some((ws, node, _)) = &job.workspace
         && *node != machine.facts.node
     {
         return Err(format!("pinned to workspace {ws} on {node}"));
+    }
+    if !crate::types::runs_in(&job.pools, machine.pool) {
+        return Err(format!(
+            "in pool {}, not the job's {}",
+            machine.pool,
+            crate::types::fmt_pools(&job.pools)
+        ));
     }
     if let Some(unmet) = machine.facts.unmet(&job.on) {
         return Err(unmet);

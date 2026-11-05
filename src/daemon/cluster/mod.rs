@@ -266,6 +266,10 @@ pub(crate) struct CState {
     pub givebacks: Vec<GiveBack>,
     /// Claims refused lately: not tried again until this time (boot clock).
     pub rejected: BTreeMap<JobId, u64>,
+    /// Jobs granted here that this machine did not run because they don't verify (an unsigned or
+    /// forged job, or one not for this machine's pool), with why: never claimed again while their
+    /// owners still queue them.
+    pub refused: BTreeMap<JobId, String>,
     /// Other machines' jobs the latest plan may start: job -> (owner, record).
     pub candidates: BTreeMap<JobId, (NodeName, crate::types::JobRecord)>,
     /// Other machines' jobs granted here: the numbers of the last report the owner made before
@@ -447,6 +451,14 @@ impl Cluster {
     pub fn push_soon(&self) {
         self.cs().push_due = true;
         self.wake();
+    }
+
+    /// This machine's pool, from the admission that made it a member (the default pool in a
+    /// cluster without users, or out of one).
+    pub fn pool_here(&self) -> String {
+        self.mesh()
+            .pool_of(&self.node)
+            .unwrap_or_else(|| crate::mesh::trust::DEFAULT_POOL.to_string())
     }
 
     /// Whether a member by that name is in the cluster (this machine included).
@@ -1000,7 +1012,8 @@ fn handle_call(
 ) -> Result<PeerResponse, String> {
     Ok(match req {
         PeerRequest::Report { have } => {
-            let mut report = views::for_member(views::own_report(sh, c), from);
+            let to = owner::Taker::of(&c.mesh(), from);
+            let mut report = views::for_member(views::own_report(sh, c), &to);
             match have {
                 Some(h) if report.digest() == h => PeerResponse::Unchanged {
                     started_at: report.started_at,
@@ -1766,6 +1779,8 @@ mod tests {
             kill_on_stall: false,
             recipe: None,
             submitted_from: peer::owner_of(id).into(),
+            pools: Vec::new(),
+            auth: None,
         };
         let mut j = crate::daemon::runner::new_record(id.into(), spec, now());
         j.state = state;
@@ -2154,6 +2169,33 @@ mod tests {
         assert!(log.contains("b-1: was starting; starting again\n"), "{log}");
         assert!(!log.contains("handed back"), "{log}");
         assert!(sh.lock().jobs.contains_key("b-1"), "{log}");
+        d.stop();
+    }
+
+    /// The nonce of a signed dispatch is taken once: a second dispatch with it is refused, after a
+    /// restart too, until it is a day old (its signing time is refused by then anyway).
+    #[test]
+    fn a_dispatchs_nonce_is_taken_once_and_kept_a_day() {
+        use crate::daemon::server::{forget_nonces, take_nonce};
+        use crate::jobauth::NONCE_KEEP_MS;
+        let dir = tempfile::tempdir().unwrap();
+        let t = now();
+        let d = lone_daemon(dir.path());
+        let sh = d.shared.clone();
+        take_nonce(&mut sh.lock(), "n0nce-0000000000a", t).unwrap();
+        take_nonce(&mut sh.lock(), "n0nce-0000000000b", t + 1).unwrap();
+        let e = take_nonce(&mut sh.lock(), "n0nce-0000000000a", t + 2).unwrap_err();
+        assert!(e.contains("its nonce was seen"), "{e}");
+        d.stop();
+        let d = lone_daemon(dir.path());
+        let sh = d.shared.clone();
+        assert!(take_nonce(&mut sh.lock(), "n0nce-0000000000a", t + 3).is_err());
+        forget_nonces(&mut sh.lock(), t + NONCE_KEEP_MS);
+        assert!(take_nonce(&mut sh.lock(), "n0nce-0000000000a", t + 4).is_err());
+        forget_nonces(&mut sh.lock(), t + NONCE_KEEP_MS + 1);
+        take_nonce(&mut sh.lock(), "n0nce-0000000000a", t + 5).unwrap();
+        // b, a millisecond younger, is kept.
+        assert!(take_nonce(&mut sh.lock(), "n0nce-0000000000b", t + 6).is_err());
         d.stop();
     }
 

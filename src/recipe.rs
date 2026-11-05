@@ -19,6 +19,7 @@
 //! without_submodules = ["vendor/qemu/roms/*"]
 //! env = { SOME_VAR = "1" }
 //! unset_env = ["HTTPS_PROXY"]
+//! pools = ["gpu"]
 //! ```
 //!
 //! `on` is a table, or a list in `--on`'s syntax, where `macos` and `linux` can stand alone (any
@@ -90,6 +91,9 @@ pub struct Recipe {
     /// Variables removed from the job's environment, as `--unset-env` takes them.
     #[serde(default)]
     pub unset_env: Vec<String>,
+    /// The pools of the machines that may run it, as `--pool` takes them.
+    #[serde(default)]
+    pub pools: Vec<String>,
 }
 
 /// A recipe's `on`: a table of facts, or a list of `--on` arguments split like
@@ -246,6 +250,8 @@ pub struct Resolved {
     pub keep: Vec<String>,
     pub without_submodules: Vec<String>,
     pub labels: BTreeMap<String, String>,
+    /// `--pool`, else the recipe's `pools`: sorted, each once. Empty: the default pool.
+    pub pools: Vec<String>,
 }
 
 /// Applies `args` over the named recipe (if any) of `file`. Options given on the command line
@@ -362,6 +368,23 @@ pub fn resolve(file: &ProjectFile, args: &DispatchArgs) -> anyhow::Result<Resolv
         labels.insert(k, v);
     }
 
+    let given = !args.pools.is_empty();
+    let pools: BTreeSet<String> = if given {
+        args.pools.iter().cloned().collect()
+    } else {
+        recipe.pools.iter().cloned().collect()
+    };
+    if let Some(bad) = pools.iter().find(|p| !crate::mesh::trust::valid_pool(p)) {
+        anyhow::bail!(
+            "{}: bad pool name {bad:?}: use letters, digits, '.', '_' and '-', not starting with '-'",
+            if given {
+                "--pool".to_string()
+            } else {
+                what("pools")
+            }
+        );
+    }
+
     Ok(Resolved {
         recipe: args.recipe.clone(),
         cmd,
@@ -375,6 +398,7 @@ pub fn resolve(file: &ProjectFile, args: &DispatchArgs) -> anyhow::Result<Resolv
         keep,
         without_submodules,
         labels,
+        pools: pools.into_iter().collect(),
     })
 }
 
@@ -807,6 +831,29 @@ unset_env = ["A"]
 
     fn err(file: &ProjectFile, argv: &[&str]) -> String {
         resolve(file, &args(argv)).unwrap_err().to_string()
+    }
+
+    /// `--pool` replaces the recipe's `pools`; each pool once, sorted; a name a pool can't have
+    /// is refused, naming where it came from.
+    #[test]
+    fn pools_from_the_recipe_or_the_command_line() {
+        let file = parse(
+            "[recipe.x]\ncmd = [\"a\"]\ntimeout = \"1m\"\npools = [\"gpu\", \"cloud\", \"gpu\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            resolve(&file, &args(&["x"])).unwrap().pools,
+            ["cloud", "gpu"]
+        );
+        let r = resolve(&file, &args(&["x", "--pool", "fast"])).unwrap();
+        assert_eq!(r.pools, ["fast"]);
+        let r = resolve(&ProjectFile::default(), &args(&with(&[]))).unwrap();
+        assert!(r.pools.is_empty());
+        let e = err(&file, &["x", "--pool", "a b"]);
+        assert!(e.starts_with("--pool: bad pool name \"a b\""), "{e}");
+        let bad = parse("[recipe.x]\ncmd = [\"a\"]\ntimeout = \"1m\"\npools = [\"\"]\n").unwrap();
+        let e = err(&bad, &["x"]);
+        assert!(e.starts_with("recipe x: pools: bad pool name \"\""), "{e}");
     }
 
     #[test]

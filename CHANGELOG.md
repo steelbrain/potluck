@@ -11,6 +11,13 @@
   nothing. `admit --pool POOL` puts a machine in a pool. `user add`, `user remove`, `user list`
   and `user key` manage the users. A cluster without users works as before. See
   [A cluster](docs/cluster.md#users).
+- `dispatch --pool POOL`, repeatable, and a recipe's `pools`: the job runs only on machines admitted
+  into one of those pools, `default` when none is given. See [Jobs](docs/jobs.md#where-it-runs).
+- Signed jobs. In a cluster with users, the command line signs every dispatch with its user key and
+  refuses to dispatch without one; a machine runs another machine's job only when a user it knows
+  signed it for that machine and the job it was granted is the one signed. Jobs queued before
+  `user init` run only on the machine they were dispatched on. See
+  [A cluster](docs/cluster.md#users).
 
 ### Fixed
 

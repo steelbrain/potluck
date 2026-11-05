@@ -110,7 +110,21 @@ From then on:
   machine keys count for nothing, and a member's daemon signs neither.
 - A machine's pool is the one its admission names: `potluck admit --pool POOL`, default `default`.
   The members `user init` signs in are in `default`. Pool names are letters, digits, `.`, `_` and
-  `-`, not starting with `-`.
+  `-`, not starting with `-`. A job runs only on machines in its pools (`dispatch --pool`, default
+  `default`; see [Queue and claims](#queue-and-claims)).
+- The command line signs every dispatch with its user key, for the machine it dispatches on, and
+  refuses to dispatch without one. The daemon there takes a dispatch only when a user signed it,
+  for that machine, within 10 minutes of the daemon's clock, and with a nonce it hasn't seen in the
+  day before (see [Dispatching](jobs.md#dispatching)).
+- A machine claims another machine's job only when a user it knows signed it, and runs it only
+  after checking the grant: a user it knows signed the job for the machine that granted it, and
+  the job granted is the one signed, field by field (repository ids aside, which the dispatching
+  machine salts with its name, the same way on every machine), for this machine's pool. A job that
+  fails the check isn't run: the machine hands it back, logs a `WARNING` line saying why, and
+  doesn't claim it again while it stays queued. A job queued again after its machine is lost is the
+  same signed job, and is checked again where it runs next.
+- Jobs queued before `user init` are unsigned: they still run, but only on the machine they were
+  dispatched on.
 - Only a user's signed record adds or removes a user. `potluck user key` prints this command line's
   public key, making the key first if there is none. A user adds that key with `potluck user add
   NAME KEY` and removes it with `potluck user remove NAME`; `user remove` refuses to remove the
@@ -157,10 +171,15 @@ syncing shows in `why` as a `sync` blocker.
 ## Queue and claims
 
 Each machine keeps the queue of the jobs dispatched on it. Members exchange queues about once a
-second and whenever one changes, so every member sees every queue. What members tell each other of a
-job leaves out its command, env and the paths of its repositories (and, while it runs, its labels
-and `--keep` globs), except to the job's dispatching machine; the machine that claims a job gets all
-of it with the grant. So `status` on a machine that neither dispatched nor runs a job shows it
+second and whenever one changes, so every member sees every queued job for its pool. A job runs
+only on machines in one of its pools (`dispatch --pool`, default `default`; a machine's pool is its
+admission's, see [Users](#users)): the dispatching machine tells a member of a queued job, serves
+it the job's repositories and grants it the job only when the member is in one of those pools, and
+in a cluster with users only when the job is signed. It also refuses a claim when the claiming
+machine's facts, as that machine last reported them, don't meet the job's `--on`. What members tell
+each other of a job leaves out its command, env, the paths of its repositories and the spec its
+signature covers (and, while it runs, its labels and `--keep` globs), except to the job's
+dispatching machine; the machine that claims a job gets all of it with the grant. So `status` on a machine that neither dispatched nor runs a job shows it
 without its command (`-`), and other members' workspaces without their paths. Each machine plans for
 itself and claims a job from its dispatching machine only when it can start it now. The dispatching
 machine grants each job once; a machine whose claim is refused plans again. A machine with no
