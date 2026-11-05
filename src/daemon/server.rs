@@ -282,7 +282,7 @@ fn other_binary(sh: &Shared, asking: Option<&std::path::Path>) -> Option<String>
 
 /// A request in a log line: what it asks and the job, workspace or machine it names, never its
 /// contents (a dispatch's env may hold secrets).
-fn describe(req: &Request) -> String {
+pub(crate) fn describe(req: &Request) -> String {
     let (op, about): (&str, Option<&str>) = match req {
         Request::Ping => ("ping", None),
         Request::Dispatch { spec } => ("dispatch", spec.key.as_deref()),

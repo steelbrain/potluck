@@ -2,8 +2,10 @@
 //! start it; the CLI never starts a daemon itself.
 
 use crate::config::Paths;
+use crate::mesh::user::UserKey;
 use crate::proto::{
-    ClientContext, ClientRequest, Request, Response, ServerResponse, read_msg, write_msg,
+    ClientContext, ClientRequest, NEEDS_USER_KEY, Request, RequestAuth, Response, ServerResponse,
+    read_msg, write_msg,
 };
 use crate::types::Reminder;
 use std::io::{BufReader, Read, Write};
@@ -130,6 +132,23 @@ pub struct Client {
     pub ctx: ClientContext,
     /// Reminders from the latest response.
     pub reminders: Vec<Reminder>,
+    /// The user key ([`crate::mesh::user::key_path`]) that signs each request ([`RequestAuth`]);
+    /// without one, what a refusal saying a request needs it adds.
+    user: Result<UserKey, String>,
+}
+
+/// This command line's user key; without one, where it looked and why it found none.
+fn user_key(paths: &Paths) -> Result<UserKey, String> {
+    let path = crate::mesh::user::key_path(paths);
+    match UserKey::load(&path) {
+        Ok(Some(key)) => Ok(key),
+        Ok(None) => Err(format!(
+            "this command line has no user key at {} (run it where a user's key is; or make one \
+             here with `potluck user key` and have a user run `potluck user add NAME KEY`)",
+            path.display()
+        )),
+        Err(e) => Err(format!("this command line's user key can't be read: {e}")),
+    }
 }
 
 impl Client {
@@ -150,20 +169,33 @@ impl Client {
             writer,
             ctx,
             reminders: Vec::new(),
+            user: user_key(paths),
         })
     }
 
-    /// Sends a request and reads one response. An `Error` response becomes an `Err`.
+    /// Sends a request, signed with the user key when there is one, and reads one response. An
+    /// `Error` response becomes an `Err`; one saying an unsigned request needs a user key says
+    /// why this command line has none.
     pub fn call(&mut self, req: Request) -> anyhow::Result<Response> {
+        let auth = self.user.as_ref().ok().map(|k| RequestAuth::sign(k, &req));
         write_msg(
             &mut self.writer,
             &ClientRequest {
                 ctx: self.ctx.clone(),
                 req,
+                auth,
             },
         )
         .map_err(|e| Disconnected(format!("writing to the daemon: {e}")))?;
-        self.next_frame()
+        match (self.next_frame(), &self.user) {
+            // Sent unsigned.
+            (Err(e), Err(why))
+                if !is_disconnected(&e) && e.to_string().contains(NEEDS_USER_KEY) =>
+            {
+                Err(anyhow::anyhow!("{e}; {why}"))
+            }
+            (answer, _) => answer,
+        }
     }
 
     /// Reads the next response frame (for streamed answers such as copies).

@@ -2009,6 +2009,7 @@ fn after_user_init_only_what_users_sign_admits_and_removes() {
                 node: "c".into(),
                 removal: None,
             },
+            auth: None,
         };
         let header = serde_json::json!({ "kind": "client", "req": req });
         let stream = client_mesh(&b).open_stream("a", header).unwrap();
@@ -4155,6 +4156,7 @@ fn only_job_workspace_and_removal_requests_are_relayed() {
                 lease_token: None,
             },
             req,
+            auth: None,
         };
         let header = serde_json::json!({ "kind": "client", "req": req });
         let stream = mesh.open_stream("a", header).unwrap();
@@ -4924,6 +4926,7 @@ fn a_restart_relayed_by_a_member_is_refused() {
     let req = potluck::proto::ClientRequest {
         ctx: ClientContext::default(),
         req: Request::Restart { binary: None },
+        auth: None,
     };
     let stream = mesh
         .open_stream("a", serde_json::json!({"kind": "client", "req": req}))
@@ -5803,5 +5806,355 @@ fn a_forged_or_unsigned_job_from_another_owner_is_never_run() {
         "{log}"
     );
     assert_eq!(b.get("c-905").spec.cmd, ["true"]);
+    mesh.stop();
+}
+
+/// `potluck user init` on `first`, and every member of `all` holding the first user's admission
+/// of each.
+fn init_users(first: &Node, all: &[&Node]) {
+    first.cli_ok(&["user", "init", "--name", "owner"]);
+    for n in all {
+        wait_until(&format!("{} has the first user", n.name), || {
+            let t = trust_of(n);
+            t.users_exist()
+                && t.view.members.len() == all.len()
+                && t.view.members.values().all(|m| m.by_user())
+        });
+    }
+}
+
+/// The user key `user init` made beside `node`'s node.toml.
+fn user_key_of(node: &Node) -> potluck::mesh::user::UserKey {
+    potluck::mesh::user::UserKey::load(&node.dir.join("user.key"))
+        .unwrap()
+        .unwrap()
+}
+
+/// What `to` answers first to `req` with `auth`, which the member `mesh` runs as relays to it.
+fn relayed(
+    mesh: &potluck::mesh::Mesh,
+    to: &str,
+    req: &Request,
+    auth: Option<potluck::proto::RequestAuth>,
+) -> Response {
+    use potluck::proto::{ClientRequest, ServerResponse, read_msg};
+    let req = ClientRequest {
+        ctx: ClientContext::default(),
+        req: req.clone(),
+        auth,
+    };
+    let header = serde_json::json!({ "kind": "client", "req": req });
+    let stream = mesh.open_stream(to, header).unwrap();
+    let mut r = std::io::BufReader::new(stream);
+    read_msg::<_, ServerResponse>(&mut r).unwrap().unwrap().resp
+}
+
+fn refusal(r: Response) -> String {
+    match r {
+        Response::Error { message } => message,
+        other => panic!("answered: {other:?}"),
+    }
+}
+
+/// After `user init`, the user's command line (on a) gets every kind of request answered by
+/// another member (b): wait, get, logs, why and cancel of b's jobs, cp, hold and release of b's
+/// workspace, env of b. A command line without a user key (b's, of a's job) is refused, saying
+/// the request needs this cluster's user key and where it looked for one; its requests its own
+/// daemon answers still work. A member relaying a request no user signed is refused, and so is
+/// one signed by a key that is no user's, a signature over another request, one signed too long
+/// ago, and a signed one sent again.
+#[test]
+fn after_user_init_a_relayed_request_needs_a_users_signature() {
+    use potluck::proto::RequestAuth;
+    let w = World::new();
+    let a = w.node("a").start();
+    let b = w.node("b").start();
+    let c = w.node("c").start();
+    pair(&a, &b);
+    pair(&a, &c);
+    wait_until("b and c see each other", || {
+        b.node_alive("c") && c.node_alive("b")
+    });
+    init_users(&a, &[&a, &b, &c]);
+    let user = user_key_of(&a);
+
+    // b's jobs and workspace, from the user's command line on a.
+    let made = b.dispatch(&[
+        "--on",
+        "node=b",
+        "--",
+        "sh",
+        "-c",
+        "echo made > made.txt; echo out",
+    ]);
+    let ws = b.done(&made).workspace.unwrap();
+    assert_eq!(a.cli_ok(&["wait", &made])["state"], "succeeded");
+    assert_eq!(a.get(&made).state, JobState::Succeeded);
+    assert_eq!(a.cli_ok(&["logs", &made])["output"], "out\n");
+    assert_eq!(a.cli_ok(&["why", &made])["state"], "succeeded");
+    let dest = w.dir.path().join("copied");
+    a.cli_ok(&["cp", &format!("{ws}:made.txt"), dest.to_str().unwrap()]);
+    assert_eq!(std::fs::read_to_string(&dest).unwrap(), "made\n");
+    assert!(
+        a.cli_ok(&["hold", &ws, "1h"])["held_until"]
+            .as_u64()
+            .unwrap()
+            > now_ms()
+    );
+    assert_eq!(a.cli_ok(&["env", "b"])["node"], "b");
+    let long = b.dispatch(&["--on", "node=b", "--", "sleep", "30"]);
+    b.running_on(&long, "b");
+    a.cli_ok(&["cancel", &long]);
+    assert_eq!(b.done(&long).state, JobState::Cancelled);
+    a.cli_ok(&["release", &ws]);
+    wait_until("b removed the workspace", || {
+        b.ws.removed.lock().unwrap().contains(&ws)
+    });
+
+    // b's command line has no user key: a's job and env are refused; b's own still answer.
+    let theirs = a.dispatch(&["--on", "node=a", "--", "true"]);
+    a.done(&theirs);
+    let key_file = b.dir.join("user.key");
+    for args in [
+        vec!["wait", theirs.as_str()],
+        vec!["logs", theirs.as_str()],
+        vec!["cancel", theirs.as_str()],
+        vec!["env", "a"],
+        vec!["hold", "a-w1", "1h"],
+    ] {
+        let o = b.cli(&args);
+        let e = error_of(&o);
+        assert_eq!(o.code, 2, "{args:?}: {}", o.stdout);
+        assert!(
+            e.contains("needs this cluster's user key: a answers it")
+                && e.contains(&format!(
+                    "this command line has no user key at {}",
+                    key_file.display()
+                )),
+            "{args:?}: {e}"
+        );
+    }
+    b.cli_ok(&["status"]);
+    b.cli_ok(&["nodes"]);
+    b.cli_ok(&["env"]);
+    assert_eq!(b.cli_ok(&["why", &made])["state"], "succeeded");
+    assert_eq!(b.cli_ok(&["logs", &made])["output"], "out\n");
+
+    // c relays to b, as a member does, with its own machine key: no kind of request is answered
+    // unsigned.
+    let mesh = client_mesh(&c);
+    let get = Request::Get { job: made.clone() };
+    let (job, workspace) = (made.clone(), ws.clone());
+    for req in [
+        get.clone(),
+        Request::Wait {
+            job: job.clone(),
+            timeout_ms: Some(0),
+        },
+        Request::Logs {
+            job: job.clone(),
+            offset: 0,
+            max: 1 << 20,
+            wait_ms: 0,
+        },
+        Request::Why { job: job.clone() },
+        Request::Cancel { job },
+        Request::Copy {
+            workspace: workspace.clone(),
+            path: "made.txt".into(),
+        },
+        Request::Hold {
+            workspace: workspace.clone(),
+            duration_ms: 60_000,
+        },
+        Request::Release { workspace },
+        Request::Env {
+            node: Some("b".into()),
+        },
+    ] {
+        let e = refusal(relayed(&mesh, "b", &req, None));
+        assert!(
+            e.contains("needs this cluster's user key") && e.contains("c relayed it unsigned"),
+            "{req:?}: {e}"
+        );
+    }
+    let stranger = tempfile::tempdir().unwrap();
+    let (eve, _) =
+        potluck::mesh::user::UserKey::load_or_create(&stranger.path().join("u.key")).unwrap();
+    let e = refusal(relayed(
+        &mesh,
+        "b",
+        &get,
+        Some(RequestAuth::sign(&eve, &get)),
+    ));
+    assert!(e.contains("is no user of this cluster"), "{e}");
+    let other = Request::Get { job: long.clone() };
+    let e = refusal(relayed(
+        &mesh,
+        "b",
+        &get,
+        Some(RequestAuth::sign(&user, &other)),
+    ));
+    assert!(e.contains("its signature is not"), "{e}");
+    let old = RequestAuth::sign_at(&user, &get, "old".into(), now_ms() - 6 * 60_000);
+    let e = refusal(relayed(&mesh, "b", &get, Some(old)));
+    assert!(e.contains("signed 360s before now"), "{e}");
+    let auth = RequestAuth::sign(&user, &get);
+    match relayed(&mesh, "b", &get, Some(auth.clone())) {
+        Response::Job { job } => assert_eq!(job.id, made),
+        other => panic!("a signed get was not answered: {other:?}"),
+    }
+    let e = refusal(relayed(&mesh, "b", &get, Some(auth)));
+    assert!(e.contains("this is a replay of it"), "{e}");
+    let env = Request::Env {
+        node: Some("b".into()),
+    };
+    match relayed(&mesh, "b", &env, Some(RequestAuth::sign(&user, &env))) {
+        Response::Env { node, .. } => assert_eq!(node, "b"),
+        other => panic!("a signed env was not answered: {other:?}"),
+    }
+    mesh.stop();
+    let log = b.daemon_log();
+    assert!(
+        log.contains(&format!(
+            "cluster: refused a relayed request (get {made}) from c: this request (get {made}) needs this cluster's user key"
+        )),
+        "{log}"
+    );
+}
+
+/// A cancel that a member relays to the machine running a job for another owner goes to that
+/// owner, which cancels it as it does any of its jobs running elsewhere: not around it. So in a
+/// cluster without users, and with users once a user signed it.
+#[test]
+fn a_cancel_relayed_to_the_runner_of_another_owners_job_goes_to_its_owner() {
+    use potluck::proto::RequestAuth;
+    let w = World::new();
+    let a = w.node("a").start();
+    let b = w.node("b").start();
+    let c = w.node("c").start();
+    pair(&a, &b);
+    pair(&a, &c);
+    wait_until("b and c see each other", || {
+        b.node_alive("c") && c.node_alive("b")
+    });
+    let mesh = client_mesh(&c);
+    let cancelled_through_a = |job: &str, auth: &dyn Fn(&Request) -> Option<RequestAuth>| {
+        let cancel = Request::Cancel { job: job.into() };
+        match relayed(&mesh, "b", &cancel, auth(&cancel)) {
+            Response::Job { job: j } => assert_eq!(j.id, job),
+            other => panic!("the cancel was not answered: {other:?}"),
+        }
+        let j = a.done(job);
+        assert_eq!((j.state, j.exit_code), (JobState::Cancelled, Some(130)));
+        assert!(
+            a.daemon_log()
+                .contains(&format!("{job}: cancel asked; forwarded to b\n")),
+            "{}",
+            a.daemon_log()
+        );
+        assert!(
+            b.daemon_log().contains(&format!(
+                "cluster: a relayed request (cancel {job}) from c, of a job a owns, went to a"
+            )),
+            "{}",
+            b.daemon_log()
+        );
+    };
+
+    let first = a.dispatch(&["--on", "node=b", "--", "sleep", "30"]);
+    a.running_on(&first, "b");
+    cancelled_through_a(&first, &|_| None);
+
+    init_users(&a, &[&a, &b, &c]);
+    let user = user_key_of(&a);
+    let second = a.dispatch(&["--on", "node=b", "--", "sleep", "30"]);
+    a.running_on(&second, "b");
+    let cancel = Request::Cancel {
+        job: second.clone(),
+    };
+    let e = refusal(relayed(&mesh, "b", &cancel, None));
+    assert!(e.contains("needs this cluster's user key"), "{e}");
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(a.get(&second).state, JobState::Running);
+    cancelled_through_a(&second, &|r| Some(RequestAuth::sign(&user, r)));
+    mesh.stop();
+}
+
+/// A member answers a relayed get, logs or why only of a job it owns or runs now, whoever signed
+/// it: b, which ran a's job and keeps its record and log, refuses c's; while it runs another of
+/// a's, it answers for that one. It answers a cp, hold or release only of a workspace of its own.
+#[test]
+fn a_member_answers_a_relayed_request_only_about_its_own_jobs_and_workspaces() {
+    use potluck::proto::RequestAuth;
+    let w = World::new();
+    let a = w.node("a").start();
+    let b = w.node("b").start();
+    let c = w.node("c").start();
+    pair(&a, &b);
+    pair(&a, &c);
+    wait_until("b and c see each other", || {
+        b.node_alive("c") && c.node_alive("b")
+    });
+    init_users(&a, &[&a, &b, &c]);
+    let user = user_key_of(&a);
+    let ran = a.dispatch(&["--on", "node=b", "--", "sh", "-c", "echo secret"]);
+    a.done(&ran);
+    assert_eq!(output_of(&b, &ran), "secret\n");
+    let running = a.dispatch(&["--on", "node=b", "--", "sleep", "30"]);
+    a.running_on(&running, "b");
+
+    let mesh = client_mesh(&c);
+    let ask = |req: &Request| relayed(&mesh, "b", req, Some(RequestAuth::sign(&user, req)));
+    let get = Request::Get { job: ran.clone() };
+    wait_until("b has delivered the job that ran", || {
+        matches!(ask(&get), Response::Error { .. })
+    });
+    for req in [
+        get.clone(),
+        Request::Logs {
+            job: ran.clone(),
+            offset: 0,
+            max: 1 << 20,
+            wait_ms: 0,
+        },
+        Request::Why { job: ran.clone() },
+        Request::Wait {
+            job: ran.clone(),
+            timeout_ms: Some(0),
+        },
+    ] {
+        let e = refusal(ask(&req));
+        assert_eq!(
+            e,
+            format!("b neither owns nor runs job {ran}, so it doesn't answer for it; a does"),
+            "{req:?}"
+        );
+    }
+    match ask(&Request::Get {
+        job: running.clone(),
+    }) {
+        Response::Job { job } => assert_eq!(job.state, JobState::Running),
+        other => panic!("b doesn't answer for the job it runs: {other:?}"),
+    }
+    for req in [
+        Request::Copy {
+            workspace: "a-w1".into(),
+            path: "x".into(),
+        },
+        Request::Hold {
+            workspace: "a-w1".into(),
+            duration_ms: 60_000,
+        },
+        Request::Release {
+            workspace: "a-w1".into(),
+        },
+    ] {
+        assert_eq!(
+            refusal(ask(&req)),
+            "workspace a-w1 is on a, not b",
+            "{req:?}"
+        );
+    }
     mesh.stop();
 }

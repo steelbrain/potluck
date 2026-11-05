@@ -7,8 +7,9 @@
 //! The CLI only ever talks to its own machine's daemon; from phase 2 the daemon forwards requests
 //! about jobs and workspaces on other machines over the mesh.
 
-use crate::mesh::MembershipView;
+use crate::mesh::identity::Signer;
 use crate::mesh::trust::{Admission, Record, Removal, UserAdmission};
+use crate::mesh::{MembershipView, PublicKey, Signature};
 use crate::types::{
     Facts, Grant, JobId, JobRecord, JobSpec, Millis, NodeName, Reminder, WorkspaceId,
     WorkspaceRecord,
@@ -31,6 +32,76 @@ pub struct ClientContext {
 pub struct ClientRequest {
     pub ctx: ClientContext,
     pub req: Request,
+    /// A user's signature on `req`: the command line signs every request when it has a user
+    /// key. Its own daemon answers without one, and carries it along when it relays the request
+    /// to another member, which in a cluster with users answers only what a user signed. None
+    /// from a command line without a user key, or from before signatures.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<RequestAuth>,
+}
+
+/// What a refusal says, in a cluster with users, of an unsigned request another member would
+/// answer. The command line adds where it looked for its user key.
+pub const NEEDS_USER_KEY: &str = "needs this cluster's user key";
+
+/// A user's signature on a request ([`ClientRequest::auth`]): by `key`, over
+/// `("potluck request v1", request, nonce, issued_at)` as JSON, where the request is
+/// [`Request`] with its long-poll waits left out (`wait`'s `timeout_ms` as null, `logs`'
+/// `wait_ms` as 0): a daemon relaying a long poll shortens them after waiting for an owner that
+/// was away, or while it restarts, and how long a poll waits carries no authority. The request's
+/// context (the caller's repository and branch) is not signed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestAuth {
+    pub key: PublicKey,
+    /// Random, new for each request: a member answers a signed request once.
+    pub nonce: String,
+    /// When it was signed, Unix ms by the signing machine's clock: a member answers it only
+    /// within [`RequestAuth::WINDOW_MS`] of its own.
+    pub issued_at: Millis,
+    pub sig: Signature,
+}
+
+impl RequestAuth {
+    /// How far a request's `issued_at` may be from the answering member's clock, either way.
+    pub const WINDOW_MS: Millis = 5 * 60_000;
+
+    /// `req` signed by `key` now, with a new nonce.
+    pub fn sign(key: &dyn Signer, req: &Request) -> RequestAuth {
+        RequestAuth::sign_at(
+            key,
+            req,
+            crate::mesh::trust::nonce(),
+            crate::types::now_ms(),
+        )
+    }
+
+    /// `req` signed by `key` with this nonce and time.
+    pub fn sign_at(key: &dyn Signer, req: &Request, nonce: String, issued_at: Millis) -> Self {
+        let sig = key.sign(&signed_bytes(req, &nonce, issued_at));
+        RequestAuth {
+            key: key.public(),
+            nonce,
+            issued_at,
+            sig,
+        }
+    }
+
+    /// Whether this is `key`'s signature on `req`, with this nonce and time.
+    pub fn verifies(&self, req: &Request) -> bool {
+        self.key
+            .verify(&signed_bytes(req, &self.nonce, self.issued_at), &self.sig)
+    }
+}
+
+/// What a [`RequestAuth`] signs.
+fn signed_bytes(req: &Request, nonce: &str, issued_at: Millis) -> Vec<u8> {
+    let mut req = req.clone();
+    match &mut req {
+        Request::Wait { timeout_ms, .. } => *timeout_ms = None,
+        Request::Logs { wait_ms, .. } => *wait_ms = 0,
+        _ => {}
+    }
+    serde_json::to_vec(&("potluck request v1", &req, nonce, issued_at)).unwrap_or_default()
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -298,4 +369,81 @@ pub fn read_msg<R: std::io::BufRead, T: serde::de::DeserializeOwned>(
     serde_json::from_str(&line)
         .map(Some)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mesh::user::UserKey;
+
+    fn key(dir: &std::path::Path, name: &str) -> UserKey {
+        UserKey::load_or_create(&dir.join(name)).unwrap().0
+    }
+
+    #[test]
+    fn a_signed_request_verifies_and_a_changed_one_does_not() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (k, other) = (key(tmp.path(), "a.key"), key(tmp.path(), "b.key"));
+        let get = |job: &str| Request::Get { job: job.into() };
+        let auth = RequestAuth::sign(&k, &get("a-1"));
+        assert_eq!(auth.key, k.public());
+        assert!(auth.verifies(&get("a-1")));
+        assert!(auth.issued_at.abs_diff(crate::types::now_ms()) < 60_000);
+        // Another request, another kind of request with the same field, another nonce, time or
+        // key: no.
+        assert!(!auth.verifies(&get("a-2")));
+        assert!(!auth.verifies(&Request::Cancel { job: "a-1".into() }));
+        let changed = |f: &dyn Fn(&mut RequestAuth)| {
+            let mut a = auth.clone();
+            f(&mut a);
+            a.verifies(&get("a-1"))
+        };
+        assert!(!changed(&|a| a.nonce.push('x')));
+        assert!(!changed(&|a| a.issued_at += 1));
+        assert!(!changed(&|a| a.key = other.public()));
+        assert!(!changed(&|a| a.sig.0[0] ^= 1));
+        // Each signature has a nonce of its own.
+        assert_ne!(RequestAuth::sign(&k, &get("a-1")).nonce, auth.nonce);
+        // As JSON, and in a request, it is the same.
+        let req = ClientRequest {
+            ctx: ClientContext::default(),
+            req: get("a-1"),
+            auth: Some(auth.clone()),
+        };
+        let line = serde_json::to_string(&req).unwrap();
+        let back: ClientRequest = serde_json::from_str(&line).unwrap();
+        assert_eq!(back.auth.as_ref(), Some(&auth));
+        assert!(back.auth.unwrap().verifies(&back.req));
+    }
+
+    #[test]
+    fn a_long_polls_wait_is_not_signed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let k = key(tmp.path(), "a.key");
+        let wait = |t: Option<u64>| Request::Wait {
+            job: "a-1".into(),
+            timeout_ms: t,
+        };
+        let auth = RequestAuth::sign_at(&k, &wait(Some(20_000)), "n".into(), 5);
+        assert!(auth.verifies(&wait(Some(1_200))));
+        assert!(auth.verifies(&wait(None)));
+        let logs = |offset: u64, wait_ms: u64| Request::Logs {
+            job: "a-1".into(),
+            offset,
+            max: 1 << 20,
+            wait_ms,
+        };
+        let auth = RequestAuth::sign_at(&k, &logs(10, 20_000), "n".into(), 5);
+        assert!(auth.verifies(&logs(10, 1)));
+        // The rest of it is.
+        assert!(!auth.verifies(&logs(0, 20_000)));
+    }
+
+    #[test]
+    fn a_request_without_a_signature_parses_and_is_written_as_before() {
+        let old = r#"{"ctx":{"repo_id":null,"branch":null,"job":null,"lease_token":null},"req":{"op":"get","job":"a-1"}}"#;
+        let req: ClientRequest = serde_json::from_str(old).unwrap();
+        assert!(req.auth.is_none());
+        assert_eq!(serde_json::to_string(&req).unwrap(), old);
+    }
 }

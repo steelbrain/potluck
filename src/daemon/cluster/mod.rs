@@ -260,6 +260,10 @@ pub(crate) struct CState {
     /// in the store).
     pub endings: BTreeMap<JobId, owner::PendingEnd>,
 
+    // As a member others relay requests to.
+    /// Signed requests taken lately: each is taken once.
+    pub requests_seen: relay::Seen,
+
     // As a runner.
     pub outbox: BTreeMap<JobId, Outbox>,
     pub couriers: BTreeSet<JobId>,
@@ -989,7 +993,7 @@ impl Handler for PeerHandler {
             StreamHeader::Crash { job, token } => {
                 owner::receive_crash(&sh, &from.name, &job, &token, stream)
             }
-            StreamHeader::Client { req } => relay::serve(&sh, &req, stream),
+            StreamHeader::Client { req } => relay::serve(&sh, &c, from, &req, stream),
             StreamHeader::UploadPack { repo_id } => {
                 owner::upload_pack(&sh, &c, &from.name, &repo_id, stream)
             }
@@ -2753,6 +2757,7 @@ mod tests {
             req: Request::Release {
                 workspace: "lone-w1".into(),
             },
+            auth: None,
         };
         let mut out = Vec::new();
         crate::daemon::server::handle_relayed(&sh, &req, &mut out).unwrap();

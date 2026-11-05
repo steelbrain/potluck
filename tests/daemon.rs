@@ -3455,6 +3455,7 @@ fn idle_connections_are_let_go() {
             max: 4 << 20,
             wait_ms: 0,
         },
+        auth: None,
     };
     potluck::proto::write_msg(&mut stuck, &req).unwrap();
     std::thread::sleep(Duration::from_millis(1500));

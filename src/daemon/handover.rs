@@ -1729,6 +1729,7 @@ mod tests {
             let mut line = serde_json::to_vec(&crate::proto::ClientRequest {
                 ctx: Default::default(),
                 req,
+                auth: None,
             })
             .unwrap();
             line.push(b'\n');

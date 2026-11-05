@@ -5,13 +5,24 @@
 //! admission, removal and self-update go to the mesh. In a cluster without users, a removal goes
 //! to the oldest member up that was admitted before the machine removed, which makes it final; in
 //! one with users, a user signs it and no member signs one for another.
+//!
+//! In a cluster with users, a member answers a relayed request only when a user signed it
+//! ([`RequestAuth`]): a recognized user's key, signed within [`RequestAuth::WINDOW_MS`] of the
+//! member's clock, and not answered before. Whoever signs it, a member answers about a job only
+//! when it owns it or runs it now; a cancel of a job it runs for another owner goes to that owner;
+//! and it answers about a workspace only when the workspace is its own.
 
 use super::peer::{StreamHeader, node_of_ws, owner_of};
 use super::{Cluster, membership, owner, self_update, views};
 use crate::daemon::Shared;
 use crate::daemon::files::reply;
-use crate::daemon::server::{self, handle_relayed, reminders};
-use crate::proto::{ClientRequest, Request, Response, ServerResponse, read_msg};
+use crate::daemon::server::{self, describe, handle_relayed, reminders};
+use crate::mesh::{Peer, PublicKey};
+use crate::proto::{
+    ClientRequest, NEEDS_USER_KEY, Request, RequestAuth, Response, ServerResponse, read_msg,
+};
+use crate::types::Millis;
+use std::collections::BTreeMap;
 use std::io::{BufReader, Read, Write};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -57,6 +68,9 @@ pub(crate) fn intercept<W: Write>(
             if owner != me {
                 if relayed || !c.is_member(owner) || c.removed() {
                     return Ok(false);
+                }
+                if let Some(why) = unsigned(&c, req, owner) {
+                    return answer(w, Err(why));
                 }
                 let began = Instant::now();
                 loop {
@@ -125,6 +139,9 @@ pub(crate) fn intercept<W: Write>(
                     )),
                 );
             }
+            if let Some(why) = unsigned(&c, req, node) {
+                return answer(w, Err(why));
+            }
             match relay(sh, &c, node, req, w) {
                 Ok(()) => Ok(true),
                 Err(RelayError::Broken(e)) => Err(e),
@@ -163,6 +180,9 @@ pub(crate) fn intercept<W: Write>(
                     ),
                     None => format!("{node} is down, and only its own daemon has its environment"),
                 };
+                return answer(w, Err(why));
+            }
+            if let Some(why) = unsigned(&c, req, node) {
                 return answer(w, Err(why));
             }
             match relay(sh, &c, node, req, w) {
@@ -214,6 +234,30 @@ pub(crate) fn intercept<W: Write>(
         | Request::UserRecord { .. } => answer(w, membership(sh, &c, &req.req)),
         Request::SelfUpdate => answer(w, self_update(sh, &c).map(|text| Response::Text { text })),
         _ => Ok(false),
+    }
+}
+
+/// Why `req` from this machine's command line isn't relayed to `node`, which would refuse it: in
+/// a cluster with users, it is unsigned, or signed by a key that is no user's. None when it goes
+/// (`node` checks the signature).
+fn unsigned(c: &Cluster, req: &ClientRequest, node: &str) -> Option<String> {
+    let mesh = c.mesh();
+    if !mesh.users_exist() {
+        return None;
+    }
+    let what = describe(&req.req);
+    match &req.auth {
+        None => Some(format!(
+            "this request ({what}) {NEEDS_USER_KEY}: {node} answers it, and in a cluster with \
+             users a machine answers another machine's requests only when a user signed them"
+        )),
+        Some(a) if !mesh.recognized_user(&a.key) => Some(format!(
+            "this request ({what}) is signed with the user key {key}, which is no user of this \
+             cluster, and {node} answers only what a user signed; a user adds the key with \
+             `potluck user add NAME {key}`",
+            key = a.key
+        )),
+        Some(_) => None,
     }
 }
 
@@ -459,16 +503,21 @@ fn serve_removal<W: Write>(
     )
 }
 
-/// A request another member relayed here: answered on the stream as on the socket. Only the
-/// requests [`intercept`] relays are answered (about a job or a workspace, this machine's login
-/// environment, and a removal, which it relays to a member admitted before the machine removed);
-/// anything else, such as an admission, is refused rather than done here on another member's
-/// word.
-pub(super) fn serve(sh: &Arc<Shared>, req: &ClientRequest, stream: crate::mesh::Stream) {
+/// A request another member (`from`) relayed here: answered on the stream as on the socket, when
+/// [`may_answer`] lets it be. Only the requests [`intercept`] relays are answered (about a job or
+/// a workspace, this machine's login environment, and a removal, which it relays to a member
+/// admitted before the machine removed); anything else, such as an admission, is refused rather
+/// than done here on another member's word.
+pub(super) fn serve(
+    sh: &Arc<Shared>,
+    c: &Cluster,
+    from: &Peer,
+    req: &ClientRequest,
+    stream: crate::mesh::Stream,
+) {
     let mut s = stream;
     if let Request::Remove { node, .. } = &req.req {
-        let requester = s.peer().name.clone();
-        let answered = serve_removal(sh, req, node, &requester, &mut s);
+        let answered = serve_removal(sh, req, node, &from.name, &mut s);
         if let Err(e) = answered {
             sh.log
                 .log(format!("cluster: answering a relayed request: {e}"));
@@ -489,7 +538,18 @@ pub(super) fn serve(sh: &Arc<Shared>, req: &ClientRequest, stream: crate::mesh::
             | Request::Env { .. }
     );
     let answered = if relayable {
-        handle_relayed(sh, req, &mut s)
+        match may_answer(c, &from.name, req) {
+            Ok(Answer::Here) => handle_relayed(sh, req, &mut s),
+            Ok(Answer::ToOwner(owner)) => to_owner(sh, c, &from.name, &owner, req, &mut s),
+            Err(message) => {
+                sh.log.log(format!(
+                    "cluster: refused a relayed request ({}) from {}: {message}",
+                    describe(&req.req),
+                    from.name
+                ));
+                reply(&mut s, &[], Response::Error { message })
+            }
+        }
     } else {
         let op = serde_json::to_value(&req.req)
             .ok()
@@ -514,4 +574,211 @@ pub(super) fn serve(sh: &Arc<Shared>, req: &ClientRequest, stream: crate::mesh::
             .log(format!("cluster: answering a relayed request: {e}"));
     }
     let _ = s.close_write();
+}
+
+/// Where a relayed request [`may_answer`] lets in is answered.
+#[derive(Debug, PartialEq, Eq)]
+enum Answer {
+    /// Here, as on the socket.
+    Here,
+    /// By the job's owner: a cancel of a job this machine runs for it.
+    ToOwner(String),
+}
+
+/// Whether this machine answers `req`, which member `from` relayed (a kind [`serve`] answers),
+/// and where; the reason, for the command line, when it doesn't. In a cluster with users, a user
+/// must have signed it ([`signed`]). Whoever signed it: about a job, only when this machine owns
+/// it or runs it now, a cancel of one it runs for another owner going to that owner; about a
+/// workspace, only one of this machine's.
+fn may_answer(c: &Cluster, from: &str, req: &ClientRequest) -> Result<Answer, String> {
+    if c.mesh().users_exist() {
+        signed(c, from, req)?;
+    }
+    let me = c.node.as_str();
+    match &req.req {
+        Request::Get { job }
+        | Request::Wait { job, .. }
+        | Request::Logs { job, .. }
+        | Request::Why { job }
+        | Request::Cancel { job } => {
+            let owner = owner_of(job);
+            if owner == me {
+                return Ok(Answer::Here);
+            }
+            match (runs(c, job), &req.req) {
+                (Some(_), Request::Cancel { .. }) => Ok(Answer::ToOwner(owner.to_string())),
+                (Some(_), _) => Ok(Answer::Here),
+                (None, _) => Err(format!(
+                    "{me} neither owns nor runs job {job}, so it doesn't answer for it; {owner} does"
+                )),
+            }
+        }
+        Request::Copy { workspace, .. }
+        | Request::Hold { workspace, .. }
+        | Request::Release { workspace }
+            if node_of_ws(workspace) != me =>
+        {
+            Err(format!(
+                "workspace {workspace} is on {}, not {me}",
+                node_of_ws(workspace)
+            ))
+        }
+        _ => Ok(Answer::Here),
+    }
+}
+
+/// Whether a user signed `req`, relayed by `from`: a signature by a recognized user's key that
+/// verifies, made within [`RequestAuth::WINDOW_MS`] of this machine's clock, and on a request
+/// this machine hasn't taken before ([`Seen`]). The reason when not.
+fn signed(c: &Cluster, from: &str, req: &ClientRequest) -> Result<(), String> {
+    let me = c.node.as_str();
+    let what = describe(&req.req);
+    let Some(auth) = &req.auth else {
+        return Err(format!(
+            "this request ({what}) {NEEDS_USER_KEY}: in a cluster with users, {me} answers \
+             another machine's requests only when a user signed them, and {from} relayed it \
+             unsigned"
+        ));
+    };
+    if !c.mesh().recognized_user(&auth.key) {
+        return Err(format!(
+            "{me} refuses this request ({what}): the key that signed it, {}, is no user of this \
+             cluster",
+            auth.key
+        ));
+    }
+    if !auth.verifies(&req.req) {
+        return Err(format!(
+            "{me} refuses this request ({what}): its signature is not {}'s on it",
+            auth.key
+        ));
+    }
+    let now = c.clock.wall_ms();
+    c.cs()
+        .requests_seen
+        .take(auth, now)
+        .map_err(|why| format!("{me} refuses this request ({what}): {why}"))
+}
+
+/// The signed requests this machine took lately ([`signed`]), by key and nonce, with when each
+/// was signed. One is kept until it is too old to be taken anyway: [`RequestAuth::WINDOW_MS`]
+/// past its time. In memory only: a daemon that starts again takes a request signed before once
+/// more, within that window.
+#[derive(Default)]
+pub(crate) struct Seen(BTreeMap<(PublicKey, String), Millis>);
+
+impl Seen {
+    /// Takes a request `auth` signed, at wall time `now`: refused when it was signed too far
+    /// from `now`, either way, or was taken before.
+    fn take(&mut self, auth: &RequestAuth, now: Millis) -> Result<(), String> {
+        let window = RequestAuth::WINDOW_MS;
+        if auth.issued_at.abs_diff(now) > window {
+            let (by, way) = match auth.issued_at > now {
+                true => (auth.issued_at - now, "after"),
+                false => (now - auth.issued_at, "before"),
+            };
+            return Err(format!(
+                "it was signed {}s {way} now by this machine's clock, and a signed request is \
+                 taken only within {} minutes of it (one signed long ago, or a clock that is off)",
+                by / 1000,
+                window / 60_000
+            ));
+        }
+        self.0.retain(|_, at| at.saturating_add(window) >= now);
+        match self.0.entry((auth.key, auth.nonce.clone())) {
+            std::collections::btree_map::Entry::Occupied(_) => Err(
+                "it was taken once already, and a signed request is taken once (this is a replay \
+                 of it)"
+                    .to_string(),
+            ),
+            std::collections::btree_map::Entry::Vacant(v) => {
+                v.insert(auth.issued_at);
+                Ok(())
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
+/// A cancel, relayed by `from`, of a job this machine runs for `owner`: sent on to `owner`, which
+/// cancels it here as it cancels any of its jobs running elsewhere, its answer copied back.
+fn to_owner<W: Write>(
+    sh: &Arc<Shared>,
+    c: &Cluster,
+    from: &str,
+    owner: &str,
+    req: &ClientRequest,
+    w: &mut W,
+) -> std::io::Result<()> {
+    let _answering = sh.up.serving();
+    let what = describe(&req.req);
+    match relay(sh, c, owner, req, w) {
+        Ok(()) => {
+            sh.log.log(format!(
+                "cluster: a relayed request ({what}) from {from}, of a job {owner} owns, went to {owner}"
+            ));
+            Ok(())
+        }
+        Err(RelayError::Broken(e)) => Err(e),
+        Err(RelayError::NotStarted(e)) => {
+            let rem = reminders(sh, &req.ctx);
+            let message = format!(
+                "{} runs this job for {owner}, which cancels it, and {owner} can't be reached: {e}",
+                c.node
+            );
+            reply(w, &rem, Response::Error { message })
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mesh::user::UserKey;
+
+    #[test]
+    fn a_signed_request_is_taken_once_and_only_near_its_time() {
+        let tmp = tempfile::tempdir().unwrap();
+        let k = UserKey::load_or_create(&tmp.path().join("u.key"))
+            .unwrap()
+            .0;
+        let other = UserKey::load_or_create(&tmp.path().join("v.key"))
+            .unwrap()
+            .0;
+        let req = Request::Get { job: "a-1".into() };
+        let now: Millis = 1_000_000_000;
+        let w = RequestAuth::WINDOW_MS;
+        let at = |t: Millis, nonce: &str| RequestAuth::sign_at(&k, &req, nonce.into(), t);
+        let mut seen = Seen::default();
+        seen.take(&at(now, "n1"), now).unwrap();
+        // Again: a replay.
+        let e = seen.take(&at(now, "n1"), now + 1_000).unwrap_err();
+        assert!(e.contains("replay"), "{e}");
+        // The same nonce from another key is another request.
+        seen.take(&RequestAuth::sign_at(&other, &req, "n1".into(), now), now)
+            .unwrap();
+        // Up to 5 minutes either way.
+        seen.take(&at(now - w, "n2"), now).unwrap();
+        seen.take(&at(now + w, "n3"), now).unwrap();
+        let e = seen.take(&at(now - w - 1_000, "n4"), now).unwrap_err();
+        assert!(e.contains("signed 301s before now"), "{e}");
+        let e = seen.take(&at(now + w + 61_000, "n5"), now).unwrap_err();
+        assert!(e.contains("signed 361s after now"), "{e}");
+        assert_eq!(seen.len(), 4);
+        // Kept until too old to be taken anyway: then forgotten.
+        let e = seen.take(&at(now + w, "n3"), now + 2 * w).unwrap_err();
+        assert!(e.contains("replay"), "{e}");
+        seen.take(&at(now + 2 * w, "n6"), now + 2 * w).unwrap();
+        assert_eq!(
+            seen.len(),
+            2,
+            "only n3 (signed at now + 5m) and n6 are left"
+        );
+        // n1, forgotten, is too old to count.
+        assert!(seen.take(&at(now, "n1"), now + 2 * w).is_err());
+    }
 }
