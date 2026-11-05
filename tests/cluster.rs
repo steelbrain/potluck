@@ -5283,3 +5283,47 @@ fn upload_pack_serves_the_repositories_of_queued_jobs_and_of_the_askers_own() {
     as_c.stop();
     as_b.stop();
 }
+
+/// A queued job pinned to a workspace keeps it from removal only as its owner reports it: c's
+/// report naming a's job pinned to b's workspace counts for nothing on b.
+#[test]
+fn a_workspace_is_kept_only_by_its_owners_report_of_a_job_pinned_to_it() {
+    let w = World::new();
+    let a = w.node("a").start();
+    let b = w.node("b").gpu().start();
+    let mut c = w.node("c").start();
+    pair(&a, &b);
+    pair(&a, &c);
+    wait_until("b and c see each other", || {
+        b.node_alive("c") && c.node_alive("b")
+    });
+    let first = a.dispatch(&["--gpu", "any", "--", "sleep", "2"]);
+    let ws = a.running_on(&first, "b").workspace.unwrap();
+    let second = a.dispatch(&["--workspace", &ws, "--", "true"]);
+    let pending = |n: &Node| -> u64 {
+        let st = n.cli_ok(&["status"]);
+        st["workspaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|x| x["id"] == ws.as_str() && x["node"] == "b")
+            .map_or(0, |x| x["pending"].as_u64().unwrap())
+    };
+    wait_until("b counts a's queued job", || pending(&b) == 2);
+    let pinned = entry_of(&report_to(&b, "a"), "queue", &second);
+    let mut report = report_to(&b, "c");
+    a.cli_ok(&["cancel", &second]);
+    wait_until("b counts nothing", || pending(&b) == 0);
+    // c's next report, as c could make it: a's job in c's queue.
+    c.stop();
+    report["queue"] = serde_json::json!([pinned]);
+    report["seq"] = 0.into();
+    let mesh = client_mesh(&c);
+    let r = mesh
+        .call("b", serde_json::json!({"op": "push", "report": report}))
+        .unwrap();
+    assert_eq!(r["kind"], "ok", "{r}");
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(pending(&b), 0, "{}", b.daemon_log());
+    mesh.stop();
+}

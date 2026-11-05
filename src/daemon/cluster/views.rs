@@ -137,7 +137,9 @@ pub(super) fn received(sh: &Shared, c: &Cluster, from: &str, mut report: Machine
     if report.node != from {
         return;
     }
+    // The digest of what it sent, which its next pull's answer is compared with.
     let digest = report.digest();
+    own_entries(from, &mut report);
     let known = super::capable::Known {
         facts: report.facts.clone(),
         ram_capacity_mib: report.ram_capacity_mib,
@@ -168,6 +170,15 @@ pub(super) fn received(sh: &Shared, c: &Cluster, from: &str, mut report: Machine
     drop(cs);
     drop(guard);
     sh.kick();
+}
+
+/// What a report from `from` says for its own machine, the rest dropped: its queue holds only its
+/// own queued jobs. Another machine's job there (no report of a member's holds one) would keep
+/// this machine's workspaces it is pinned to from removal.
+fn own_entries(from: &str, report: &mut MachineReport) {
+    report
+        .queue
+        .retain(|j| owner_of(&j.id) == from && j.state == JobState::Queued);
 }
 
 /// A pull found the report held from `from` still current: it takes the numbers of the one `from`

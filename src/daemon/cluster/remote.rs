@@ -78,8 +78,9 @@ fn could_start_soon(view: &MachineView, q: &Queued, now: Millis, wait: u64) -> b
 
 /// Workspaces here that other machines' queued jobs are pinned to are never removed: counted
 /// from every member's last report, the ones away too (asleep, updating): its queued jobs still
-/// need their workspaces when it is back. Run as each report arrives, so a `release` right after
-/// counts the queue that report shows.
+/// need their workspaces when it is back. A report's queue holds only its machine's own jobs
+/// ([`super::views::received`]): a job keeps a workspace only as its owner reports it. Run as
+/// each report arrives, so a `release` right after counts the queue that report shows.
 pub(super) fn pinned_here(st: &mut State, cs: &CState) {
     let mut pending: BTreeMap<String, u32> = BTreeMap::new();
     for r in cs.reports.values() {
