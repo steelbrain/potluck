@@ -274,7 +274,8 @@ fn for_now(req: &ClientRequest, waited: Duration) -> ClientRequest {
 /// alive lists it (a member that is down keeps its last report here, and the job may have ended
 /// since: its owner ends it, or queues it again, once the runner is lost), or else that the
 /// owner is away (`why`): nothing reachable knows how the job is, and the client asks again.
-/// None for anything else.
+/// A report lists a job only as its owner (queued) or its runner (starting, running) says
+/// ([`views::received`]): no other member's word ends a `wait`. None for anything else.
 fn no_news(c: &Cluster, req: &Request, why: &str) -> Option<Response> {
     match req {
         Request::Logs {

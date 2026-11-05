@@ -5327,3 +5327,51 @@ fn a_workspace_is_kept_only_by_its_owners_report_of_a_job_pinned_to_it() {
     assert_eq!(pending(&b), 0, "{}", b.daemon_log());
     mesh.stop();
 }
+
+/// While a job's owner is away, `wait` elsewhere takes the job's record only from its owner's
+/// or its runner's report: c, saying a's failed job succeeded (queued there, or running there),
+/// doesn't end a `wait` on b, which waits for a.
+#[test]
+fn a_wait_while_the_owner_is_away_takes_no_third_members_word() {
+    let w = World::new();
+    let mut a = w.node("a").start();
+    let b = w.node("b").down_after(30_000).start();
+    let mut c = w.node("c").start();
+    pair(&a, &b);
+    pair(&a, &c);
+    wait_until("b and c see each other", || {
+        b.node_alive("c") && c.node_alive("b")
+    });
+    let j = a.dispatch(&["--on", "node=a", "--", "false"]);
+    assert_eq!(a.done(&j).state, JobState::Failed);
+    wait_until("b has a's report without the job", || {
+        b.cli_ok(&["status"])["running"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    });
+    let mut report = report_to(&b, "c");
+    let mut rec = a.get(&j);
+    rec.state = JobState::Succeeded;
+    rec.exit_code = Some(0);
+    let mut there = rec.clone();
+    there.node = Some("c".into());
+    report["queue"] = serde_json::json!([rec]);
+    report["running"] = serde_json::json!([there]);
+    report["seq"] = 0.into();
+    c.stop();
+    a.stop();
+    let mesh = client_mesh(&c);
+    let r = mesh
+        .call("b", serde_json::json!({"op": "push", "report": report}))
+        .unwrap();
+    assert_eq!(r["kind"], "ok", "{r}");
+    let o = b.cli(&["wait", "-q", &j, "--max-wait", "2s"]);
+    mesh.stop();
+    assert_eq!(o.code, 2, "{}\nB:\n{}", o.json, b.daemon_log());
+    let error = o.json["error"].as_str().unwrap_or_default();
+    assert!(
+        error.starts_with(&format!("can't reach a, the machine job {j} belongs to")),
+        "{error}"
+    );
+}

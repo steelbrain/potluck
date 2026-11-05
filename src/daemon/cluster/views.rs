@@ -173,12 +173,16 @@ pub(super) fn received(sh: &Shared, c: &Cluster, from: &str, mut report: Machine
 }
 
 /// What a report from `from` says for its own machine, the rest dropped: its queue holds only its
-/// own queued jobs. Another machine's job there (no report of a member's holds one) would keep
-/// this machine's workspaces it is pinned to from removal.
+/// own queued jobs, and what runs there only jobs starting or running there. Anything else (no
+/// report of a member's holds it) would keep this machine's workspaces a job is pinned to from
+/// removal, or answer a `wait` while the job's owner is away.
 fn own_entries(from: &str, report: &mut MachineReport) {
     report
         .queue
         .retain(|j| owner_of(&j.id) == from && j.state == JobState::Queued);
+    report.running.retain(|j| {
+        j.node.as_deref() == Some(from) && matches!(j.state, JobState::Starting | JobState::Running)
+    });
 }
 
 /// A pull found the report held from `from` still current: it takes the numbers of the one `from`
