@@ -2215,6 +2215,7 @@ mod tests {
 
         fn git(args: &[&str]) -> String {
             let out = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid"])
                 .args(args)
                 .output()
                 .unwrap();
