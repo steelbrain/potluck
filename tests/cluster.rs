@@ -880,8 +880,6 @@ fn wait_until(what: &str, mut f: impl FnMut() -> bool) {
     }
 }
 
-/// Pairs `new` into `member`'s cluster through the CLI: `pair`, `admit`, `pair --finish`.
-
 /// The version test nodes run unless a test gives another: not this build's, so a test that
 /// compares versions doesn't change meaning when Cargo.toml's does.
 const TEST_VERSION: &str = "0.1.0";
@@ -894,6 +892,7 @@ fn client_mesh(node: &Node) -> potluck::mesh::Mesh {
     potluck::mesh::Mesh::connect_only(cfg).unwrap()
 }
 
+/// Pairs `new` into `member`'s cluster through the CLI: `pair`, `admit`, `pair --finish`.
 fn pair(member: &Node, new: &Node) {
     let request = new.cli_ok(&["pair"])["text"].as_str().unwrap().to_string();
     let reply = member.cli_ok(&["admit", &request])["text"]
