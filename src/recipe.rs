@@ -16,6 +16,7 @@
 //! on = { os = "linux" }
 //! hold = "30m"
 //! keep = ["target/nextest/default/junit.xml"]
+//! without_submodules = ["vendor/qemu/roms/*"]
 //! env = { SOME_VAR = "1" }
 //! ```
 //!
@@ -80,6 +81,9 @@ pub struct Recipe {
     pub hold: Option<String>,
     #[serde(default)]
     pub keep: Vec<String>,
+    /// Submodules to leave out, as `--without-submodule` takes them.
+    #[serde(default)]
+    pub without_submodules: Vec<String>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
 }
@@ -234,6 +238,7 @@ pub struct Resolved {
     pub on: BTreeMap<String, String>,
     pub hold_ms: Option<u64>,
     pub keep: Vec<String>,
+    pub without_submodules: Vec<String>,
     pub labels: BTreeMap<String, String>,
 }
 
@@ -343,6 +348,12 @@ pub fn resolve(file: &ProjectFile, args: &DispatchArgs) -> anyhow::Result<Resolv
         args.keep.clone()
     };
 
+    let without_submodules = if args.without_submodule.is_empty() {
+        recipe.without_submodules.clone()
+    } else {
+        args.without_submodule.clone()
+    };
+
     let mut labels = BTreeMap::new();
     for kv in &args.labels {
         let (k, v) = parse_kv(kv, "--label")?;
@@ -359,6 +370,7 @@ pub fn resolve(file: &ProjectFile, args: &DispatchArgs) -> anyhow::Result<Resolv
         on,
         hold_ms,
         keep,
+        without_submodules,
         labels,
     })
 }

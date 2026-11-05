@@ -346,6 +346,85 @@ fn submodule_ids_shared_across_worktrees() {
     assert_eq!(main.id, agent.id);
 }
 
+/// Submodules a dispatch leaves out: neither checked nor listed, what is nested in them with
+/// them, their changes not counted; a pattern that matches none is refused.
+#[test]
+fn inspect_leaves_out_submodules() {
+    let t = tmp();
+    let (app, _lib, _inner) = submodule_fixture(t.path());
+    let without = |patterns: &[&str]| {
+        let patterns: Vec<String> = patterns.iter().map(|p| p.to_string()).collect();
+        move |_: &str| Ok(patterns.clone())
+    };
+    let paths = |i: &gitinfo::Inspected| -> Vec<String> {
+        i.repo.submodules.iter().map(|s| s.path.clone()).collect()
+    };
+
+    // A clone whose submodules aren't checked out is refused, unless they are left out.
+    let clone = t.path().join("clone");
+    git(
+        t.path(),
+        &[
+            "clone",
+            "-q",
+            app.to_str().unwrap(),
+            clone.to_str().unwrap(),
+        ],
+    );
+    let e = format!("{:#}", gitinfo::inspect(&clone).unwrap_err());
+    assert!(
+        e.contains("submodule vendor/lib: not checked out")
+            && e.contains("--without-submodule vendor/lib"),
+        "{e}"
+    );
+    let i = gitinfo::inspect_without(&clone, &mut without(&["vendor/lib"])).unwrap();
+    assert!(i.repo.submodules.is_empty());
+    assert_eq!(i.left_out, ["vendor/lib"]);
+    // A pattern inside one left out counts as matched: it goes with its parent.
+    let i = gitinfo::inspect_without(&clone, &mut without(&["vendor/lib/", "vendor/lib/inner"]))
+        .unwrap();
+    assert_eq!(i.left_out, ["vendor/lib"]);
+
+    // A nested one, by glob, under a parent that ships; `*` doesn't cross a `/`.
+    let i = gitinfo::inspect_without(&app, &mut without(&["vendor/lib/*"])).unwrap();
+    assert_eq!(paths(&i), ["vendor/lib"]);
+    assert_eq!(i.left_out, ["vendor/lib/inner"]);
+    let i = gitinfo::inspect_without(&app, &mut without(&["vendor/*"])).unwrap();
+    assert!(i.repo.submodules.is_empty());
+    assert_eq!(i.left_out, ["vendor/lib"]);
+
+    // Changes in what is left out don't count, nor does it being at another commit.
+    write(&app, "vendor/lib/inner/inner.txt", "changed\n");
+    assert!(gitinfo::inspect(&app).is_err());
+    gitinfo::inspect_without(&app, &mut without(&["vendor/lib/inner"])).unwrap();
+    git(
+        &app.join("vendor/lib/inner"),
+        &["checkout", "--", "inner.txt"],
+    );
+    let lib_dir = app.join("vendor/lib");
+    write(&lib_dir, "lib.c", "int lib = 3;\n");
+    commit(&lib_dir, "lib 3", 1_700_000_200);
+    assert!(gitinfo::inspect(&app).is_err());
+    let i = gitinfo::inspect_without(&app, &mut without(&["vendor/lib"])).unwrap();
+    assert!(i.repo.submodules.is_empty());
+
+    // A typo is refused, naming the submodules the commit has.
+    let e = format!(
+        "{:#}",
+        gitinfo::inspect_without(&app, &mut without(&["vendor/lib", "vendor/lbi"])).unwrap_err()
+    );
+    assert!(
+        e.contains("\"vendor/lbi\" matches no submodule of commit")
+            && e.contains("it has vendor/lib"),
+        "{e}"
+    );
+    let e = format!(
+        "{:#}",
+        gitinfo::inspect_without(&app, &mut without(&["["])).unwrap_err()
+    );
+    assert!(e.contains("leaving out submodules: \"[\""), "{e}");
+}
+
 #[test]
 fn inspect_submodules_nested() {
     let t = tmp();

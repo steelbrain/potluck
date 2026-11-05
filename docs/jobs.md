@@ -18,6 +18,21 @@ would store it differently (a CRLF file committed before `*.txt text` was added,
 refused when it holds the committed bytes or what a checkout writes for them. Its workspaces
 hold what a checkout writes, and `git status` there shows it modified too.
 
+`--without-submodule PATTERN`, repeatable, leaves out the submodules a job doesn't need. PATTERN
+is a submodule's path from the top of the repository, or a glob on such paths in which `*`
+doesn't cross a `/`. A submodule left out, and every submodule nested in it, is neither checked
+at dispatch nor copied to the machine that runs the job: its directory in the workspace is
+empty, and its uncommitted changes, or its being at another commit than recorded, don't count.
+`dispatch` names what it left out on stderr (with `--json`, `without_submodules`). A pattern that
+matches no submodule of the commit is refused, so a typo can't ship what it meant to leave out;
+one that names a submodule inside another left out counts as matched.
+
+```console
+$ potluck dispatch --timeout 30m --without-submodule vendor/qemu -- cargo test
+job studio-9
+potluck: left out 1 submodule and what is nested in it: vendor/qemu
+```
+
 A dispatch that no machine could run is refused at once, with each machine's reason, and nothing
 is queued. Only machines that are up count; capable machines that aren't up are named in the
 refusal. A member on another potluck version that answers counts as up: one of the two is
@@ -230,10 +245,11 @@ with 124. A process that left the group (with `setsid`, for example) is not stop
 with the job, as do processes the command leaves running when it exits. Its environment is the job's
 with the request's env on top, except potluck's own variables, which stay the job's. A request that
 doesn't fit fails at once with exit code 2, and so does one with `--keep`, `--hold`, `--key`,
-`--label`, `--no-rerun` or `--kill-on-stall`, which only mean something for a job of its own; a
-recipe's `keep` and `hold` are left out, and `dispatch` says so. It never waits for the job's own
-resources, so a job can't deadlock on itself; for the same reason `potluck wait` and
-`potluck logs -f` of the job's own id fail at once inside it, with exit code 2. The job runs the
+`--label`, `--no-rerun`, `--kill-on-stall` or `--without-submodule`, which only mean something for
+a job of its own; a recipe's `keep`, `hold` and `without_submodules` are left out, and `dispatch`
+says so. It never waits for the job's own resources, so a job can't deadlock on itself; for the
+same reason `potluck wait` and `potluck logs -f` of the job's own id fail at once inside it, with
+exit code 2. The job runs the
 `potluck` its `PATH` finds, and that `PATH` comes from the login environment, so potluck's directory
 must be on the `PATH` a login shell sets; otherwise the job's shell says
 `potluck: command not found` and exits 127. From a job holding 4 GiB:
@@ -274,7 +290,7 @@ $ potluck dispatch gpu-tests --timeout 1h -- cargo test --features gpu -- render
 ```
 
 A recipe's fields are `cmd` (required), `timeout`, `priority`, `ram`, `cpu`, `gpu`, `exclusive`,
-`on`, `hold`, `keep` and `env`. Unknown fields are refused, so a misspelled option can't be dropped
+`on`, `hold`, `keep`, `without_submodules` (a list of `--without-submodule` patterns) and `env`. Unknown fields are refused, so a misspelled option can't be dropped
 silently. `on` is a table, as above, or a list in `--on`'s form: `on = ["macos=27", "gpu=apple"]`.
 Options on the command line replace the recipe's; `on` and `env` merge key by key, the command line
 last, with `os`, `macos` and `linux` counting as one key, so `--on macos` replaces a recipe's

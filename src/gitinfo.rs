@@ -16,6 +16,9 @@
 //!   worktree) and must be checked out at the recorded commit. Its repository id comes from the
 //!   top repository's id and its path ([`submodule_repo_id`]), not from its git dir, so every
 //!   worktree of the superproject shares one mirror per submodule on each machine.
+//! - A dispatch can leave submodules out ([`inspect_without`]): patterns on the full path from
+//!   the top. One left out, and everything nested in it, is neither checked nor listed, so the
+//!   job's workspace doesn't have it, and its uncommitted changes don't count.
 //!
 //! Git is driven through the `git` command line. Every git potluck runs drops the environment
 //! variables that would point it at another repository, index or object store
@@ -111,8 +114,29 @@ pub(crate) fn describe(cmd: &Command) -> String {
     s
 }
 
+/// What a dispatch reads of the caller's repository ([`inspect_without`]).
+#[derive(Clone, Debug)]
+pub struct Inspected {
+    pub repo: RepoRef,
+    /// The submodules left out, by their full paths from the top, parents before what is nested
+    /// in them.
+    pub left_out: Vec<String>,
+}
+
 /// Inspects the repository containing `cwd`.
 pub fn inspect(cwd: &Path) -> anyhow::Result<RepoRef> {
+    inspect_without(cwd, &mut |_| Ok(Vec::new())).map(|i| i.repo)
+}
+
+/// [`inspect`], leaving out the submodules that `without` names for the commit (called once,
+/// with HEAD's commit, before any submodule is read): patterns ([`glob::Pattern`], where `*`
+/// doesn't cross a `/`) on the full path from the top, such as `vendor/qemu` or
+/// `vendor/qemu/roms/*`. A pattern that matches no submodule of the commit is refused, unless it
+/// names one inside a submodule left out or not looked into.
+pub fn inspect_without(
+    cwd: &Path,
+    without: &mut dyn FnMut(&str) -> anyhow::Result<Vec<String>>,
+) -> anyhow::Result<Inspected> {
     let out = git_text(
         cwd,
         [
@@ -143,11 +167,23 @@ pub fn inspect(cwd: &Path) -> anyhow::Result<RepoRef> {
         .and_then(|r| r.strip_prefix("refs/heads/").map(str::to_string))
         .filter(|b| !b.is_empty());
 
+    let mut skip = Skip::new(&without(&commit)?)?;
     let mut problems = Vec::new();
     dirty_paths(&top, "", &mut problems)?;
     let mut submodules = Vec::new();
     let id = repo_id(&common);
-    collect_submodules(&top, &commit, &id, "", &mut submodules, &mut problems)?;
+    collect_submodules(
+        &top,
+        &commit,
+        &id,
+        "",
+        &mut submodules,
+        &mut problems,
+        &mut skip,
+    )?;
+    // What is left out doesn't count: a submodule left out at another commit than recorded
+    // shows as modified in its parent's status.
+    problems.retain(|p| p.get(3..).is_none_or(|path| !skip.covers(path)));
     if !problems.is_empty() {
         let shown = problems.len().min(MAX_LISTED);
         let mut msg = format!(
@@ -168,13 +204,124 @@ pub fn inspect(cwd: &Path) -> anyhow::Result<RepoRef> {
         );
         bail!(msg);
     }
-    Ok(RepoRef {
-        id,
-        source: common,
-        commit,
-        branch,
-        submodules,
+    skip.all_matched(&commit)?;
+    Ok(Inspected {
+        repo: RepoRef {
+            id,
+            source: common,
+            commit,
+            branch,
+            submodules,
+        },
+        left_out: skip.left_out,
     })
+}
+
+/// The submodules a dispatch leaves out, and what [`collect_submodules`] saw of them.
+struct Skip {
+    /// Each pattern as given, parsed, and whether a submodule matched it.
+    patterns: Vec<(String, glob::Pattern, bool)>,
+    left_out: Vec<String>,
+    /// Submodules not looked into (not checked out, or at another commit): what is nested in
+    /// them can't be matched.
+    unread: Vec<String>,
+    seen: Vec<String>,
+}
+
+impl Skip {
+    fn new(patterns: &[String]) -> anyhow::Result<Skip> {
+        let mut parsed = Vec::new();
+        for raw in patterns {
+            let p = raw.trim_end_matches('/');
+            if p.is_empty() {
+                bail!("leaving out submodules: {raw:?} names no path");
+            }
+            let pattern = glob::Pattern::new(p)
+                .map_err(|e| anyhow::anyhow!("leaving out submodules: {raw:?}: {e}"))?;
+            parsed.push((p.to_string(), pattern, false));
+        }
+        Ok(Skip {
+            patterns: parsed,
+            left_out: Vec::new(),
+            unread: Vec::new(),
+            seen: Vec::new(),
+        })
+    }
+
+    /// Whether the submodule at `full` is left out (noting which patterns matched it).
+    fn leaves_out(&mut self, full: &str) -> bool {
+        self.seen.push(full.to_string());
+        let opts = glob::MatchOptions {
+            require_literal_separator: true,
+            ..Default::default()
+        };
+        let mut hit = false;
+        for (_, pattern, matched) in &mut self.patterns {
+            if pattern.matches_with(full, opts) {
+                *matched = true;
+                hit = true;
+            }
+        }
+        if hit {
+            self.left_out.push(full.to_string());
+        }
+        hit
+    }
+
+    /// Whether `path` is a submodule left out or inside one.
+    fn covers(&self, path: &str) -> bool {
+        self.left_out.iter().any(|l| {
+            path == l
+                || path
+                    .strip_prefix(l.as_str())
+                    .is_some_and(|r| r.starts_with('/'))
+        })
+    }
+
+    /// Refuses a pattern that matched no submodule: a typo would ship what it meant to leave out.
+    fn all_matched(&self, commit: &str) -> anyhow::Result<()> {
+        let inside = |p: &str, dirs: &[String]| {
+            dirs.iter().any(|d| {
+                p.strip_prefix(d.as_str())
+                    .is_some_and(|r| r.starts_with('/'))
+            })
+        };
+        let unmatched: Vec<&str> = self
+            .patterns
+            .iter()
+            .filter(|(p, _, matched)| {
+                !matched && !inside(p, &self.left_out) && !inside(p, &self.unread)
+            })
+            .map(|(p, _, _)| p.as_str())
+            .collect();
+        if unmatched.is_empty() {
+            return Ok(());
+        }
+        let known = if self.seen.is_empty() {
+            "it has none".to_string()
+        } else {
+            let shown = self.seen.len().min(MAX_LISTED);
+            let mut s = format!("it has {}", self.seen[..shown].join(", "));
+            if self.seen.len() > shown {
+                s.push_str(&format!(" and {} more", self.seen.len() - shown));
+            }
+            s
+        };
+        bail!(
+            "leaving out submodules: {} {} no submodule of commit {} ({known})",
+            unmatched
+                .iter()
+                .map(|p| format!("{p:?}"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            if unmatched.len() == 1 {
+                "matches"
+            } else {
+                "match"
+            },
+            short(commit)
+        )
+    }
 }
 
 /// The repository id for a common git dir: [`crate::types::repo_id`], shared with the client's
@@ -265,15 +412,22 @@ fn collect_submodules(
     prefix: &str,
     subs: &mut Vec<SubmoduleRef>,
     problems: &mut Vec<String>,
+    skip: &mut Skip,
 ) -> anyhow::Result<()> {
     for (path, sha) in gitlinks(dir, commit)? {
         let full = format!("{prefix}{path}");
+        if skip.leaves_out(&full) {
+            continue;
+        }
         let sub_dir = dir.join(&path);
         let not_checked_out = || {
-            format!("submodule {full}: not checked out (git submodule update --init --recursive)")
+            format!(
+                "submodule {full}: not checked out (git submodule update --init --recursive, or leave it out with --without-submodule {full})"
+            )
         };
         if sub_dir.join(".git").symlink_metadata().is_err() {
             problems.push(not_checked_out());
+            skip.unread.push(full.clone());
             continue;
         }
         let out = git_text(
@@ -288,11 +442,13 @@ fn collect_submodules(
         );
         let Ok(out) = out else {
             problems.push(not_checked_out());
+            skip.unread.push(full.clone());
             continue;
         };
         let lines: Vec<&str> = out.lines().collect();
         if lines.len() < 3 || canonical(Path::new(lines[0]))? != canonical(&sub_dir)? {
             problems.push(not_checked_out());
+            skip.unread.push(full.clone());
             continue;
         }
         let common = canonical(Path::new(lines[1]))?;
@@ -304,6 +460,7 @@ fn collect_submodules(
                 short(head),
                 short(&sha)
             ));
+            skip.unread.push(full.clone());
             continue;
         }
         let sub_prefix = format!("{full}/");
@@ -314,7 +471,7 @@ fn collect_submodules(
             source: common,
             commit: sha.clone(),
         });
-        collect_submodules(&sub_dir, &sha, top_id, &sub_prefix, subs, problems)?;
+        collect_submodules(&sub_dir, &sha, top_id, &sub_prefix, subs, problems, skip)?;
     }
     Ok(())
 }

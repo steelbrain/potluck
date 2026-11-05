@@ -205,6 +205,11 @@ pub struct DispatchArgs {
     /// Files to copy back here when the job ends, as globs relative to the workspace. Repeatable.
     #[arg(long = "keep", value_name = "GLOB")]
     pub keep: Vec<String>,
+    /// Leave out the submodules matching PATTERN, a path from the top or a glob
+    /// (`vendor/qemu/roms/*`), and everything nested in them: not checked here, not in the job's
+    /// workspace. Repeatable; replaces the recipe's `without_submodules`.
+    #[arg(long = "without-submodule", value_name = "PATTERN")]
+    pub without_submodule: Vec<String>,
     /// Makes the dispatch idempotent: a key that exists returns that job.
     #[arg(long)]
     pub key: Option<String>,
@@ -233,7 +238,7 @@ pub use output::{JsonText, Report, fmt_bytes, fmt_mib, table};
 use crate::client::Client;
 use crate::config::Paths;
 use crate::proto::{Request as Req, Response};
-use crate::types::{JobRecord, RepoRef, now_ms, parse_duration_ms};
+use crate::types::{JobRecord, now_ms, parse_duration_ms};
 use serde_json::{Value, json};
 use std::ffi::OsString;
 use std::io::Write;
@@ -273,8 +278,16 @@ pub struct Env {
     pub job: Option<String>,
     pub lease: Option<String>,
     pub workspace: Option<String>,
-    pub inspect: fn(&Path) -> anyhow::Result<RepoRef>,
+    /// [`crate::gitinfo::inspect_without`], or a stand-in in tests.
+    pub inspect: Inspect,
 }
+
+/// Reads the caller's repository for a dispatch: the second argument gets the commit and returns
+/// the patterns of submodules to leave out.
+pub type Inspect = fn(
+    &Path,
+    &mut dyn FnMut(&str) -> anyhow::Result<Vec<String>>,
+) -> anyhow::Result<crate::gitinfo::Inspected>;
 
 impl Env {
     pub fn from_process() -> anyhow::Result<Env> {
@@ -287,7 +300,7 @@ impl Env {
             job: var("POTLUCK_JOB"),
             lease: var("POTLUCK_LEASE"),
             workspace: var("POTLUCK_WORKSPACE"),
-            inspect: crate::gitinfo::inspect,
+            inspect: crate::gitinfo::inspect_without,
         })
     }
 }
@@ -642,17 +655,27 @@ impl Cx<'_> {
         if let (Some(job), Some(lease)) = (self.env.job.clone(), self.env.lease.clone()) {
             return self.dispatch_nested(&args, &job, &lease);
         }
-        let repo = (self.env.inspect)(&self.env.cwd)?;
-        let file = match crate::recipe::load_at_commit(&self.env.cwd, &repo.commit)? {
-            Some(f) => f,
-            None if args.recipe.is_some() => anyhow::bail!(
-                "commit {} has no {}: recipes come from the committed file",
-                crate::gitinfo::short(&repo.commit),
-                crate::recipe::FILE_NAME
-            ),
-            None => Default::default(),
-        };
-        let r = crate::recipe::resolve(&file, &args)?;
+        // The recipe comes from the commit, and says which submodules to leave out before they
+        // are read.
+        let (inspect, cwd) = (self.env.inspect, self.env.cwd.clone());
+        let mut resolved = None;
+        let inspected = inspect(&cwd, &mut |commit| {
+            let file = match crate::recipe::load_at_commit(&cwd, commit)? {
+                Some(f) => f,
+                None if args.recipe.is_some() => anyhow::bail!(
+                    "commit {} has no {}: recipes come from the committed file",
+                    crate::gitinfo::short(commit),
+                    crate::recipe::FILE_NAME
+                ),
+                None => Default::default(),
+            };
+            let r = crate::recipe::resolve(&file, &args)?;
+            let without = r.without_submodules.clone();
+            resolved = Some(r);
+            Ok(without)
+        })?;
+        let r = resolved.ok_or_else(|| anyhow::anyhow!("the dispatch's recipe wasn't read"))?;
+        let (repo, left_out) = (inspected.repo, inspected.left_out);
         let spec = crate::types::JobSpec {
             key: args.key.clone(),
             labels: r.labels,
@@ -700,17 +723,35 @@ impl Cx<'_> {
                 state.map(|s| format!(", {s}")).unwrap_or_default()
             ));
         }
-        Ok(Report::new(
-            json!({
-                "job": job,
-                "existing": existing,
-                "workspace": workspace,
-                "state": state,
-                "commit": spec.repo.commit,
-                "branch": spec.repo.branch,
-            }),
-            human,
-        ))
+        let note = if left_out.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "left out {} and what is nested in {}: {}",
+                if left_out.len() == 1 {
+                    "1 submodule".to_string()
+                } else {
+                    format!("{} submodules", left_out.len())
+                },
+                if left_out.len() == 1 { "it" } else { "them" },
+                left_out.join(", ")
+            )
+        };
+        Ok(Report {
+            note,
+            ..Report::new(
+                json!({
+                    "job": job,
+                    "existing": existing,
+                    "workspace": workspace,
+                    "state": state,
+                    "commit": spec.repo.commit,
+                    "branch": spec.repo.branch,
+                    "without_submodules": left_out,
+                }),
+                human,
+            )
+        })
     }
 
     fn dispatch_nested(

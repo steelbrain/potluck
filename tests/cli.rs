@@ -50,19 +50,28 @@ fn repo_with(toml: &str) -> tempfile::TempDir {
 }
 
 /// Stands in for gitinfo::inspect (another part's work): HEAD of the repository, no checks.
-fn fake_inspect(cwd: &Path) -> anyhow::Result<RepoRef> {
+fn fake_inspect(
+    cwd: &Path,
+    without: &mut dyn FnMut(&str) -> anyhow::Result<Vec<String>>,
+) -> anyhow::Result<potluck::gitinfo::Inspected> {
     let common = PathBuf::from(git(cwd, &["rev-parse", "--git-common-dir"]));
     let common = if common.is_absolute() {
         common
     } else {
         cwd.join(common)
     };
-    Ok(RepoRef {
-        id: potluck::types::repo_id(&common),
-        source: common,
-        commit: git(cwd, &["rev-parse", "HEAD"]),
-        branch: Some(git(cwd, &["symbolic-ref", "--short", "HEAD"])),
-        submodules: vec![],
+    let commit = git(cwd, &["rev-parse", "HEAD"]);
+    // Here every pattern names one submodule, left out (gitinfo's own tests match them).
+    let left_out = without(&commit)?;
+    Ok(potluck::gitinfo::Inspected {
+        repo: RepoRef {
+            id: potluck::types::repo_id(&common),
+            source: common,
+            commit,
+            branch: Some(git(cwd, &["symbolic-ref", "--short", "HEAD"])),
+            submodules: vec![],
+        },
+        left_out,
     })
 }
 
@@ -282,6 +291,47 @@ fn dispatch_from_a_subdirectory_reads_the_top_level_potluck_toml() {
     );
     assert_eq!(out.code, 0, "{}", out.stderr);
     assert_eq!(dispatched_spec(&fake).cmd, ["true"]);
+}
+
+/// The submodules to leave out come from the recipe of the commit, or from the flags, which
+/// replace them; dispatch says which were left out, and so does its JSON.
+#[test]
+fn dispatch_leaves_out_the_submodules_the_recipe_or_the_flags_name() {
+    let fake = dispatch_daemon();
+    let repo = repo_with(
+        "[recipe.boot]\ncmd = [\"true\"]\ntimeout = \"5m\"\nwithout_submodules = [\"vendor/qemu/roms/*\"]\n",
+    );
+    let env = env_for(&fake, repo.path());
+    let out = run_in(&env, &["dispatch", "boot"]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert!(
+        out.stderr
+            .contains("potluck: left out 1 submodule and what is nested in it: vendor/qemu/roms/*"),
+        "{}",
+        out.stderr
+    );
+    let out = run_in(
+        &env,
+        &[
+            "--json",
+            "dispatch",
+            "boot",
+            "--without-submodule",
+            "vendor/qemu",
+            "--without-submodule",
+            "third_party/x",
+        ],
+    );
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let v: serde_json::Value = serde_json::from_str(&out.stdout).unwrap();
+    assert_eq!(
+        v["without_submodules"],
+        serde_json::json!(["vendor/qemu", "third_party/x"])
+    );
+    // None left out: nothing said.
+    let out = run_in(&env, &["dispatch", "--timeout", "1m", "--", "true"]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert!(!out.stderr.contains("left out"), "{}", out.stderr);
 }
 
 #[test]
@@ -2065,6 +2115,10 @@ fn nested_dispatch_refuses_options_it_cannot_honour() {
         (
             &["--kill-on-stall"][..],
             "job studio-9's own dispatch decides",
+        ),
+        (
+            &["--without-submodule", "vendor/x"][..],
+            "with the submodules that job's dispatch shipped",
         ),
     ] {
         let mut args = vec!["dispatch", "--timeout", "1m"];
