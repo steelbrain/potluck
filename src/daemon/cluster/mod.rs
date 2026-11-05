@@ -1063,9 +1063,14 @@ fn handle_call(
             PeerResponse::Ok
         }
         // Removed ones too, while their records are kept: the asker tells "gone" from "never
-        // there".
+        // there". Only what a dispatch into it checks.
         PeerRequest::Workspace { workspace } => PeerResponse::Workspace {
-            workspace: sh.lock().workspaces.get(&workspace).cloned().map(Box::new),
+            workspace: sh
+                .lock()
+                .workspaces
+                .get(&workspace)
+                .map(views::for_dispatch)
+                .map(Box::new),
         },
     })
 }

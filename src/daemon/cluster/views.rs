@@ -9,7 +9,9 @@ use crate::daemon::state::{MachineSnap, State};
 use crate::mesh::Member;
 use crate::proto::{NodeView, Response, StatusView};
 use crate::sched::{MachineView, Queued, Running};
-use crate::types::{Facts, JobId, JobRecord, JobState, Millis, NodeName, RepoRef, WorkspaceRecord};
+use crate::types::{
+    Facts, JobId, JobRecord, JobState, Millis, NodeName, RepoRef, WorkspaceRecord, WorkspaceState,
+};
 use crate::why::Snapshot;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -131,6 +133,29 @@ fn no_sources(repo: &mut RepoRef) {
     }
     for c in &mut repo.carried {
         c.source = PathBuf::new();
+    }
+}
+
+/// What a member asking for one of this machine's workspaces gets ([`PeerRequest::Workspace`]):
+/// what a dispatch into it checks, its repository, commit and state; of a removed one only that
+/// it is gone. No path, branch, hold, size or times.
+pub(super) fn for_dispatch(w: &WorkspaceRecord) -> WorkspaceRecord {
+    let live = w.state != WorkspaceState::Removed;
+    let kept = |v: &String| if live { v.clone() } else { String::new() };
+    WorkspaceRecord {
+        id: w.id.clone(),
+        node: w.node.clone(),
+        repo_id: kept(&w.repo_id),
+        commit: kept(&w.commit),
+        branch: None,
+        path: PathBuf::new(),
+        state: w.state,
+        created_at: 0,
+        last_used_at: 0,
+        held_until: 0,
+        pending: 0,
+        size_bytes: None,
+        advanced_by: None,
     }
 }
 

@@ -6158,3 +6158,45 @@ fn a_member_answers_a_relayed_request_only_about_its_own_jobs_and_workspaces() {
     }
     mesh.stop();
 }
+
+/// Asked for one of its workspaces (for a dispatch into it), a member tells another what the
+/// dispatch checks: the workspace's repository, commit and state, not its path, branch, hold or
+/// size; of a removed one, only that it is gone. A dispatch into it from the other works as before.
+#[test]
+fn a_workspace_asked_of_its_machine_comes_without_its_path() {
+    let w = World::new();
+    let a = w.node("a").start();
+    let b = w.node("b").start();
+    pair(&a, &b);
+    let first = a.dispatch(&["--on", "node=b", "--", "true"]);
+    let j = a.done(&first);
+    let ws = j.workspace.clone().unwrap();
+    let mesh = client_mesh(&a);
+    let ask = || {
+        mesh.call("b", serde_json::json!({"op": "workspace", "workspace": ws}))
+            .unwrap()["workspace"]
+            .clone()
+    };
+    let rec = ask();
+    assert_eq!(rec["id"], ws.as_str(), "{rec}");
+    assert_eq!(rec["state"], "held", "{rec}");
+    assert_eq!(rec["commit"], j.spec.repo.commit.as_str(), "{rec}");
+    assert_eq!(rec["repo_id"], j.spec.repo.id.as_str(), "{rec}");
+    assert_eq!(rec["path"], "", "{rec}");
+    assert!(rec["branch"].is_null(), "{rec}");
+    assert_eq!(rec["held_until"], 0, "{rec}");
+    let pinned = a.dispatch(&["--workspace", &ws, "--", "true"]);
+    assert_eq!(a.done(&pinned).state, JobState::Succeeded);
+    a.cli_ok(&["release", &ws]);
+    wait_until("b removed the workspace", || {
+        b.ws.removed.lock().unwrap().contains(&ws)
+    });
+    let rec = ask();
+    assert_eq!(rec["state"], "removed", "{rec}");
+    assert_eq!(
+        (&rec["commit"], &rec["repo_id"]),
+        (&"".into(), &"".into()),
+        "{rec}"
+    );
+    mesh.stop();
+}
