@@ -1925,7 +1925,6 @@ fn after_user_init_only_what_users_sign_admits_and_removes() {
     let out = a.cli_ok(&["user", "init", "--name", "owner"]);
     assert_eq!(out["user"], "owner", "{out}");
     assert_eq!(out["members"], serde_json::json!(["a", "b", "c"]), "{out}");
-    assert_eq!(out["signed_jobs"], serde_json::json!([]), "{out}");
     assert!(out["warning"].is_null(), "a founded the cluster: {out}");
     assert_eq!(
         std::path::PathBuf::from(out["file"].as_str().unwrap()),
@@ -1959,18 +1958,18 @@ fn after_user_init_only_what_users_sign_admits_and_removes() {
     assert_eq!(users["users"][0]["name"], "owner", "{users}");
     assert_eq!(users["users"][0]["this_cli"], true, "{users}");
     assert_eq!(b.cli_ok(&["user", "list"])["users"][0]["this_cli"], false);
-    // Again, with the user's key: no records, nothing left to sign. A key that is no user's (b's
-    // command line has none) is refused.
-    let again = a.cli_ok(&["user", "init"]);
-    assert_eq!(again["user"], "owner", "{again}");
-    assert_eq!(again["signed_jobs"], serde_json::json!([]), "{again}");
-    assert!(again["members"].is_null(), "{again}");
-    let refused = b.cli(&["user", "init"]);
-    assert!(
-        refused.code == 2 && error_of(&refused).contains("has users already (owner)"),
-        "{}",
-        refused.stdout
-    );
+    // Again, with the user's key or with none (b's command line has none): refused.
+    for n in [&a, &b] {
+        let refused = n.cli(&["user", "init"]);
+        assert!(
+            refused.code == 2
+                && error_of(&refused)
+                    == "this cluster has users already (owner); `potluck user add NAME KEY` adds another",
+            "{}: {}",
+            n.name,
+            refused.stdout
+        );
+    }
     assert!(!b.dir.join("user.key").exists());
 
     // d joins in pool cloud, admitted with the user's key.
@@ -5875,24 +5874,18 @@ fn after_user_init_jobs_are_signed_and_checked_where_they_run() {
 }
 
 /// Two jobs a dispatched before `user init`, unsigned, that only b runs: one running on b, one
-/// queued behind it. `user init` on a signs both, each as a holds it (its ids salted already), and
-/// says so; b then claims and runs the queued one, its grant checked. Nothing is left to sign, and
-/// the request that signs is answered only on the machine itself.
+/// queued behind it. `user init` on a signs neither and says nothing of them; the queued one stays
+/// queued on a once b is free, unsigned: b never claims it.
 #[test]
-fn user_init_signs_the_jobs_queued_before_it() {
-    use potluck::proto::{JobSignature, RequestAuth};
+fn user_init_signs_no_jobs_queued_before_it() {
     let w = World::new();
     let a = w.node("a").start();
     let b = w.node("b").start();
     pair(&a, &b);
     let busy = a.dispatch(&["--on", "node=b", "--exclusive", "--", "sleep", "60"]);
     a.running_on(&busy, "b");
-    let waits = a.dispatch(&["--on", "node=b", "--", "sh", "-c", "echo on $POTLUCK_NODE"]);
-    let before = a.get(&waits);
-    assert_eq!(before.state, JobState::Queued);
-    assert!(before.spec.auth.is_none());
-    assert!(potluck::types::is_owned_repo_id(&before.spec.repo.id));
-    // In words, how many; the daemon logs which.
+    let waits = a.dispatch(&["--on", "node=b", "--", "true"]);
+    assert_eq!(a.get(&waits).state, JobState::Queued);
     let out = Command::new(BIN)
         .args(["user", "init", "--name", "owner"])
         .current_dir(&a.repo)
@@ -5905,224 +5898,32 @@ fn user_init_signs_the_jobs_queued_before_it() {
         String::from_utf8_lossy(&out.stderr),
     );
     assert_eq!(
-        stdout,
-        "owner is the cluster's first user; signed in its members: a, b; signed 2 jobs a dispatched before it that haven't ended\n",
+        stdout, "owner is the cluster's first user; signed in its members: a, b\n",
         "{stderr}"
     );
-    assert!(!stderr.contains("not signed"), "{stderr}");
-    assert!(
-        a.daemon_log().contains(&format!(
-            "signed by a user, so other members may run them: {busy}, {waits}\n"
-        )),
-        "{}",
-        a.daemon_log()
+    assert_eq!(
+        stderr,
+        format!(
+            "potluck: made a user key at {}\n",
+            a.dir.join("user.key").display()
+        )
     );
     wait_until("b has the user", || trust_of(&b).users_exist());
-    let user = user_key(&a);
+    a.cli_ok(&["cancel", &busy]);
+    a.done(&busy);
+    std::thread::sleep(Duration::from_secs(2));
     for id in [&busy, &waits] {
-        let spec = a.get(id).spec;
-        let auth = spec.auth.clone().expect("signed");
-        assert_eq!(auth.key, user.public());
-        let unsigned = potluck::types::JobSpec { auth: None, ..spec };
-        assert_eq!(potluck::jobauth::open(&auth).unwrap(), unsigned, "{id}");
+        assert!(a.get(id).spec.auth.is_none(), "{id}");
     }
-    a.cli_ok(&["cancel", &busy]);
-    let j = a.done(&waits);
+    let j = a.get(&waits);
     assert_eq!(
         (j.state, j.node.as_deref()),
-        (JobState::Succeeded, Some("b")),
-        "{j:#?}\nA:\n{}\nB:\n{}",
-        a.daemon_log(),
-        b.daemon_log()
-    );
-    assert!(output_of(&a, &waits).contains("on b"));
-    assert!(!b.daemon_log().contains("WARNING"), "{}", b.daemon_log());
-    assert_eq!(b.stored(&waits).spec.auth, a.get(&waits).spec.auth);
-
-    // Nothing is left to sign.
-    match a.client().call(Request::UnsignedJobs) {
-        Ok(Response::Jobs { jobs }) => assert!(jobs.is_empty(), "{jobs:?}"),
-        other => panic!("{other:?}"),
-    }
-    // Asked over the mesh, by a member, with a user's signature: refused there.
-    let sign = Request::SignJobs {
-        jobs: vec![JobSignature {
-            job: waits.clone(),
-            auth: a.get(&waits).spec.auth.unwrap(),
-        }],
-    };
-    let mesh = client_mesh(&b);
-    for req in [Request::UnsignedJobs, sign] {
-        let e = refusal(relayed(
-            &mesh,
-            "a",
-            &req,
-            Some(RequestAuth::sign(&user, &req)),
-        ));
-        assert!(
-            e.contains("are not relayed between members"),
-            "{req:?}: {e}"
-        );
-    }
-    mesh.stop();
-}
-
-/// A first `user init` whose signing is cut short, its connection to the daemon dropping as it
-/// sends the second batch of signatures (64 a batch), makes the first user and signs the first
-/// 64 of the 65 jobs a dispatched before it, and says which one it didn't sign and why. `user
-/// init` again, with the user's key, makes no records and signs the one left; a third run finds
-/// none left. Every job is signed as a holds it, by the user.
-#[test]
-fn user_init_again_signs_the_jobs_a_first_run_left() {
-    let w = World::new();
-    let a = w.node("a").start();
-    let b = w.node("b").start();
-    pair(&a, &b);
-    let busy = a.dispatch(&["--on", "node=b", "--exclusive", "--", "sleep", "60"]);
-    a.running_on(&busy, "b");
-    let mut jobs = vec![busy.clone()];
-    for _ in 0..64 {
-        jobs.push(a.dispatch(&["--on", "node=b", "--", "true"]));
-    }
-    let last = jobs.last().unwrap().clone();
-    let cut = CutSocket::new(&a, "sign_jobs", 2);
-    let first = Command::new(BIN)
-        .args(["--json", "user", "init", "--name", "owner"])
-        .current_dir(&a.repo)
-        .env("POTLUCK_HOME", cut.home.path())
-        .env("POTLUCK_CONFIG", &a.paths.config)
-        .stdin(Stdio::null())
-        .output()
-        .unwrap();
-    let (stdout, stderr) = (
-        String::from_utf8_lossy(&first.stdout),
-        String::from_utf8_lossy(&first.stderr),
-    );
-    assert_eq!(first.status.code(), Some(0), "{stdout}\n{stderr}");
-    let doc: Value = serde_json::from_str(&stdout).unwrap();
-    assert_eq!(doc["user"], "owner", "{doc}");
-    assert_eq!(doc["members"], serde_json::json!(["a", "b"]), "{doc}");
-    let signed: Vec<&str> = doc["signed_jobs"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|j| j.as_str().unwrap())
-        .collect();
-    assert_eq!(signed, jobs[..64], "{doc}");
-    assert_eq!(
-        doc["jobs_not_signed"],
-        serde_json::json!({ last.clone(): "the daemon closed the connection" }),
-        "{doc}"
-    );
-    assert!(a.get(&last).spec.auth.is_none());
-    assert!(a.get(&jobs[63]).spec.auth.is_some());
-
-    let again = Command::new(BIN)
-        .args(["user", "init"])
-        .current_dir(&a.repo)
-        .env("POTLUCK_HOME", &a.paths.home)
-        .env("POTLUCK_CONFIG", &a.paths.config)
-        .stdin(Stdio::null())
-        .output()
-        .unwrap();
-    let (stdout, stderr) = (
-        String::from_utf8_lossy(&again.stdout),
-        String::from_utf8_lossy(&again.stderr),
-    );
-    assert_eq!(again.status.code(), Some(0), "{stdout}\n{stderr}");
-    assert_eq!(
-        stdout,
-        "owner is already a user of this cluster; signed 1 job a dispatched before the first user that hasn't ended\n",
-        "{stderr}"
-    );
-    assert_eq!(stderr, "");
-    let user = user_key(&a);
-    for id in &jobs {
-        let spec = a.get(id).spec;
-        let auth = spec
-            .auth
-            .clone()
-            .unwrap_or_else(|| panic!("{id} is unsigned"));
-        assert_eq!(auth.key, user.public(), "{id}");
-        let unsigned = potluck::types::JobSpec { auth: None, ..spec };
-        assert_eq!(potluck::jobauth::open(&auth).unwrap(), unsigned, "{id}");
-    }
-    let third = a.cli_ok(&["user", "init"]);
-    assert_eq!(
-        third,
-        serde_json::json!({
-            "user": "owner",
-            "key": user.public(),
-            "file": a.dir.join("user.key"),
-            "made": false,
-            "signed_jobs": [],
-            "jobs_not_signed": {},
-            "reminders": [],
-        })
-    );
-    // The last one runs on b as signed.
-    a.cli_ok(&["cancel", &busy]);
-    let j = a.done(&last);
-    assert_eq!(
-        (j.state, j.node.as_deref()),
-        (JobState::Succeeded, Some("b")),
+        (JobState::Queued, None),
         "{j:#?}"
     );
-    assert!(!b.daemon_log().contains("WARNING"), "{}", b.daemon_log());
-}
-
-/// A stand-in for `node`'s daemon socket, in a home of its own (`POTLUCK_HOME` for a command line
-/// that talks to `node`'s daemon through it): it passes each request on to the daemon and each
-/// answer back, and in place of the `nth` request whose op is `op` (counting across connections)
-/// it closes the connection, both ways, as a daemon restarting does.
-struct CutSocket {
-    home: tempfile::TempDir,
-}
-
-impl CutSocket {
-    fn new(node: &Node, op: &str, nth: usize) -> CutSocket {
-        use std::io::{BufRead, Write};
-        use std::net::Shutdown;
-        use std::os::unix::net::{UnixListener, UnixStream};
-        let home = tempfile::tempdir().unwrap();
-        let listener = UnixListener::bind(home.path().join("potluck.sock")).unwrap();
-        let (daemon, op) = (node.paths.socket(), op.to_string());
-        let seen = Arc::new(AtomicU64::new(0));
-        std::thread::spawn(move || {
-            for cli in listener.incoming() {
-                let Ok(cli) = cli else { return };
-                let Ok(mut up) = UnixStream::connect(&daemon) else {
-                    return;
-                };
-                let (mut answers, mut back) = (up.try_clone().unwrap(), cli.try_clone().unwrap());
-                std::thread::spawn(move || {
-                    let _ = std::io::copy(&mut answers, &mut back);
-                    let _ = back.shutdown(Shutdown::Both);
-                });
-                let (op, seen) = (op.clone(), seen.clone());
-                std::thread::spawn(move || {
-                    let mut requests = std::io::BufReader::new(cli);
-                    let mut line = String::new();
-                    while requests.read_line(&mut line).is_ok_and(|n| n > 0) {
-                        let req: Value = serde_json::from_str(&line).unwrap_or_default();
-                        if req["req"]["op"] == op.as_str()
-                            && seen.fetch_add(1, Ordering::SeqCst) + 1 == nth as u64
-                        {
-                            let _ = up.shutdown(Shutdown::Both);
-                            let _ = requests.get_ref().shutdown(Shutdown::Both);
-                            return;
-                        }
-                        if up.write_all(line.as_bytes()).is_err() {
-                            return;
-                        }
-                        line.clear();
-                    }
-                    let _ = up.shutdown(Shutdown::Write);
-                });
-            }
-        });
-        CutSocket { home }
-    }
+    assert!(b.exec.launch_of(&waits).is_none());
+    assert!(!b.daemon_log().contains(&waits), "{}", b.daemon_log());
+    a.cli_ok(&["cancel", &waits]);
 }
 
 /// A job runs only on machines in the pools its signed spec names, and `nodes` shows each

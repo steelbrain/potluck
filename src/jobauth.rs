@@ -9,9 +9,8 @@
 //! any version, and then compares the spec it was given with the one it derives from them
 //! ([`derived`]): the owner's salting of repository ids is the only change a machine makes.
 //!
-//! `potluck user init` signs the jobs its machine dispatched before the cluster had users, and
-//! hasn't ended, as that machine holds them: their ids salted already, which a runner takes as
-//! they are ([`derived`]).
+//! `potluck resize` signs a queued job as its owner holds it, with its new request: its ids
+//! salted already, which a runner takes as they are ([`derived`]).
 
 use crate::mesh::identity::{PublicKey, Signature, Signer};
 use crate::types::{JobSpec, Millis};
@@ -122,7 +121,7 @@ pub fn owned(owner: &str, spec: &JobSpec, pre_salting: bool) -> JobSpec {
 /// signed, `signed`: equal, field by field, to [`owned`] of `signed` with `signed`'s
 /// `submitted_from` as the owner. A spec pinned to a workspace whose repository id is the signed,
 /// unsalted one may be the [`owned`] form from before salting. A signed spec whose ids are salted
-/// already ([`salted_already`]: signed as its owner held it, by `potluck user init`) must be
+/// already ([`salted_already`]: signed as its owner held it, by `potluck resize`) must be
 /// `effective` itself, salted no second time: the user signed that very spec for that owner.
 pub fn derived(signed: &JobSpec, effective: &JobSpec) -> Result<(), String> {
     let effective = JobSpec {
@@ -607,7 +606,7 @@ mod tests {
         assert!(verify_grant(&kept, "studio", yes).is_err());
     }
 
-    /// `potluck user init` signs a job as its owner holds it, its ids salted already: a runner
+    /// `potluck resize` signs a job as its owner holds it, its ids salted already: a runner
     /// takes that spec as it is, and not salted a second time, nor unsalted. So too a job pinned to
     /// a workspace from before salting (its own ids unsalted, its carried ones salted).
     #[test]

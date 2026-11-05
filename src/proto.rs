@@ -205,18 +205,6 @@ pub enum Request {
     UserRecord {
         record: Box<Record>,
     },
-    /// This machine's own jobs that haven't ended and that no user signed (dispatched before the
-    /// cluster had users), for `potluck user init` to sign: answered with [`Response::Jobs`].
-    /// Asked on the machine itself, never relayed.
-    UnsignedJobs,
-    /// A user's signatures of this machine's unsigned jobs ([`Request::UnsignedJobs`]), each over
-    /// the job's spec as it stands, for this machine, with a nonce of its own. The daemon keeps
-    /// each one that a user it recognizes made and that covers the job's spec, so other members
-    /// may run the job: answered with [`Response::JobsSigned`]. Asked on the machine itself,
-    /// never relayed.
-    SignJobs {
-        jobs: Vec<JobSignature>,
-    },
     /// Update this machine to the latest release (the other members follow when they meet it).
     SelfUpdate,
     /// Start the potluck binary at the daemon's path in the daemon's own process, handing over
@@ -230,13 +218,6 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         binary: Option<std::path::PathBuf>,
     },
-}
-
-/// A user's signature of one job ([`Request::SignJobs`]).
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct JobSignature {
-    pub job: JobId,
-    pub auth: crate::jobauth::JobAuth,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -310,16 +291,6 @@ pub enum Response {
     /// What [`Request::Membership`] asks for.
     Membership {
         membership: Box<MembershipView>,
-    },
-    /// Jobs, as [`Request::UnsignedJobs`] asks.
-    Jobs {
-        jobs: Vec<JobRecord>,
-    },
-    /// What [`Request::SignJobs`] did: the jobs whose signatures it kept, and why it kept none
-    /// of the others.
-    JobsSigned {
-        signed: Vec<JobId>,
-        refused: BTreeMap<JobId, String>,
     },
     /// Text for the user, e.g. a pairing request or reply to paste.
     Text {

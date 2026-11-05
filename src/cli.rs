@@ -334,9 +334,6 @@ use std::io::Write;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-/// How many jobs `user init` signs in one request.
-const SIGN_BATCH: usize = 64;
-
 /// `potluck wait --max-wait` exits with this when the job hasn't ended.
 pub const EXIT_STILL_RUNNING: i32 = 3;
 /// Usage errors and potluck's own errors.
@@ -1257,9 +1254,9 @@ impl Cx<'_> {
     }
 
     /// For `resize`: the job's spec as its owner holds it, with `ram_mib` as its RAM request,
-    /// signed with this command line's user key when it has one (for its owner, as `user init`
-    /// signs a job: [`crate::jobauth::salted_already`]). Without a key it goes unsigned, unless
-    /// the cluster has users: then it is refused here.
+    /// signed with this command line's user key when it has one (for its owner, its ids salted
+    /// already: [`crate::jobauth::salted_already`]). Without a key it goes unsigned, unless the
+    /// cluster has users: then it is refused here.
     fn signed_resize(
         &mut self,
         job: &str,
@@ -1647,7 +1644,11 @@ impl Cx<'_> {
             UserAction::Init { name } => {
                 let m = self.membership()?;
                 if m.users_exist {
-                    return self.user_init_again(&m, &path);
+                    let names: Vec<&str> = m.users.iter().map(|u| u.name.as_str()).collect();
+                    anyhow::bail!(
+                        "this cluster has users already ({}); `potluck user add NAME KEY` adds another",
+                        names.join(", ")
+                    );
                 }
                 if !m.member {
                     anyhow::bail!(
@@ -1688,7 +1689,6 @@ impl Cx<'_> {
                     Response::Ok => {}
                     other => return Err(unexpected("user init", &other)),
                 }
-                let (signed_jobs, not_signed) = self.sign_unsigned_jobs(&key, &m.node);
                 let members: Vec<&str> = m.members.iter().map(|e| e.name.as_str()).collect();
                 let warning = match m.elders.as_slice() {
                     [] => None,
@@ -1706,10 +1706,6 @@ impl Cx<'_> {
                     notes.push(format!("made a user key at {}", path.display()));
                 }
                 notes.extend(warning.clone());
-                let (said, not_signed_notes, not_signed) =
-                    jobs_signed(&m.node, "it", &signed_jobs, not_signed);
-                notes.extend(not_signed_notes);
-                let jobs = said.map(|s| format!("; {s}")).unwrap_or_default();
                 Ok(Report {
                     note: notes.join("\npotluck: "),
                     ..Report::new(
@@ -1720,11 +1716,9 @@ impl Cx<'_> {
                             "made": made,
                             "members": members,
                             "warning": warning,
-                            "signed_jobs": signed_jobs,
-                            "jobs_not_signed": not_signed,
                         }),
                         format!(
-                            "{name} is the cluster's first user; signed in {}: {}{jobs}",
+                            "{name} is the cluster's first user; signed in {}: {}",
                             if members.len() == 1 {
                                 "its member"
                             } else {
@@ -1797,111 +1791,6 @@ impl Cx<'_> {
                 ))
             }
         }
-    }
-
-    /// `potluck user init` in a cluster that has users. With a user's key, it makes no records and
-    /// signs the jobs this machine dispatched before users that haven't ended and are still
-    /// unsigned: those a first run's signing left (a batch refused, the daemon restarted, the
-    /// connection dropped). Any other key is refused, as a first user is made only once.
-    fn user_init_again(
-        &mut self,
-        m: &crate::mesh::MembershipView,
-        path: &Path,
-    ) -> anyhow::Result<Report> {
-        let key = UserKey::load(path)?;
-        let user = key
-            .as_ref()
-            .and_then(|k| m.users.iter().find(|u| u.key == k.public()));
-        let (Some(key), Some(user)) = (&key, user) else {
-            let names: Vec<&str> = m.users.iter().map(|u| u.name.as_str()).collect();
-            anyhow::bail!(
-                "this cluster has users already ({}); `potluck user add NAME KEY` adds another",
-                names.join(", ")
-            );
-        };
-        let (signed_jobs, not_signed) = self.sign_unsigned_jobs(key, &m.node);
-        let failed = !not_signed.is_empty();
-        let (said, notes, not_signed) =
-            jobs_signed(&m.node, "the first user", &signed_jobs, not_signed);
-        let jobs = match said {
-            Some(s) => s,
-            None if !failed => format!(
-                "no job {} dispatched before the first user is left to sign",
-                m.node
-            ),
-            None => "signed no jobs".to_string(),
-        };
-        Ok(Report {
-            note: notes.join("\npotluck: "),
-            ..Report::new(
-                json!({
-                    "user": user.name,
-                    "key": key.public(),
-                    "file": path,
-                    "made": false,
-                    "signed_jobs": signed_jobs,
-                    "jobs_not_signed": not_signed,
-                }),
-                format!("{} is already a user of this cluster; {jobs}", user.name),
-            )
-        })
-    }
-
-    /// For `user init`: signs with `key` this machine's jobs that haven't ended and that no user
-    /// signed (dispatched before the cluster had users), each as its daemon holds it, for `node`
-    /// (this machine), so that other members may run them. Returns the jobs signed, and those
-    /// that weren't with why (None: none was).
-    fn sign_unsigned_jobs(
-        &mut self,
-        key: &UserKey,
-        node: &str,
-    ) -> (Vec<String>, Vec<(Option<String>, String)>) {
-        let none = |why: String| {
-            let why = format!("the jobs {node} dispatched before users were not signed: {why}");
-            (Vec::new(), vec![(None, why)])
-        };
-        let jobs = match self.call(Req::UnsignedJobs) {
-            Ok(Response::Jobs { jobs }) => jobs,
-            Ok(other) => return none(format!("{:#}", unexpected("unsigned jobs", &other))),
-            Err(e) => return none(format!("{e:#}")),
-        };
-        let (mut signed, mut refused) = (Vec::new(), Vec::new());
-        // A bounded request each, however many jobs there are.
-        for batch in jobs.chunks(SIGN_BATCH) {
-            let now = now_ms();
-            let jobs: Vec<crate::proto::JobSignature> = batch
-                .iter()
-                .filter_map(|j| {
-                    let spec = crate::types::JobSpec {
-                        submitted_from: node.to_string(),
-                        ..j.spec.clone()
-                    };
-                    let auth = crate::jobauth::sign(&spec, key, now).auth?;
-                    Some(crate::proto::JobSignature {
-                        job: j.id.clone(),
-                        auth,
-                    })
-                })
-                .collect();
-            match self.call(Req::SignJobs { jobs }) {
-                Ok(Response::JobsSigned {
-                    signed: s,
-                    refused: r,
-                }) => {
-                    signed.extend(s);
-                    refused.extend(r.into_iter().map(|(job, why)| (Some(job), why)));
-                }
-                Ok(other) => {
-                    let why = format!("{:#}", unexpected("sign jobs", &other));
-                    refused.extend(batch.iter().map(|j| (Some(j.id.clone()), why.clone())));
-                }
-                Err(e) => {
-                    let why = format!("{e:#}");
-                    refused.extend(batch.iter().map(|j| (Some(j.id.clone()), why.clone())));
-                }
-            }
-        }
-        (signed, refused)
     }
 
     fn text_request(&mut self, req: Req, what: &str) -> anyhow::Result<Report> {
@@ -2035,39 +1924,6 @@ fn broken_pipe(e: &anyhow::Error) -> bool {
         c.downcast_ref::<std::io::Error>()
             .is_some_and(|io| io.kind() == std::io::ErrorKind::BrokenPipe)
     })
-}
-
-/// What `potluck user init` says of the jobs machine `node` dispatched before users that it
-/// signed (`signed`) and didn't (`not_signed`, as [`Cx::sign_unsigned_jobs`] returns them):
-/// "signed 2 jobs NODE dispatched before {before} that haven't ended" (None when it signed none),
-/// a note for each it didn't sign, and `jobs_not_signed` for `--json`.
-fn jobs_signed(
-    node: &str,
-    before: &str,
-    signed: &[String],
-    not_signed: Vec<(Option<String>, String)>,
-) -> (Option<String>, Vec<String>, serde_json::Map<String, Value>) {
-    let said = match signed.len() {
-        0 => None,
-        1 => Some(format!(
-            "signed 1 job {node} dispatched before {before} that hasn't ended"
-        )),
-        n => Some(format!(
-            "signed {n} jobs {node} dispatched before {before} that haven't ended"
-        )),
-    };
-    let notes = not_signed
-        .iter()
-        .map(|(job, why)| match job {
-            Some(job) => format!("job {job} was not signed: {why}"),
-            None => why.clone(),
-        })
-        .collect();
-    let not_signed = not_signed
-        .into_iter()
-        .map(|(job, why)| (job.unwrap_or_default(), json!(why)))
-        .collect();
-    (said, notes, not_signed)
 }
 
 fn unexpected(what: &str, resp: &Response) -> anyhow::Error {
