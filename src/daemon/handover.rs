@@ -1687,6 +1687,7 @@ mod tests {
                     commit: "0".repeat(40),
                     branch: None,
                     submodules: Vec::new(),
+                    carried: Vec::new(),
                 },
                 workspace: None,
                 cmd: vec!["true".into()],

@@ -135,7 +135,7 @@ pub fn check(
 /// `--priority` and `--cpu` aren't among them: in place a command starts at once and shares the
 /// job's CPU.
 pub fn refused_option(args: &DispatchArgs, job: &str) -> Option<(&'static str, String)> {
-    let checks: [(bool, &'static str, String); 7] = [
+    let checks: [(bool, &'static str, String); 8] = [
         (
             !args.keep.is_empty(),
             "--keep",
@@ -171,6 +171,13 @@ pub fn refused_option(args: &DispatchArgs, job: &str) -> Option<(&'static str, S
             "--without-submodule",
             format!(
                 "it runs in job {job}'s workspace, with the submodules that job's dispatch shipped"
+            ),
+        ),
+        (
+            !args.carry.is_empty(),
+            "--carry",
+            format!(
+                "it runs with the mirrors job {job}'s dispatch carried commits into (its POTLUCK_MIRROR_ variables)"
             ),
         ),
     ];
@@ -239,7 +246,7 @@ pub fn top_of(cwd: &Path) -> std::path::PathBuf {
 }
 
 /// Runs the command here: in `cwd`, with this process's environment plus the resolved env
-/// (except potluck's own variables, [`crate::daemon::JOB_VARIABLES`], which stay the job's) and
+/// (except potluck's own variables, [`crate::daemon::is_job_variable`], which stay the job's) and
 /// without the variables it unsets (never potluck's own: [`crate::recipe::resolve`] refuses
 /// those), stdin and stderr inherited, stdout inherited too unless `stdout_to_stderr` (so `--json` keeps
 /// stdout for its one document). It runs in a process group of its own, which is ended at its
@@ -260,7 +267,7 @@ pub fn run_in_place(
     let env = r
         .env
         .iter()
-        .filter(|(k, _)| !crate::daemon::JOB_VARIABLES.contains(&k.as_str()));
+        .filter(|(k, _)| !crate::daemon::is_job_variable(k));
     cmd.args(args).current_dir(cwd).envs(env).process_group(0);
     for k in &r.unset_env {
         cmd.env_remove(k);

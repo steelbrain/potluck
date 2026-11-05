@@ -179,6 +179,7 @@ fn record(cmd: &[&str]) -> JobRecord {
                 commit: "0".repeat(40),
                 branch: None,
                 submodules: Vec::new(),
+                carried: Vec::new(),
             },
             workspace: None,
             cmd: cmd.iter().map(|s| s.to_string()).collect(),

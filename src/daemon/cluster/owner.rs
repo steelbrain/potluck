@@ -1139,9 +1139,8 @@ pub(super) fn upload_pack(
 pub(crate) fn dispatched(st: &mut State, c: &Cluster, repo: &RepoRef) {
     let mut cs = c.cs();
     let before = cs.sources.clone();
-    cs.sources.insert(repo.id.clone(), repo.source.clone());
-    for s in &repo.submodules {
-        cs.sources.insert(s.repo_id.clone(), s.source.clone());
+    for (repo_id, source, _) in repo.commits() {
+        cs.sources.insert(repo_id.to_string(), source.to_path_buf());
     }
     if cs.sources != before {
         save(st, super::KV_SOURCES, &cs.sources);

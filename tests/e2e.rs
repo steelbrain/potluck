@@ -1750,6 +1750,146 @@ fn a_runner_gets_a_submodule_commit_only_one_worktree_has() {
     }
 }
 
+/// A repository `dep-x` beside `node`'s project, with a commit only its detached HEAD had (on no
+/// branch now): returns its directory and that commit.
+fn dep_with_a_local_commit(node: &Node) -> (PathBuf, String) {
+    let dep = node.dir.path().join("repos/dep-x");
+    std::fs::create_dir_all(&dep).unwrap();
+    git(&dep, &["init", "-q"]);
+    std::fs::write(dep.join("dep.txt"), "dep v1\n").unwrap();
+    git(&dep, &["add", "."]);
+    git(&dep, &["commit", "-qm", "dep"]);
+    git(&dep, &["checkout", "-q", "--detach"]);
+    std::fs::write(dep.join("dep.txt"), "dep local\n").unwrap();
+    git(&dep, &["commit", "-qam", "local only"]);
+    let local = git(&dep, &["rev-parse", "HEAD"]);
+    git(&dep, &["checkout", "-q", "main"]);
+    (dep, local)
+}
+
+/// A job's script that fetches `commit` from the carried mirror into a repository of its own and
+/// prints the mirror's path and the commit's dep.txt.
+fn fetch_carried(commit: &str) -> String {
+    format!(
+        "set -e; echo mirror=$POTLUCK_MIRROR_dep_x other=${{POTLUCK_MIRROR_other-unset}}; \
+         git init -q --bare \"$TMPDIR/dep.git\"; \
+         git -C \"$TMPDIR/dep.git\" fetch -q \"$POTLUCK_MIRROR_dep_x\" {commit}; \
+         git -C \"$TMPDIR/dep.git\" cat-file -p {commit}:dep.txt"
+    )
+}
+
+/// `--carry DIR@REV`: a commit of another repository here, on no branch, goes into the mirror
+/// that repository's own jobs use, pinned while the job lasts; the job finds that mirror in
+/// POTLUCK_MIRROR_<name>, which the dispatch's env can't set, and fetches the commit from it.
+#[test]
+fn a_job_fetches_a_carried_commit_from_the_mirror_it_is_told_of() {
+    let n = Node::new();
+    let (dep, local) = dep_with_a_local_commit(&n);
+    let carry = format!("{}@{}", dep.display(), &local[..10]);
+    let o = n.cli(&[
+        "dispatch",
+        "--timeout",
+        "1m",
+        "--carry",
+        &carry,
+        "--env",
+        "POTLUCK_MIRROR_dep_x=/elsewhere",
+        "--env",
+        "POTLUCK_MIRROR_other=/elsewhere",
+        "--",
+        "sh",
+        "-c",
+        &fetch_carried(&local),
+    ]);
+    assert_eq!(o.code, 0, "{} {}\n{}", o.json, o.stderr, n.daemon_log());
+    assert_eq!(o.json["carried"][0]["name"], "dep_x", "{}", o.json);
+    assert_eq!(o.json["carried"][0]["commit"], local.as_str());
+    let job = o.json["job"].as_str().unwrap().to_string();
+    let (code, j, _) = n.wait(&job);
+    let output = n.output(&job);
+    assert_eq!(code, 0, "{j}\n{output}\n{}", n.daemon_log());
+    assert!(output.contains("dep local"), "{output}");
+    let mirror = output
+        .lines()
+        .find_map(|l| l.strip_prefix("mirror="))
+        .and_then(|l| l.split(' ').next())
+        .map(PathBuf::from)
+        .unwrap_or_default();
+    assert!(output.contains(" other=unset"), "{output}");
+    // The mirror in this daemon's state directory, as an absolute path.
+    assert!(
+        mirror.is_absolute() && mirrors_of(&n).contains(&mirror),
+        "{mirror:?} not among {:?}",
+        mirrors_of(&n)
+    );
+    // The commit was pinned for the job, and the pin goes when it ends.
+    let pins = || {
+        git(
+            &mirror,
+            &["for-each-ref", "--format=%(refname)", "refs/potluck/pins/"],
+        )
+    };
+    let start = Instant::now();
+    while pins().contains(&job) {
+        assert!(start.elapsed() < Duration::from_secs(10), "{}", pins());
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // A dispatch from that repository itself uses the same mirror: no other is made.
+    let before = mirrors_of(&n).len();
+    let o = n.cli_in(
+        &dep,
+        &["dispatch", "--timeout", "1m", "--", "cat", "dep.txt"],
+    );
+    assert_eq!(o.code, 0, "{} {}", o.json, o.stderr);
+    let own = o.json["job"].as_str().unwrap().to_string();
+    let (code, _, _) = n.wait(&own);
+    assert_eq!(code, 0, "{}", n.daemon_log());
+    assert_eq!(n.output(&own).trim(), "dep v1");
+    assert_eq!(mirrors_of(&n).len(), before, "{:?}", mirrors_of(&n));
+}
+
+/// A carried commit only the dispatching machine has reaches the runner's mirror through the
+/// tunnel before the job starts there, and the job fetches it from the runner's mirror.
+#[test]
+fn a_runner_gets_a_carried_commit_only_the_owner_has() {
+    let a = Node::new();
+    let b = Node::new();
+    pair(&a, &b);
+    let (dep, local) = dep_with_a_local_commit(&a);
+    let carry = format!("{}@{}", dep.display(), &local[..10]);
+    let on_b = format!("node={}", b.name);
+    let job = a.dispatch(&[
+        "--timeout",
+        "1m",
+        "--on",
+        &on_b,
+        "--carry",
+        &carry,
+        "--",
+        "sh",
+        "-c",
+        &fetch_carried(&local),
+    ]);
+    let (code, j, _) = a.wait(&job);
+    let logs = || format!("{}\n{}", a.daemon_log(), b.daemon_log());
+    let output = a.output(&job);
+    assert_eq!(code, 0, "{j}\n{output}\n{}", logs());
+    assert_eq!(j["record"]["node"], b.name.as_str());
+    assert!(output.contains("dep local"), "{output}");
+    let mirror = output
+        .lines()
+        .find_map(|l| l.strip_prefix("mirror="))
+        .and_then(|l| l.split(' ').next())
+        .map(PathBuf::from)
+        .unwrap_or_default();
+    assert!(
+        mirrors_of(&b).contains(&mirror),
+        "{mirror:?} not among b's {:?}",
+        mirrors_of(&b)
+    );
+}
+
 /// The `*.git` mirrors in a node's state directory.
 fn mirrors_of(node: &Node) -> Vec<PathBuf> {
     let Ok(dir) = std::fs::read_dir(node.paths.home.join("mirrors")) else {

@@ -1918,6 +1918,7 @@ fn normalised_fixture(e: &Env, autocrlf: bool) -> (RepoRef, RepoRef) {
         commit: git(&src, &["rev-parse", "HEAD"]),
         branch: Some("main".into()),
         submodules: vec![],
+        carried: vec![],
     };
     e.sync(&repo3);
     let mirror = e.mirror(&repo3.id);
@@ -2083,6 +2084,7 @@ fn a_workspace_follows_its_commit_s_attributes_whatever_its_base() {
         commit: git(&src, &["rev-parse", "HEAD"]),
         branch: Some("main".into()),
         submodules: vec![],
+        carried: vec![],
     };
     e.sync(&repo2);
     git(
@@ -2167,6 +2169,7 @@ fn a_gitattributes_change_rewrites_only_the_files_it_concerns() {
             commit: git(&src, &["rev-parse", "HEAD"]),
             branch: Some("main".into()),
             submodules: vec![],
+            carried: vec![],
         };
         e.sync(&repo2);
         if autocrlf {
@@ -3115,6 +3118,7 @@ fn mirrors_and_bases_from_before_salted_ids_are_removed() {
             commit: c.clone(),
             branch: None,
             submodules: vec![],
+            carried: vec![],
         };
         let w = format!("w-{id}");
         let root = e.ws.create(&w, &repo).unwrap();
@@ -3208,6 +3212,7 @@ fn a_mirror_changed_outside_a_sync_is_reported_and_reset() {
         commit: c1.clone(),
         branch: None,
         submodules: vec![],
+        carried: vec![],
     };
     let root = e.ws.create(&"w1".to_string(), &repo).unwrap();
 
@@ -3341,6 +3346,7 @@ fn a_seeding_that_fills_the_disk_blames_neither_base_nor_mirror() {
             commit: c,
             branch: None,
             submodules: vec![],
+            carried: vec![],
         };
         let err = format!("{:#}", ws.create(&"w1".to_string(), &repo).unwrap_err());
         let mirror = ws.paths.mirror(id);

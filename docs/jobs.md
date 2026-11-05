@@ -38,6 +38,36 @@ job studio-9
 potluck: left out 1 submodule and what is nested in it: vendor/qemu
 ```
 
+`--carry DIR[@REV]`, repeatable, carries a commit of another repository on the dispatching machine
+to the machine that runs the job, for the job to fetch from there: a dependency the project pins at
+a commit that was never pushed, for one. DIR is any directory in that repository, a bare one too,
+and REV is a commit there, HEAD by default. An argument that is a directory as a whole has no REV;
+otherwise it splits at the last `@` that has a directory before it, so `../dep@HEAD@{1}` works. As
+for the job's own repository, only committed work counts: REV must name a commit, and uncommitted
+changes in DIR are not carried. The repository travels like a submodule (see
+[Sources](cluster.md#sources)), with its branches and tags, into the running machine's mirror of it,
+the one a dispatch from that repository on the dispatching machine uses. The commit is pinned there
+until the job ends, and nothing checks it out. The job finds the mirror's path in
+`POTLUCK_MIRROR_<name>`, where `<name>` is the directory name of the repository's working tree (of a
+bare repository, its name without `.git`), with every character but ASCII letters, digits and `_`
+made `_`: `--carry ~/src/my-dep` gives `POTLUCK_MIRROR_my_dep`. Refused: the job's own repository,
+one repository carried twice, and two repositories whose names are the same. `dispatch` names what
+it carried on stderr (with `--json`, `carried`). potluck.toml's recipes have no field for it.
+
+The mirror is shared by the jobs on that machine and kept in step with its source by potluck, so
+a job must not write to it. It fetches from it into a repository of its own. `git fetch` takes
+the commit's full id, which this project keeps in `dep.rev`:
+
+```console
+$ potluck dispatch --timeout 30m --carry ../dep@b01aec5cbe -- sh -c '
+    git init -q "$TMPDIR/dep" &&
+    git -C "$TMPDIR/dep" fetch -q "$POTLUCK_MIRROR_dep" "$(cat dep.rev)" &&
+    git -C "$TMPDIR/dep" checkout -q FETCH_HEAD &&
+    ./test.sh "$TMPDIR/dep"'
+job studio-10
+potluck: carried dep at b01aec5cbe2b (POTLUCK_MIRROR_dep)
+```
+
 A dispatch that no machine could run is refused at once, with each machine's reason, and nothing
 is queued. Only machines that are up count; capable machines that aren't up are named in the
 refusal. A member on another potluck version that answers counts as up: one of the two is
@@ -236,8 +266,9 @@ A job's environment is built in this order, later entries winning:
 3. `[env]` of the `potluck.toml` committed at the dispatched commit, then the recipe's `env`;
 4. `--env K=V`;
 5. `POTLUCK_JOB`, `POTLUCK_WORKSPACE`, `POTLUCK_NODE`, `POTLUCK_GPUS`, `POTLUCK_LEASE`,
-   `POTLUCK_HOME`, `POTLUCK_CONFIG`, and `TMPDIR`, a directory beside the workspace that is removed
-   with it.
+   `POTLUCK_HOME`, `POTLUCK_CONFIG`, `TMPDIR`, a directory beside the workspace that is removed
+   with it, and `POTLUCK_MIRROR_<name>` for each `--carry`. A `POTLUCK_MIRROR_` variable from the
+   steps above is dropped, so a job has only those of its own `--carry`.
 
 Nothing comes from the shell that ran `dispatch`.
 
@@ -251,7 +282,7 @@ starting with a digit), and for a K that `--env` also sets:
 $ potluck dispatch --timeout 10m --unset-env HTTPS_PROXY -- cargo test
 job studio-6
 $ potluck dispatch --timeout 10m --unset-env TMPDIR -- cargo test
-potluck: --unset-env: TMPDIR is one of potluck's own variables, which every job gets (POTLUCK_JOB, POTLUCK_LEASE, POTLUCK_WORKSPACE, POTLUCK_NODE, POTLUCK_GPUS, POTLUCK_HOME, POTLUCK_CONFIG, TMPDIR)
+potluck: --unset-env: TMPDIR is one of potluck's own variables, which every job gets (POTLUCK_JOB, POTLUCK_LEASE, POTLUCK_WORKSPACE, POTLUCK_NODE, POTLUCK_GPUS, POTLUCK_HOME, POTLUCK_CONFIG, TMPDIR and POTLUCK_MIRROR_<name>)
 ```
 
 The daemon captures the login environment when it starts, so a change to a login profile, or to
@@ -277,11 +308,11 @@ with the job, as do processes the command leaves running when it exits. Its envi
 with the request's env on top and without the variables it unsets (`--unset-env`, a recipe's
 `unset_env`), except potluck's own variables, which stay the job's. A request that
 doesn't fit fails at once with exit code 2, and so does one with `--keep`, `--hold`, `--key`,
-`--label`, `--no-rerun`, `--kill-on-stall` or `--without-submodule`, which only mean something for
-a job of its own; a recipe's `keep`, `hold` and `without_submodules` are left out, and `dispatch`
-says so. It never waits for the job's own resources, so a job can't deadlock on itself; for the
-same reason `potluck wait` and `potluck logs -f` of the job's own id fail at once inside it, with
-exit code 2. The job runs the
+`--label`, `--no-rerun`, `--kill-on-stall`, `--without-submodule` or `--carry`, which only mean
+something for a job of its own; a recipe's `keep`, `hold` and `without_submodules` are left out,
+and `dispatch` says so. It never waits for the job's own resources, so a job can't deadlock on
+itself; for the same reason `potluck wait` and `potluck logs -f` of the job's own id fail at once
+inside it, with exit code 2. The job runs the
 `potluck` its `PATH` finds, and that `PATH` comes from the login environment, so potluck's directory
 must be on the `PATH` a login shell sets; otherwise the job's shell says
 `potluck: command not found` and exits 127. From a job holding 4 GiB:

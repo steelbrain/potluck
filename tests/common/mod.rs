@@ -162,6 +162,7 @@ pub fn spec(cmd: &[&str]) -> JobSpec {
             commit: "0123456789abcdef0123456789abcdef01234567".into(),
             branch: Some("feature".into()),
             submodules: vec![],
+            carried: vec![],
         },
         workspace: None,
         cmd: cmd.iter().map(|s| s.to_string()).collect(),

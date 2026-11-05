@@ -296,6 +296,51 @@ pub struct RepoRef {
     /// The dispatching agent's branch, if HEAD is on one. Holds belong to it.
     pub branch: Option<String>,
     pub submodules: Vec<SubmoduleRef>,
+    /// Other repositories' commits the dispatch carries along (`dispatch --carry`): synced into
+    /// the mirrors and pinned like the submodules', never checked out. None in records from
+    /// before `--carry`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub carried: Vec<CarriedRef>,
+}
+
+impl RepoRef {
+    /// Every repository commit the dispatch names, as (repository id, source, commit): the
+    /// repository's own, each submodule's, then each carried repository's. A machine runs the
+    /// job only once its mirrors hold them all, and pins each of them for it.
+    pub fn commits(&self) -> impl Iterator<Item = (&str, &Path, &str)> {
+        let subs = self
+            .submodules
+            .iter()
+            .map(|s| (s.repo_id.as_str(), s.source.as_path(), s.commit.as_str()));
+        let carried = self
+            .carried
+            .iter()
+            .map(|c| (c.repo_id.as_str(), c.source.as_path(), c.commit.as_str()));
+        std::iter::once((
+            self.id.as_str(),
+            self.source.as_path(),
+            self.commit.as_str(),
+        ))
+        .chain(subs)
+        .chain(carried)
+    }
+}
+
+/// A commit of another repository that a dispatch carries along (`dispatch --carry DIR[@REV]`),
+/// for the job to fetch from the mirror that holds it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CarriedRef {
+    /// The repository's directory name with every character but ASCII letters, digits and `_`
+    /// made `_`: the job finds the mirror in `POTLUCK_MIRROR_<name>`.
+    pub name: String,
+    /// Its repository id: the CLI sends [`repo_id`] of its common git dir, and the owner's daemon
+    /// salts it ([`owned_repo_id`]), as for a dispatch from that repository itself, so the commit
+    /// goes into the mirror that repository's own jobs use.
+    pub repo_id: String,
+    /// Its common git dir on the submitting machine.
+    pub source: PathBuf,
+    /// Full commit sha.
+    pub commit: String,
 }
 
 /// A submodule commit that a dispatched commit pins.
@@ -746,7 +791,7 @@ fn on_in_order(on: &BTreeMap<String, String>) -> impl Iterator<Item = (&str, &st
 
 /// Why `name` can't be removed from a job's environment (`--unset-env`): it isn't a variable's
 /// name (letters, digits and `_`, not starting with a digit), or it is one of potluck's own
-/// variables ([`crate::daemon::JOB_VARIABLES`]), which every job gets.
+/// variables ([`crate::daemon::is_job_variable`]), which every job gets.
 pub fn unset_env_refused(name: &str) -> Option<String> {
     let mut chars = name.chars();
     let valid = chars
@@ -758,11 +803,11 @@ pub fn unset_env_refused(name: &str) -> Option<String> {
             "{name:?} is not a variable name: use letters, digits and _, not starting with a digit"
         ));
     }
-    let own = crate::daemon::JOB_VARIABLES;
-    own.contains(&name).then(|| {
+    crate::daemon::is_job_variable(name).then(|| {
         format!(
-            "{name} is one of potluck's own variables, which every job gets ({})",
-            own.join(", ")
+            "{name} is one of potluck's own variables, which every job gets ({} and {}<name>)",
+            crate::daemon::JOB_VARIABLES.join(", "),
+            crate::daemon::MIRROR_VARIABLE_PREFIX
         )
     })
 }
@@ -988,7 +1033,10 @@ mod tests {
                 "{bad}: {why}"
             );
         }
-        for own in crate::daemon::JOB_VARIABLES {
+        for own in crate::daemon::JOB_VARIABLES
+            .into_iter()
+            .chain(["POTLUCK_MIRROR_dep"])
+        {
             let why = unset_env_refused(own).unwrap();
             assert!(
                 why.starts_with(&format!(
@@ -1082,6 +1130,34 @@ mod tests {
             }
         }
         assert!(t.starts_with("2026-11-0") && t.ends_with(".042"), "{t}");
+    }
+
+    /// A record from before `--carry` loads with no carried repositories, and one without any
+    /// is written as before (no `carried` field), so an older binary reads it too.
+    #[test]
+    fn repo_refs_from_before_carry_load_and_are_written_as_before() {
+        let old = r#"{"id":"app-0123abcd","source":"/src/app/.git","commit":"c","branch":null,"submodules":[]}"#;
+        let r: RepoRef = serde_json::from_str(old).unwrap();
+        assert!(r.carried.is_empty());
+        assert_eq!(serde_json::to_string(&r).unwrap(), old);
+        let carrying = RepoRef {
+            carried: vec![CarriedRef {
+                name: "dep".into(),
+                repo_id: "dep-89abcdef".into(),
+                source: PathBuf::from("/src/dep/.git"),
+                commit: "d".into(),
+            }],
+            ..r.clone()
+        };
+        let text = serde_json::to_string(&carrying).unwrap();
+        assert_eq!(serde_json::from_str::<RepoRef>(&text).unwrap(), carrying);
+        assert_eq!(
+            carrying.commits().collect::<Vec<_>>(),
+            [
+                ("app-0123abcd", Path::new("/src/app/.git"), "c"),
+                ("dep-89abcdef", Path::new("/src/dep/.git"), "d"),
+            ]
+        );
     }
 
     #[test]

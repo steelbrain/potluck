@@ -97,6 +97,12 @@ daemon's log and in the log and `why` of the job the sync was for:
 Repository ids are salted with the dispatching machine's name, so two machines whose repositories
 have the same path never share a mirror on a third.
 
+A repository a dispatch carries (`--carry`, see [Dispatching](jobs.md#dispatching)) travels like
+a submodule: a member's mirror of it is fed from the dispatching machine, and its commit is pinned
+and must be there before the member takes the job, but it is not checked out in the workspace. Its
+id is the one a dispatch from that repository on the same machine gets, so the commit goes into
+the mirror that repository's own jobs use.
+
 A dispatch pins its commits with refs under `refs/potluck/` until its workspace is removed, so
 amending or deleting a branch can't let `git gc` drop them. A machine takes a job only once its
 mirrors hold every commit the job names, and nothing is fetched at run time. A mirror still

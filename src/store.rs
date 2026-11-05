@@ -460,6 +460,7 @@ mod tests {
                     commit: "a".repeat(40),
                     branch: Some("main".into()),
                     submodules: vec![],
+                    carried: vec![],
                 },
                 workspace: None,
                 cmd: vec!["true".into()],

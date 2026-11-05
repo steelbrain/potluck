@@ -717,7 +717,11 @@ unset_env = ["FROM_FILE", "DEBUG_LAYER", "DEBUG_LAYER"]
                 &["--unset-env", "TMPDIR"][..],
                 "--unset-env: TMPDIR is one of potluck's own variables, which every job gets \
                  (POTLUCK_JOB, POTLUCK_LEASE, POTLUCK_WORKSPACE, POTLUCK_NODE, POTLUCK_GPUS, \
-                 POTLUCK_HOME, POTLUCK_CONFIG, TMPDIR)",
+                 POTLUCK_HOME, POTLUCK_CONFIG, TMPDIR and POTLUCK_MIRROR_<name>)",
+            ),
+            (
+                &["--unset-env", "POTLUCK_MIRROR_dep"],
+                "--unset-env: POTLUCK_MIRROR_dep is one of potluck's own variables",
             ),
             (
                 &["--unset-env", "POTLUCK_JOB"],

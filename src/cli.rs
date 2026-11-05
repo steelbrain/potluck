@@ -224,6 +224,13 @@ pub struct DispatchArgs {
     /// workspace. Repeatable; replaces the recipe's `without_submodules`.
     #[arg(long = "without-submodule", value_name = "PATTERN")]
     pub without_submodule: Vec<String>,
+    /// Carry a commit of another repository here into the mirrors of the machine that runs the
+    /// job, for the job to fetch: DIR is a directory in that repository, REV a commit there
+    /// (default HEAD). The job finds the mirror in POTLUCK_MIRROR_<name>, <name> being the
+    /// repository's directory name with characters other than letters, digits and _ made _.
+    /// Repeatable.
+    #[arg(long = "carry", value_name = "DIR[@REV]")]
+    pub carry: Vec<String>,
     /// Makes the dispatch idempotent: a key that exists returns that job.
     #[arg(long)]
     pub key: Option<String>,
@@ -690,7 +697,8 @@ impl Cx<'_> {
             Ok(without)
         })?;
         let r = resolved.ok_or_else(|| anyhow::anyhow!("the dispatch's recipe wasn't read"))?;
-        let (repo, left_out) = (inspected.repo, inspected.left_out);
+        let (mut repo, left_out) = (inspected.repo, inspected.left_out);
+        repo.carried = crate::gitinfo::carry_all(&args.carry, &cwd, &repo)?;
         let spec = crate::types::JobSpec {
             key: args.key.clone(),
             labels: r.labels,
@@ -739,10 +747,9 @@ impl Cx<'_> {
                 state.map(|s| format!(", {s}")).unwrap_or_default()
             ));
         }
-        let note = if left_out.is_empty() {
-            String::new()
-        } else {
-            format!(
+        let mut notes = Vec::new();
+        if !left_out.is_empty() {
+            notes.push(format!(
                 "left out {} and what is nested in {}: {}",
                 if left_out.len() == 1 {
                     "1 submodule".to_string()
@@ -751,8 +758,32 @@ impl Cx<'_> {
                 },
                 if left_out.len() == 1 { "it" } else { "them" },
                 left_out.join(", ")
-            )
-        };
+            ));
+        }
+        if !spec.repo.carried.is_empty() {
+            let carried: Vec<String> = spec
+                .repo
+                .carried
+                .iter()
+                .map(|c| {
+                    format!(
+                        "{} at {} (POTLUCK_MIRROR_{})",
+                        c.name,
+                        crate::gitinfo::short(&c.commit),
+                        c.name
+                    )
+                })
+                .collect();
+            notes.push(format!("carried {}", carried.join(", ")));
+        }
+        // One `potluck: ` line each.
+        let note = notes.join("\npotluck: ");
+        let carried: Vec<Value> = spec
+            .repo
+            .carried
+            .iter()
+            .map(|c| json!({ "name": c.name, "commit": c.commit, "source": c.source }))
+            .collect();
         Ok(Report {
             note,
             ..Report::new(
@@ -764,6 +795,7 @@ impl Cx<'_> {
                     "commit": spec.repo.commit,
                     "branch": spec.repo.branch,
                     "without_submodules": left_out,
+                    "carried": carried,
                 }),
                 human,
             )

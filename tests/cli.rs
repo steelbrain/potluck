@@ -70,6 +70,7 @@ fn fake_inspect(
             commit,
             branch: Some(git(cwd, &["symbolic-ref", "--short", "HEAD"])),
             submodules: vec![],
+            carried: vec![],
         },
         left_out,
     })
@@ -332,6 +333,128 @@ fn dispatch_leaves_out_the_submodules_the_recipe_or_the_flags_name() {
     let out = run_in(&env, &["dispatch", "--timeout", "1m", "--", "true"]);
     assert_eq!(out.code, 0, "{}", out.stderr);
     assert!(!out.stderr.contains("left out"), "{}", out.stderr);
+}
+
+/// `--carry DIR[@REV]` sends each carried repository's commit, id, source and name with the
+/// dispatch; dispatch names them on stderr and in its JSON. What it can't carry is refused before
+/// anything is sent.
+#[test]
+fn dispatch_carries_other_repositories_commits() {
+    let fake = dispatch_daemon();
+    let repo = repo_with(RECIPES);
+    let deps = tempfile::tempdir().unwrap();
+    let dep = deps.path().join("dep-lib");
+    std::fs::create_dir_all(&dep).unwrap();
+    git(&dep, &["init", "-q", "-b", "main"]);
+    git(&dep, &["commit", "-q", "--allow-empty", "-m", "one"]);
+    let first = git(&dep, &["rev-parse", "HEAD"]);
+    git(&dep, &["commit", "-q", "--allow-empty", "-m", "two"]);
+    let head = git(&dep, &["rev-parse", "HEAD"]);
+    let source = std::fs::canonicalize(dep.join(".git")).unwrap();
+    let env = env_for(&fake, repo.path());
+    let dispatches = || {
+        fake.requests()
+            .into_iter()
+            .filter_map(|r| match r.req {
+                Request::Dispatch { spec } => Some(*spec),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let dep_arg = dep.display().to_string();
+    let at_first = format!("{dep_arg}@HEAD~1");
+    let out = run_in(
+        &env,
+        &[
+            "--json",
+            "dispatch",
+            "--timeout",
+            "1m",
+            "--carry",
+            &at_first,
+            "--",
+            "true",
+        ],
+    );
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let v = one_json(&out.stdout);
+    assert_eq!(
+        v["carried"],
+        serde_json::json!([{ "name": "dep_lib", "commit": first, "source": source }]),
+        "{v}"
+    );
+    let spec = dispatches().pop().unwrap();
+    assert_eq!(spec.repo.carried.len(), 1, "{spec:#?}");
+    let c = &spec.repo.carried[0];
+    assert_eq!(
+        (c.name.as_str(), c.commit.as_str(), &c.source),
+        ("dep_lib", first.as_str(), &source)
+    );
+    // The id a dispatch from that repository sends (the daemon salts both alike).
+    assert_eq!(c.repo_id, potluck::types::repo_id(&source));
+
+    // Without --json, a note on stderr; HEAD by default; and none without --carry.
+    let out = run_in(
+        &env,
+        &[
+            "dispatch",
+            "--timeout",
+            "1m",
+            "--carry",
+            &dep_arg,
+            "--",
+            "true",
+        ],
+    );
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert!(
+        out.stderr.contains(&format!(
+            "potluck: carried dep_lib at {} (POTLUCK_MIRROR_dep_lib)\n",
+            &head[..12]
+        )),
+        "{}",
+        out.stderr
+    );
+    assert_eq!(dispatches().pop().unwrap().repo.carried[0].commit, head);
+    let out = run_in(
+        &env,
+        &["--json", "dispatch", "--timeout", "1m", "--", "true"],
+    );
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(one_json(&out.stdout)["carried"], serde_json::json!([]));
+    assert!(dispatches().pop().unwrap().repo.carried.is_empty());
+    assert!(!out.stderr.contains("carried"), "{}", out.stderr);
+
+    let plain = deps.path().join("plain");
+    std::fs::create_dir_all(&plain).unwrap();
+    let missing = deps.path().join("missing").display().to_string();
+    let plain = plain.display().to_string();
+    let bad_rev = format!("{dep_arg}@no-such-rev");
+    let sent = dispatches().len();
+    for (args, want) in [
+        (vec![missing.as_str()], "there is no directory"),
+        (vec![plain.as_str()], "is not in a git repository"),
+        (vec![bad_rev.as_str()], "no-such-rev names no commit in"),
+        (vec!["."], "that is the job's own repository"),
+        (
+            vec![dep_arg.as_str(), at_first.as_str()],
+            "are one repository",
+        ),
+    ] {
+        let mut argv = vec!["dispatch", "--timeout", "1m"];
+        for a in &args {
+            argv.extend(["--carry", a]);
+        }
+        argv.extend(["--", "true"]);
+        let out = run_in(&env, &argv);
+        assert_eq!(out.code, 2, "{args:?}: {}", out.stderr);
+        assert!(
+            out.stderr.contains("potluck: --carry ") && out.stderr.contains(want),
+            "{args:?}: {}",
+            out.stderr
+        );
+    }
+    assert_eq!(dispatches().len(), sent, "a refused --carry sent nothing");
 }
 
 #[test]
@@ -2023,7 +2146,8 @@ fn nested_dispatch_runs_in_place_when_it_fits_the_lease() {
 }
 
 /// In place, potluck's own variables stay the job's: `--env` and the committed potluck.toml
-/// can't change them (a nested dispatch inside would otherwise present another lease).
+/// can't change them (a nested dispatch inside would otherwise present another lease), nor add or
+/// change a `POTLUCK_MIRROR_` one.
 #[test]
 fn nested_dispatch_keeps_the_jobs_own_variables() {
     let grant = Grant {
@@ -2036,6 +2160,7 @@ fn nested_dispatch_keeps_the_jobs_own_variables() {
     let cwd = tempfile::tempdir().unwrap();
     let r = run(inside_job(&fake, cwd.path())
         .env("TMPDIR", "/the-jobs-tmp")
+        .env("POTLUCK_MIRROR_dep", "/the-jobs-mirror")
         .args([
             "dispatch",
             "--timeout",
@@ -2047,14 +2172,21 @@ fn nested_dispatch_keeps_the_jobs_own_variables() {
             "--env",
             "TMPDIR=/elsewhere",
             "--env",
+            "POTLUCK_MIRROR_dep=/elsewhere",
+            "--env",
+            "POTLUCK_MIRROR_other=/elsewhere",
+            "--env",
             "X=from-flag",
             "--",
             "sh",
             "-c",
-            "echo $POTLUCK_JOB $POTLUCK_LEASE $TMPDIR $X",
+            "echo $POTLUCK_JOB $POTLUCK_LEASE $TMPDIR $POTLUCK_MIRROR_dep ${POTLUCK_MIRROR_other-unset} $X",
         ]));
     assert_eq!(r.code, 0, "{}", r.stderr);
-    assert_eq!(r.stdout.trim(), "studio-9 secret /the-jobs-tmp from-flag");
+    assert_eq!(
+        r.stdout.trim(),
+        "studio-9 secret /the-jobs-tmp /the-jobs-mirror unset from-flag"
+    );
 }
 
 /// `potluck env`: one `K=V` line a variable, a value's line breaks written as escapes, and what
@@ -2286,6 +2418,10 @@ fn nested_dispatch_refuses_options_it_cannot_honour() {
         (
             &["--without-submodule", "vendor/x"][..],
             "with the submodules that job's dispatch shipped",
+        ),
+        (
+            &["--carry", "../dep"][..],
+            "with the mirrors job studio-9's dispatch carried commits into",
         ),
     ] {
         let mut args = vec!["dispatch", "--timeout", "1m"];

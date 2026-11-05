@@ -19,13 +19,17 @@
 //! - A dispatch can leave submodules out ([`inspect_without`]): patterns on the full path from
 //!   the top. One left out, and everything nested in it, is neither checked nor listed, so the
 //!   job's workspace doesn't have it, and its uncommitted changes don't count.
+//! - A dispatch can carry other repositories' commits along (`--carry DIR[@REV]`, [`carry_all`]),
+//!   which go into the mirrors like a submodule's but are never checked out. A carried
+//!   repository's id is [`repo_id`] of its common git dir, the id a dispatch from that repository
+//!   gets, so the daemon's salting makes it the id of the mirror its own jobs use.
 //!
 //! Git is driven through the `git` command line. Every git potluck runs drops the environment
 //! variables that would point it at another repository, index or object store
 //! (`git rev-parse --local-env-vars`), so a potluck started from a git hook still reads the
 //! repository it was pointed at.
 
-use crate::types::{RepoRef, SubmoduleRef};
+use crate::types::{CarriedRef, RepoRef, SubmoduleRef};
 use anyhow::{Context, bail};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -212,6 +216,7 @@ pub fn inspect_without(
             commit,
             branch,
             submodules,
+            carried: Vec::new(),
         },
         left_out: skip.left_out,
     })
@@ -498,8 +503,9 @@ pub fn submodule_repo_id(top_id: &str, path: &str) -> String {
     format!("{name}-{hash:08x}")
 }
 
-/// `repo` with its ids salted with `owner` ([`crate::types::owned_repo_id`]) and its submodules'
-/// ids derived from the salted top id.
+/// `repo` with its ids salted with `owner` ([`crate::types::owned_repo_id`]): its submodules'
+/// ids derived from the salted top id, and its carried repositories' ids salted as a dispatch
+/// from each of them would be ([`owned_carried`]).
 pub fn owned_repo(owner: &str, repo: &RepoRef) -> RepoRef {
     let id = crate::types::owned_repo_id(owner, &repo.id);
     let submodules = repo
@@ -513,8 +519,171 @@ pub fn owned_repo(owner: &str, repo: &RepoRef) -> RepoRef {
     RepoRef {
         id,
         submodules,
+        carried: owned_carried(owner, &repo.carried),
         ..repo.clone()
     }
+}
+
+/// Carried repositories with their ids salted with `owner`, each as a dispatch from that
+/// repository itself is ([`crate::types::owned_repo_id`] of the CLI's [`repo_id`]), so their
+/// commits go into the mirrors that repository's own jobs use. Salted also for a dispatch into a
+/// workspace from before salting, which keeps its own unsalted ids: a carried repository's
+/// mirror isn't that workspace's.
+pub fn owned_carried(owner: &str, carried: &[CarriedRef]) -> Vec<CarriedRef> {
+    carried
+        .iter()
+        .map(|c| CarriedRef {
+            repo_id: crate::types::owned_repo_id(owner, &c.repo_id),
+            ..c.clone()
+        })
+        .collect()
+}
+
+/// What `--carry DIR[@REV]` names, relative to `cwd`: the directory and the revision. The whole
+/// argument is the directory when it is one, with REV HEAD. Otherwise it splits at the last `@`
+/// whose left side is an existing directory, so a revision may hold `@` (`dep@HEAD@{1}`) and a
+/// directory too (`dep@2@main`); without an `@`, REV is HEAD.
+pub fn split_carry(arg: &str, cwd: &Path) -> anyhow::Result<(PathBuf, String)> {
+    if arg.is_empty() {
+        bail!("--carry \"\": names no directory (DIR[@REV])");
+    }
+    let whole = cwd.join(arg);
+    if whole.is_dir() {
+        return Ok((whole, "HEAD".to_string()));
+    }
+    let splits: Vec<usize> = arg.match_indices('@').map(|(i, _)| i).collect();
+    for &at in splits.iter().rev() {
+        let (dir, rev) = (&arg[..at], &arg[at + 1..]);
+        let path = cwd.join(dir);
+        if dir.is_empty() || !path.is_dir() {
+            continue;
+        }
+        if rev.is_empty() {
+            bail!("--carry {arg}: names no revision after the @ (DIR[@REV])");
+        }
+        return Ok((path, rev.to_string()));
+    }
+    let dir = splits.last().map_or(arg, |&at| &arg[..at]);
+    if dir.is_empty() {
+        bail!("--carry {arg}: names no directory before the @ (DIR[@REV])");
+    }
+    bail!(
+        "--carry {arg}: there is no directory {}",
+        cwd.join(dir).display()
+    )
+}
+
+/// The repository and commit `--carry DIR[@REV]` names ([`split_carry`]): DIR is any directory
+/// in a git repository, a bare one too, and REV (HEAD by default) is resolved there to a commit
+/// (`rev-parse --verify REV^{commit}`), HEAD being that worktree's. Its id is [`repo_id`] of its
+/// common git dir; its name is the directory name of its worktree's top (of a bare repository,
+/// its own name without `.git`), with every character but ASCII letters, digits and `_` made
+/// `_`.
+pub fn carried(arg: &str, cwd: &Path) -> anyhow::Result<CarriedRef> {
+    let (dir, rev) = split_carry(arg, cwd)?;
+    let out = git_text(
+        &dir,
+        [
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-common-dir",
+            "--is-inside-work-tree",
+        ],
+    )
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "--carry {arg}: {} is not in a git repository",
+            dir.display()
+        )
+    })?;
+    let mut lines = out.lines();
+    let (Some(common), Some(inside)) = (lines.next(), lines.next()) else {
+        bail!("unexpected output from git rev-parse in {}", dir.display());
+    };
+    let common = canonical(Path::new(common))?;
+    let top = if inside == "true" {
+        let top = git_text(
+            &dir,
+            ["rev-parse", "--path-format=absolute", "--show-toplevel"],
+        )?;
+        Some(canonical(Path::new(&top))?)
+    } else {
+        None
+    };
+    let commit = git_text(
+        &dir,
+        [
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "--end-of-options",
+            &format!("{rev}^{{commit}}"),
+        ],
+    )
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "--carry {arg}: {rev} names no commit in {}",
+            top.as_deref().unwrap_or(&common).display()
+        )
+    })?;
+    let raw = match &top {
+        Some(top) => top.file_name().map(|n| n.to_string_lossy().into_owned()),
+        None => match common.file_name().map(|n| n.to_string_lossy().into_owned()) {
+            Some(n) if n == ".git" => common
+                .parent()
+                .and_then(Path::file_name)
+                .map(|n| n.to_string_lossy().into_owned()),
+            Some(n) => Some(n.strip_suffix(".git").unwrap_or(&n).to_string()),
+            None => None,
+        },
+    };
+    Ok(CarriedRef {
+        name: carried_name(&raw.unwrap_or_default()),
+        repo_id: repo_id(&common),
+        source: common,
+        commit,
+    })
+}
+
+/// `raw` as the name in `POTLUCK_MIRROR_<name>`: every character but ASCII letters, digits and
+/// `_` made `_`; `repo` when empty.
+pub fn carried_name(raw: &str) -> String {
+    if raw.is_empty() {
+        return "repo".to_string();
+    }
+    raw.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect()
+}
+
+/// The repositories a dispatch of `repo` carries along, one for each `--carry` ([`carried`]).
+/// Refused: `repo` itself (its workspace holds its commit), and two that are one repository (a
+/// job's mirror holds one pinned commit of each) or have one name.
+pub fn carry_all(args: &[String], cwd: &Path, repo: &RepoRef) -> anyhow::Result<Vec<CarriedRef>> {
+    let mut all: Vec<(&str, CarriedRef)> = Vec::new();
+    for arg in args {
+        let c = carried(arg, cwd)?;
+        if c.repo_id == repo.id {
+            bail!(
+                "--carry {arg}: that is the job's own repository ({}), whose commit its workspace holds; --carry is for other repositories",
+                c.source.display()
+            );
+        }
+        if let Some((other, _)) = all.iter().find(|(_, o)| o.repo_id == c.repo_id) {
+            bail!(
+                "--carry {other} and --carry {arg} are one repository ({}): a dispatch carries one commit of each repository",
+                c.source.display()
+            );
+        }
+        if let Some((other, _)) = all.iter().find(|(_, o)| o.name == c.name) {
+            bail!(
+                "--carry {other} and --carry {arg} would both be POTLUCK_MIRROR_{}: carried repositories need directories with different names",
+                c.name
+            );
+        }
+        all.push((arg, c));
+    }
+    Ok(all.into_iter().map(|(_, c)| c).collect())
 }
 
 /// The first 12 characters of a commit id, for messages. Ids from peers or raw requests aren't
@@ -534,6 +703,245 @@ mod tests {
         assert_eq!(short("0123456789abcdef"), "0123456789ab");
         assert_eq!(short("abc"), "abc");
         assert_eq!(short("aaaaaaaaaaa\u{e9}"), "aaaaaaaaaaa\u{e9}");
+    }
+
+    /// git in `dir` for a test, with no global or system config.
+    fn test_git(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "init.defaultBranch=main",
+            ])
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// A repository at `dir` with two commits.
+    fn two_commits(dir: &Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        test_git(dir, &["init", "-q"]);
+        for n in ["one", "two"] {
+            std::fs::write(dir.join("f"), n).unwrap();
+            test_git(dir, &["add", "f"]);
+            test_git(dir, &["commit", "-qm", n]);
+        }
+    }
+
+    fn err_of<T: std::fmt::Debug>(r: anyhow::Result<T>) -> String {
+        format!("{:#}", r.unwrap_err())
+    }
+
+    /// `--carry DIR[@REV]`: a whole argument that is a directory has no REV; otherwise it splits
+    /// at the last `@` with a directory before it.
+    #[test]
+    fn carry_arguments_split_into_a_directory_and_a_revision() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path();
+        for d in ["dep", "v@2", "v@2@x"] {
+            std::fs::create_dir_all(cwd.join(d)).unwrap();
+        }
+        let split = |a: &str| split_carry(a, cwd).unwrap();
+        let at = |d: &str, r: &str| (cwd.join(d), r.to_string());
+        assert_eq!(split("dep"), at("dep", "HEAD"));
+        assert_eq!(split("dep/"), at("dep/", "HEAD"));
+        assert_eq!(split("dep@b01aec5cbe"), at("dep", "b01aec5cbe"));
+        assert_eq!(split("dep@HEAD@{1}"), at("dep", "HEAD@{1}"));
+        assert_eq!(split("dep@main@{upstream}"), at("dep", "main@{upstream}"));
+        // A directory whose name holds an @.
+        assert_eq!(split("v@2"), at("v@2", "HEAD"));
+        assert_eq!(split("v@2@x"), at("v@2@x", "HEAD"));
+        assert_eq!(split("v@2@main"), at("v@2", "main"));
+        assert_eq!(split("v@2@x@main"), at("v@2@x", "main"));
+        // Absolute, and relative to the working directory.
+        let abs = cwd.join("dep");
+        assert_eq!(
+            split_carry(&format!("{}@v1", abs.display()), Path::new("/")).unwrap(),
+            (abs.clone(), "v1".to_string())
+        );
+        assert_eq!(
+            split_carry("../dep@v1", &cwd.join("v@2")).unwrap(),
+            (cwd.join("v@2/../dep"), "v1".to_string())
+        );
+
+        let e = err_of(split_carry("nope", cwd));
+        assert!(
+            e.contains("--carry nope: there is no directory") && e.contains("nope"),
+            "{e}"
+        );
+        let e = err_of(split_carry("nope@abc", cwd));
+        assert!(
+            e.ends_with(&format!("{}", cwd.join("nope").display())),
+            "{e}"
+        );
+        let e = err_of(split_carry("dep@", cwd));
+        assert!(e.contains("names no revision after the @"), "{e}");
+        let e = err_of(split_carry("@abc", cwd));
+        assert!(e.contains("names no directory before the @"), "{e}");
+        let e = err_of(split_carry("", cwd));
+        assert!(e.contains("names no directory"), "{e}");
+    }
+
+    /// A carried repository: its commit at REV, its name from its directory, and the id a
+    /// dispatch from it gets.
+    #[test]
+    fn carried_repositories_are_read_like_a_dispatch_from_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dep = tmp.path().join("my-dep.rs");
+        two_commits(&dep);
+        let head = test_git(&dep, &["rev-parse", "HEAD"]);
+        let first = test_git(&dep, &["rev-parse", "HEAD~1"]);
+        let c = carried("my-dep.rs", tmp.path()).unwrap();
+        assert_eq!(c.name, "my_dep_rs");
+        assert_eq!(c.commit, head);
+        assert_eq!(c.source, canonical(&dep.join(".git")).unwrap());
+        // The id a dispatch from the repository itself sends.
+        assert_eq!(c.repo_id, inspect(&dep).unwrap().id);
+        assert_eq!(
+            carried("my-dep.rs@HEAD~1", tmp.path()).unwrap().commit,
+            first
+        );
+        // A subdirectory, and a full or short sha.
+        std::fs::create_dir_all(dep.join("sub")).unwrap();
+        let sub = carried(
+            &format!("{}@{}", dep.join("sub").display(), &first[..10]),
+            tmp.path(),
+        )
+        .unwrap();
+        assert_eq!(
+            (sub.commit.as_str(), sub.name.as_str()),
+            (first.as_str(), "my_dep_rs")
+        );
+        assert_eq!(sub.repo_id, c.repo_id);
+
+        // A commit on no branch: only committed work, but not only branches.
+        test_git(&dep, &["checkout", "-q", "--detach"]);
+        std::fs::write(dep.join("f"), "detached").unwrap();
+        test_git(&dep, &["commit", "-qam", "detached"]);
+        let detached = test_git(&dep, &["rev-parse", "HEAD"]);
+        test_git(&dep, &["checkout", "-q", "main"]);
+        let d = carried(&format!("my-dep.rs@{detached}"), tmp.path()).unwrap();
+        assert_eq!(d.commit, detached);
+
+        // A linked worktree: its own HEAD and directory name, the repository's id.
+        let wt = tmp.path().join("dep-wt");
+        test_git(
+            &dep,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                wt.to_str().unwrap(),
+                &first,
+            ],
+        );
+        let w = carried("dep-wt", tmp.path()).unwrap();
+        assert_eq!(
+            (w.commit.as_str(), w.name.as_str()),
+            (first.as_str(), "dep_wt")
+        );
+        assert_eq!((&w.repo_id, &w.source), (&c.repo_id, &c.source));
+
+        // A bare repository is named without its .git, and so is a .git directory by its
+        // parent.
+        test_git(
+            tmp.path(),
+            &["clone", "-q", "--bare", dep.to_str().unwrap(), "tools.git"],
+        );
+        let b = carried("tools.git", tmp.path()).unwrap();
+        assert_eq!(
+            (b.name.as_str(), b.commit.as_str()),
+            ("tools", head.as_str())
+        );
+        assert!(b.repo_id.starts_with("tools-"), "{}", b.repo_id);
+        let g = carried("my-dep.rs/.git", tmp.path()).unwrap();
+        assert_eq!((g.name.as_str(), &g.repo_id), ("my_dep_rs", &c.repo_id));
+
+        // Refused: not a repository, and a revision that names no commit.
+        let plain = tmp.path().join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        let e = err_of(carried("plain", tmp.path()));
+        assert!(
+            e.contains("--carry plain:") && e.contains("is not in a git repository"),
+            "{e}"
+        );
+        let e = err_of(carried("my-dep.rs@nope", tmp.path()));
+        assert!(
+            e.contains("--carry my-dep.rs@nope: nope names no commit in"),
+            "{e}"
+        );
+        let tree = test_git(&dep, &["rev-parse", "HEAD^{tree}"]);
+        let e = err_of(carried(&format!("my-dep.rs@{tree}"), tmp.path()));
+        assert!(e.contains("names no commit"), "{e}");
+        let e = err_of(carried("my-dep.rs@--output=x", tmp.path()));
+        assert!(e.contains("names no commit"), "{e}");
+    }
+
+    #[test]
+    fn carried_names() {
+        assert_eq!(carried_name("dep"), "dep");
+        assert_eq!(carried_name("my-dep.rs"), "my_dep_rs");
+        assert_eq!(carried_name("Dep_2"), "Dep_2");
+        assert_eq!(carried_name("caf\u{e9}"), "caf_");
+        assert_eq!(carried_name(""), "repo");
+    }
+
+    /// Refused: the job's own repository, one repository twice, and two with one name.
+    #[test]
+    fn a_dispatch_carries_other_repositories_once_each_under_distinct_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = tmp.path().join("app");
+        let dep = tmp.path().join("dep");
+        let other = tmp.path().join("other/dep");
+        let util = tmp.path().join("util");
+        for r in [&app, &dep, &other, &util] {
+            two_commits(r);
+        }
+        let repo = inspect(&app).unwrap();
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let all = carry_all(&args(&["dep", "util@HEAD~1"]), tmp.path(), &repo).unwrap();
+        assert_eq!(
+            all.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+            ["dep", "util"]
+        );
+        assert!(carry_all(&[], tmp.path(), &repo).unwrap().is_empty());
+
+        let e = err_of(carry_all(&args(&["app"]), tmp.path(), &repo));
+        assert!(
+            e.contains("--carry app: that is the job's own repository"),
+            "{e}"
+        );
+        // From a subdirectory of the job's own repository too.
+        std::fs::create_dir_all(app.join("src")).unwrap();
+        let e = err_of(carry_all(&args(&["src"]), &app, &repo));
+        assert!(e.contains("the job's own repository"), "{e}");
+
+        let e = err_of(carry_all(&args(&["dep", "dep@HEAD~1"]), tmp.path(), &repo));
+        assert!(
+            e.contains("--carry dep and --carry dep@HEAD~1 are one repository"),
+            "{e}"
+        );
+        let e = err_of(carry_all(&args(&["dep", "other/dep"]), tmp.path(), &repo));
+        assert!(
+            e.contains("--carry dep and --carry other/dep would both be POTLUCK_MIRROR_dep"),
+            "{e}"
+        );
     }
 
     #[test]
@@ -582,6 +990,12 @@ mod tests {
                 source: PathBuf::from("/src/app/.git/modules/vendor/qemu"),
                 commit: "d".repeat(40),
             }],
+            carried: vec![CarriedRef {
+                name: "dep".into(),
+                repo_id: "dep-89abcdef".into(),
+                source: PathBuf::from("/src/dep/.git"),
+                commit: "e".repeat(40),
+            }],
         };
         let a = owned_repo("studio", &repo);
         let b = owned_repo("msi", &repo);
@@ -593,6 +1007,37 @@ mod tests {
         assert_ne!(a.id, b.id);
         assert_ne!(a.submodules[0].repo_id, b.submodules[0].repo_id);
         assert_ne!(a.submodules[0].repo_id, repo.submodules[0].repo_id);
+        // A carried repository gets the id a dispatch from it gets here.
+        assert_eq!(
+            a.carried[0].repo_id,
+            crate::types::owned_repo_id("studio", "dep-89abcdef")
+        );
+        assert_eq!(
+            a.carried[0].repo_id,
+            owned_repo(
+                "studio",
+                &RepoRef {
+                    id: "dep-89abcdef".into(),
+                    submodules: Vec::new(),
+                    carried: Vec::new(),
+                    ..repo.clone()
+                }
+            )
+            .id
+        );
+        assert_ne!(a.carried[0].repo_id, b.carried[0].repo_id);
+        assert_eq!(
+            (
+                &a.carried[0].name,
+                &a.carried[0].commit,
+                &a.carried[0].source
+            ),
+            (
+                &repo.carried[0].name,
+                &repo.carried[0].commit,
+                &repo.carried[0].source
+            )
+        );
         // Everything else as it was.
         assert_eq!(
             (a.commit, a.source, a.branch),

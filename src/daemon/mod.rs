@@ -49,17 +49,20 @@
 //! `admit`, from a new member's `pair --finish`, until it is removed); a daemon on a machine in no
 //! cluster opens no port.
 //!
-//! Pins: a dispatch pins its commits (the repository's and each submodule's) under the job id
-//! until the job ends; the workspace module pins them under the workspace id when it seeds a
-//! workspace and drops those pins when it removes it.
+//! Pins: a dispatch pins its commits (the repository's, each submodule's and each carried
+//! repository's) under the job id until the job ends; the workspace module pins the repository's
+//! and its submodules' under the workspace id when it seeds a workspace and drops those pins when
+//! it removes it.
 //!
 //! A job's environment: the login environment, then the `[[gpu]]` env of each GPU it holds, then
 //! the spec's env, less the spec's `unset_env`, then potluck's own, which nothing overrides or
 //! unsets: POTLUCK_JOB, POTLUCK_LEASE, POTLUCK_WORKSPACE, POTLUCK_NODE, POTLUCK_GPUS, TMPDIR
 //! (beside the workspace), POTLUCK_HOME and POTLUCK_CONFIG (so a potluck call inside the job
-//! reaches this daemon).
+//! reaches this daemon), and POTLUCK_MIRROR_<name> for each carried repository (no other
+//! POTLUCK_MIRROR_ variable is kept).
 //!
-//! The names of potluck's own variables are [`JOB_VARIABLES`].
+//! The names of potluck's own variables are [`JOB_VARIABLES`] and [`MIRROR_VARIABLE_PREFIX`]'s
+//! ([`is_job_variable`]).
 //!
 //! A job's directory ([`Paths::job_dir`]) holds `output.log` (stdout and stderr, copied there by
 //! the supervisor, up to the config's `log_max_mib` and the last 16 MiB after it), `status.json`
@@ -1045,6 +1048,17 @@ pub const JOB_VARIABLES: [&str; 8] = [
     "POTLUCK_CONFIG",
     "TMPDIR",
 ];
+
+/// Variables with this prefix are potluck's own too: `POTLUCK_MIRROR_<name>` for each repository
+/// the dispatch carried (`--carry`), the path of the mirror holding its commit. One the machine
+/// or the dispatch sets is dropped, so a job has exactly the ones its dispatch carried.
+pub const MIRROR_VARIABLE_PREFIX: &str = "POTLUCK_MIRROR_";
+
+/// Whether `name` is one of potluck's own variables in a job's environment: [`JOB_VARIABLES`] and
+/// [`MIRROR_VARIABLE_PREFIX`]'s.
+pub fn is_job_variable(name: &str) -> bool {
+    JOB_VARIABLES.contains(&name) || name.starts_with(MIRROR_VARIABLE_PREFIX)
+}
 
 /// How long a starting daemon waits for `daemon.lock`. The previous daemon may be letting go of it
 /// right now: exiting during a restart, or (in one process) closed while a child forked by another

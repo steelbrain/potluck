@@ -35,14 +35,10 @@ const FETCHED_CLEANUP_MS: u64 = 10_000;
 /// 8 still in their handshake, and this daemon's own dials to it take up to 4 of those.
 const MAX_SYNCS_PER_OWNER: usize = 3;
 
-/// Every (repository id, commit) a dispatch names.
+/// Every (repository id, commit) a dispatch names ([`RepoRef::commits`]).
 fn commits(repo: &RepoRef) -> Vec<(String, String)> {
-    std::iter::once((repo.id.clone(), repo.commit.clone()))
-        .chain(
-            repo.submodules
-                .iter()
-                .map(|s| (s.repo_id.clone(), s.commit.clone())),
-        )
+    repo.commits()
+        .map(|(id, _, commit)| (id.to_string(), commit.to_string()))
         .collect()
 }
 

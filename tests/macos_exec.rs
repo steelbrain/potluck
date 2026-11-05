@@ -27,6 +27,7 @@ fn job(cmd: &[&str]) -> JobRecord {
                 commit: "0".repeat(40),
                 branch: None,
                 submodules: vec![],
+                carried: vec![],
             },
             workspace: None,
             cmd: cmd.iter().map(|s| s.to_string()).collect(),

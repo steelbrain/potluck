@@ -7,6 +7,17 @@ job=$(potluck dispatch --json --timeout 10m -- cargo test | jq -r .job)
 potluck wait "$job"
 ```
 
+`dispatch --json` has the job's id (`job`), whether `--key` named a job that already existed
+(`existing`), its `state`, its `workspace` once it has one, the dispatched `commit` and
+`branch`, the submodules left out (`without_submodules`) and the repositories carried
+(`carried`). Each entry of `carried` has the `name` of its `POTLUCK_MIRROR_<name>` variable, the
+full `commit` and the `source`, the repository's git directory on the dispatching machine:
+
+```console
+$ potluck dispatch --json --timeout 10m --carry ../dep -- cargo test | jq -c .carried
+[{"commit":"b01aec5cbe2b49c1f0f7a3c6e9d1e4b2a8c7f610","name":"dep","source":"/Users/me/src/dep/.git"}]
+```
+
 ## Output and exit codes
 
 Without `--json`, results go to stdout, and errors and reminders to stderr. With `--json`, every

@@ -1585,6 +1585,15 @@ fn prepare_and_start(sh: &Arc<Shared>, id: &str) -> Result<(), NotStarted> {
     for k in &job.spec.unset_env {
         env.remove(k);
     }
+    // The mirror holding each carried commit, where the job fetches it from; the job has no
+    // other POTLUCK_MIRROR_ variable.
+    env.retain(|k, _| !k.starts_with(super::MIRROR_VARIABLE_PREFIX));
+    for c in &job.spec.repo.carried {
+        env.insert(
+            format!("{}{}", super::MIRROR_VARIABLE_PREFIX, c.name),
+            sh.paths.mirror(&c.repo_id).display().to_string(),
+        );
+    }
     env.insert("POTLUCK_JOB".into(), id.to_string());
     env.insert("POTLUCK_LEASE".into(), lease.token.clone());
     env.insert("POTLUCK_WORKSPACE".into(), ws.id.clone());
@@ -1877,16 +1886,12 @@ fn is_crash_signal(sig: i32) -> bool {
     )
 }
 
-/// Pins the commits of `repo` and its submodules under `name`; on a failure, unpins those done.
+/// Pins every commit `repo` names (its own, its submodules' and its carried repositories',
+/// [`RepoRef::commits`]) under `name`; on a failure, unpins those done.
 pub(crate) fn pin_all(sh: &Shared, repo: &RepoRef, name: &str) -> Result<(), String> {
     let w = &sh.parts.workspaces;
     let mut done: Vec<&str> = Vec::new();
-    let all = std::iter::once((repo.id.as_str(), repo.commit.as_str())).chain(
-        repo.submodules
-            .iter()
-            .map(|s| (s.repo_id.as_str(), s.commit.as_str())),
-    );
-    for (repo_id, commit) in all {
+    for (repo_id, _, commit) in repo.commits() {
         if let Err(e) = w.pin(repo_id, commit, name) {
             for r in done {
                 let _ = w.unpin(r, name);
@@ -1950,12 +1955,11 @@ pub(crate) fn sweep_pins(sh: &Shared) {
     }
 }
 
-/// Releases `name`'s pins of `repo` and its submodules. Best effort: failures are logged.
+/// Releases `name`'s pins of every repository `repo` names ([`RepoRef::commits`]). Best effort:
+/// failures are logged.
 pub(crate) fn unpin_all(sh: &Shared, repo: &RepoRef, name: &str) {
     let w = &sh.parts.workspaces;
-    let ids =
-        std::iter::once(repo.id.as_str()).chain(repo.submodules.iter().map(|s| s.repo_id.as_str()));
-    for repo_id in ids {
+    for (repo_id, _, _) in repo.commits() {
         if let Err(e) = w.unpin(repo_id, name) {
             sh.log.log(format!("unpin {name} in {repo_id}: {e:#}"));
         }
@@ -2488,6 +2492,7 @@ mod tests {
                 commit: "a".repeat(40),
                 branch: None,
                 submodules: vec![],
+                carried: vec![],
             },
             workspace: None,
             cmd: vec!["true".into()],

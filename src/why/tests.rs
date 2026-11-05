@@ -20,6 +20,7 @@ fn record(id: &str, state: JobState) -> JobRecord {
                 commit: "a".repeat(40),
                 branch: Some("agent-1".into()),
                 submodules: Vec::new(),
+                carried: Vec::new(),
             },
             workspace: None,
             cmd: vec!["true".into()],

@@ -813,6 +813,7 @@ fn spec(cmd: &str) -> JobSpec {
                 source: PathBuf::from("/src/project/.git/modules/vendor/lib"),
                 commit: "1".repeat(40),
             }],
+            carried: vec![],
         },
         workspace: None,
         cmd: vec!["sh".into(), "-c".into(), cmd.into()],
@@ -995,6 +996,113 @@ fn a_workspace_from_before_ids_were_salted_keeps_working() {
     let mut held: Vec<String> = c.reminders.iter().map(|r| r.workspace.clone()).collect();
     held.sort();
     assert_eq!(held, [fresh, w]);
+}
+
+/// A carried repository (`--carry`): its mirror synced from its source under the id a dispatch
+/// from it gets here (salted, also in a dispatch into a workspace from before salting), its commit
+/// pinned for the job until it ends and not for the workspace, and the job told where that mirror
+/// is in POTLUCK_MIRROR_<name>, which no env sets. A raw dispatch with a bad name, or one
+/// repository twice, is refused.
+#[test]
+fn a_carried_repository_is_synced_pinned_and_named_to_the_job() {
+    let f = Fixture::new();
+    let s = spec("true");
+    let old = "testnode-w7".to_string();
+    let root = f.ws.create(&old, &s.repo).unwrap();
+    let now = now_ms();
+    potluck::store::Store::open(&f.paths.db())
+        .unwrap()
+        .put_workspace(&WorkspaceRecord {
+            id: old.clone(),
+            node: "testnode".into(),
+            repo_id: REPO.into(),
+            commit: s.repo.commit.clone(),
+            branch: Some(BRANCH.into()),
+            path: root,
+            state: WorkspaceState::Held,
+            created_at: now - 60_000,
+            last_used_at: now - 60_000,
+            held_until: now + 3_600_000,
+            pending: 0,
+            size_bytes: Some(4096),
+        })
+        .unwrap();
+    let f = f.start();
+    let carried = |name: &str, id: &str| potluck::types::CarriedRef {
+        name: name.into(),
+        repo_id: id.into(),
+        source: PathBuf::from(format!("/src/{name}/.git")),
+        commit: "2".repeat(40),
+    };
+    let dep = potluck::types::owned_repo_id("testnode", "dep-01234567");
+    for into in [None, Some(old.clone())] {
+        let mut s = spec("sleep 0.5");
+        s.workspace = into.clone();
+        s.repo.carried = vec![carried("dep", "dep-01234567")];
+        s.env
+            .insert("POTLUCK_MIRROR_dep".into(), "/elsewhere".into());
+        s.env
+            .insert("POTLUCK_MIRROR_other".into(), "/elsewhere".into());
+        let id = f.dispatch(s);
+        f.wait_for(&id, "running", |j| j.state == JobState::Running);
+        assert!(
+            f.ws.pins
+                .lock()
+                .unwrap()
+                .contains(&(dep.clone(), id.clone())),
+            "{into:?}: {:?}",
+            f.ws.pins.lock().unwrap()
+        );
+        let j = f.wait(&id);
+        assert_eq!(j.state, JobState::Succeeded, "{j:#?}");
+        assert_eq!(j.spec.repo.carried[0].repo_id, dep, "{into:?}");
+        assert!(
+            f.ws.synced
+                .lock()
+                .unwrap()
+                .contains(&(dep.clone(), "/src/dep/.git".to_string())),
+            "{:?}",
+            f.ws.synced.lock().unwrap()
+        );
+        let env = &f.exec.launched(&id).env;
+        assert_eq!(
+            PathBuf::from(&env["POTLUCK_MIRROR_dep"]),
+            f.paths.mirror(&dep)
+        );
+        assert!(!env.contains_key("POTLUCK_MIRROR_other"), "{env:?}");
+        wait_until("the job's pins are released", || !f.ws.pinned(&id));
+        assert!(
+            !f.ws.pins.lock().unwrap().iter().any(|(r, _)| r == &dep),
+            "{:?}",
+            f.ws.pins.lock().unwrap()
+        );
+    }
+
+    let mut c = f.client();
+    let mut call = |carried: Vec<potluck::types::CarriedRef>| {
+        let mut s = spec("true");
+        s.repo.carried = carried;
+        c.call(Request::Dispatch { spec: Box::new(s) })
+            .unwrap_err()
+            .to_string()
+    };
+    let e = call(vec![carried("de-p", "dep-01234567")]);
+    assert!(
+        e.contains("a name holds only ASCII letters, digits and _"),
+        "{e}"
+    );
+    let e = call(vec![
+        carried("dep", "dep-01234567"),
+        carried("dep", "dep-89abcdef"),
+    ]);
+    assert!(e.contains("two carried repositories are named dep"), "{e}");
+    let e = call(vec![
+        carried("a", "dep-01234567"),
+        carried("b", "dep-01234567"),
+    ]);
+    assert!(e.contains("carried twice"), "{e}");
+    let e = call(vec![carried("own", REPO)]);
+    assert!(e.contains("is the job's own"), "{e}");
 }
 
 /// A mirror the dispatch synced had diverged from its source (or was recloned): the job's log

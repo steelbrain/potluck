@@ -481,10 +481,48 @@ fn validate(spec: &JobSpec) -> Result<(), String> {
     if spec.repo.commit.is_empty() || spec.repo.id.is_empty() {
         return Err("the dispatch names no repository commit".into());
     }
+    check_carried(&spec.repo)?;
     crate::types::check_on(&spec.on).map_err(|e| format!("--on: {e}"))?;
     // A glob that can't match inside the workspace would only be dropped when the job ends.
     for g in &spec.keep {
         files::check_keep(g).map_err(|e| format!("--keep {e}"))?;
+    }
+    Ok(())
+}
+
+/// The carried repositories of a dispatch (the CLI checks them too): each with a name for its
+/// `POTLUCK_MIRROR_` variable, and a repository and commit, and no two with one name or one
+/// repository (a job pins one commit of each), nor the job's own.
+fn check_carried(repo: &crate::types::RepoRef) -> Result<(), String> {
+    let mut names = std::collections::BTreeSet::new();
+    let mut ids = std::collections::BTreeSet::from([repo.id.as_str()]);
+    for c in &repo.carried {
+        if c.name.is_empty()
+            || !c
+                .name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        {
+            return Err(format!(
+                "carried repository {:?}: a name holds only ASCII letters, digits and _",
+                c.name
+            ));
+        }
+        if c.repo_id.is_empty() || c.commit.is_empty() {
+            return Err(format!(
+                "carried repository {} names no repository commit",
+                c.name
+            ));
+        }
+        if !names.insert(c.name.as_str()) {
+            return Err(format!("two carried repositories are named {}", c.name));
+        }
+        if !ids.insert(c.repo_id.as_str()) {
+            return Err(format!(
+                "carried repository {}: repository {} is the job's own or carried twice",
+                c.name, c.repo_id
+            ));
+        }
     }
     Ok(())
 }
@@ -674,7 +712,7 @@ fn feasible_somewhere(
 /// ([`crate::gitinfo::owned_repo`]), so another owner's repository at the same path never shares
 /// a mirror with it on a runner. A dispatch into a workspace made before ids were salted (its
 /// record has the CLI's unsalted id) keeps the unsalted ids, which that workspace's mirrors and
-/// pins have.
+/// pins have; its carried repositories, in no workspace, are salted all the same.
 fn owned_spec(
     st: &super::state::State,
     spec: &JobSpec,
@@ -687,7 +725,9 @@ fn owned_spec(
     if pinned_to.is_some_and(|ws| {
         ws.repo_id == spec.repo.id && crate::types::is_unsalted_repo_id(&ws.repo_id)
     }) {
-        return spec.clone();
+        let mut spec = spec.clone();
+        spec.repo.carried = crate::gitinfo::owned_carried(&st.node, &spec.repo.carried);
+        return spec;
     }
     JobSpec {
         repo: crate::gitinfo::owned_repo(&st.node, &spec.repo),
@@ -730,19 +770,14 @@ fn check_ws_record(ws: &WorkspaceRecord, w: &str, spec: &JobSpec) -> Result<(), 
     Ok(())
 }
 
-/// Brings this machine's mirrors of the repository and its submodules up to date with their
-/// sources and makes sure they hold the dispatched commits, fetching (and pinning under the job
-/// id) any commit that came with no branch or tag. Returns the warnings to report loudly (a
-/// mirror had diverged from its source, or was recloned), already in the daemon's log.
+/// Brings this machine's mirrors of the repository, its submodules and its carried repositories
+/// up to date with their sources and makes sure they hold the dispatched commits, fetching (and
+/// pinning under the job id) any commit that came with no branch or tag. Returns the warnings to
+/// report loudly (a mirror had diverged from its source, or was recloned), already in the
+/// daemon's log.
 fn sync_mirrors(sh: &Shared, spec: &JobSpec, job: &str) -> Result<Vec<String>, String> {
     let mut warnings = Vec::new();
-    let repo = &spec.repo;
-    let all = std::iter::once((&repo.id, &repo.source, &repo.commit)).chain(
-        repo.submodules
-            .iter()
-            .map(|s| (&s.repo_id, &s.source, &s.commit)),
-    );
-    for (repo_id, source, commit) in all {
+    for (repo_id, source, commit) in spec.repo.commits() {
         let lock = sh.sync_lock(repo_id);
         let _g = lock.lock().unwrap_or_else(|e| e.into_inner());
         let url = source.to_string_lossy();
