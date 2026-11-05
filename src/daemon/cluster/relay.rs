@@ -64,7 +64,8 @@ pub(crate) fn intercept<W: Write>(
         | Request::Wait { job, .. }
         | Request::Logs { job, .. }
         | Request::Why { job }
-        | Request::Cancel { job } => {
+        | Request::Cancel { job }
+        | Request::Resize { job, .. } => {
             let owner = owner_of(job);
             if owner != me {
                 if relayed || !c.is_member(owner) || c.removed() {
@@ -552,6 +553,7 @@ pub(super) fn serve(
             | Request::Logs { .. }
             | Request::Why { .. }
             | Request::Cancel { .. }
+            | Request::Resize { .. }
             | Request::Copy { .. }
             | Request::Hold { .. }
             | Request::Release { .. }
@@ -620,7 +622,8 @@ fn may_answer(c: &Cluster, from: &str, req: &ClientRequest) -> Result<Answer, St
         | Request::Wait { job, .. }
         | Request::Logs { job, .. }
         | Request::Why { job }
-        | Request::Cancel { job } => {
+        | Request::Cancel { job }
+        | Request::Resize { job, .. } => {
             let owner = owner_of(job);
             if owner == me {
                 return Ok(Answer::Here);

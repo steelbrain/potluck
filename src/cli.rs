@@ -54,6 +54,20 @@ pub enum Command {
         /// The job's id.
         job: String,
     },
+    /// Lower a queued job's RAM request; it keeps its place in the queue.
+    ///
+    /// The machine the job was dispatched on changes it, only while the job is queued, and only
+    /// to less than it asks for: the same amount changes nothing, and more is refused. In a
+    /// cluster with users, the job with its new request is signed with this command line's user
+    /// key.
+    Resize {
+        /// The job's id.
+        job: String,
+        /// The RAM it reserves and its hard limit from now on, as `dispatch --ram` takes it: 2,
+        /// 2G, 512M.
+        #[arg(long, value_name = "N")]
+        ram: String,
+    },
     /// Hold a workspace for DURATION from now (at most 24h).
     Hold {
         /// The workspace's id, such as studio-w5.
@@ -659,6 +673,7 @@ impl Cx<'_> {
             } => self.wait(&job, max_wait.as_deref(), quiet),
             Command::Logs { job, follow } => self.logs(&job, follow),
             Command::Cancel { job } => self.cancel(&job),
+            Command::Resize { job, ram } => self.resize(&job, &ram),
             Command::Hold {
                 workspace,
                 duration,
@@ -1195,6 +1210,91 @@ impl Cx<'_> {
             _ => format!("cancelled job {job}"),
         };
         Ok(Report::new(json!({ "job": job, "record": record }), human))
+    }
+
+    /// `potluck resize JOB --ram N`: the job's RAM request lowered by its owner, the job keeping
+    /// its place in line.
+    fn resize(&mut self, job: &str, ram: &str) -> anyhow::Result<Report> {
+        let ram_mib =
+            crate::types::parse_ram_mib(ram).map_err(|e| anyhow::anyhow!("--ram: {e}"))?;
+        let auth = self.signed_resize(job, ram_mib)?;
+        let (record, from) = match self.call(Req::Resize {
+            job: job.to_string(),
+            ram_mib,
+            auth,
+        }) {
+            Ok(Response::Resized { job, from_ram_mib }) => (*job, from_ram_mib),
+            Ok(other) => return Err(unexpected("resize", &other)),
+            Err(e) if crate::client::not_understood(&e) => anyhow::bail!(
+                "the daemon here runs a potluck from before `potluck resize`; `potluck restart` \
+                 restarts it on the binary at its path"
+            ),
+            Err(e) => return Err(e),
+        };
+        let now = record.spec.request.ram_mib;
+        let changed = now != from;
+        let human = match changed {
+            true => format!(
+                "job {job} now asks for {} of RAM, not {}; it keeps its place in the queue",
+                fmt_mib(now),
+                fmt_mib(from)
+            ),
+            false => format!(
+                "job {job} asks for {} of RAM already; nothing changed",
+                fmt_mib(now)
+            ),
+        };
+        Ok(Report::new(
+            json!({
+                "job": job,
+                "changed": changed,
+                "ram_mib": now,
+                "from_ram_mib": from,
+                "record": record,
+            }),
+            human,
+        ))
+    }
+
+    /// For `resize`: the job's spec as its owner holds it, with `ram_mib` as its RAM request,
+    /// signed with this command line's user key when it has one (for its owner, as `user init`
+    /// signs a job: [`crate::jobauth::salted_already`]). Without a key it goes unsigned, unless
+    /// the cluster has users: then it is refused here.
+    fn signed_resize(
+        &mut self,
+        job: &str,
+        ram_mib: u64,
+    ) -> anyhow::Result<Option<Box<crate::jobauth::JobAuth>>> {
+        let path = crate::mesh::user::key_path(&self.env.paths);
+        let Some(key) = UserKey::load(&path)? else {
+            if self
+                .membership_for_signing()?
+                .is_some_and(|m| m.users_exist)
+            {
+                anyhow::bail!(
+                    "this cluster has users, so a resize is signed with a user's key, and there is none at {} (resize from the machine where a user's key is; or make one here with `potluck user key` and have a user run `potluck user add NAME KEY`)",
+                    path.display()
+                );
+            }
+            return Ok(None);
+        };
+        let held = match self.call(Req::Get {
+            job: job.to_string(),
+        })? {
+            Response::Job { job } => job.spec,
+            other => return Err(unexpected("get", &other)),
+        };
+        let spec = crate::types::JobSpec {
+            request: crate::types::Request {
+                ram_mib,
+                ..held.request.clone()
+            },
+            auth: None,
+            ..held
+        };
+        Ok(crate::jobauth::sign(&spec, &key, now_ms())
+            .auth
+            .map(Box::new))
     }
 
     fn hold(&mut self, workspace: &str, duration: &str) -> anyhow::Result<Report> {

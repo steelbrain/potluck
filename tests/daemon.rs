@@ -1359,6 +1359,112 @@ fn cancel_queued_and_running() {
     ));
 }
 
+/// What the daemon answers a resize of `job` to `ram_mib`, unsigned: the job and its request
+/// before, or the refusal.
+fn resized(f: &Fixture, job: &str, ram_mib: u64) -> Result<(JobRecord, u64), String> {
+    match f.client().call(Request::Resize {
+        job: job.into(),
+        ram_mib,
+        auth: None,
+    }) {
+        Ok(Response::Resized { job, from_ram_mib }) => Ok((*job, from_ram_mib)),
+        Ok(other) => panic!("{other:?}"),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// A resize lowers a queued job's RAM request where it stands in line: its priority, passes,
+/// submit time and id stay, so the job dispatched after it, which fits but may not jump the line,
+/// stays behind it; once its request fits, it starts, and then the one behind it. The same amount
+/// changes nothing; more, or a job that runs or has ended, is refused.
+#[test]
+fn resize_lowers_a_queued_jobs_request_in_place() {
+    let f = Fixture::new().start();
+    // 4 of the machine's 8 GiB taken.
+    let mut big = spec("sleep 30");
+    big.request.ram_mib = 4 << 10;
+    let running = f.dispatch(big);
+    f.wait_for(&running, "running", |j| j.state == JobState::Running);
+    let mut first = spec("sleep 0.3");
+    first.request.ram_mib = 6 << 10;
+    let first = f.dispatch(first);
+    let behind = f.dispatch(spec("sleep 0.3"));
+    std::thread::sleep(Duration::from_millis(300));
+    let before = f.get(&first);
+    assert_eq!(before.state, JobState::Queued);
+    assert_eq!(f.get(&behind).state, JobState::Queued);
+    let queued = || match f.client().call(Request::Status).unwrap() {
+        Response::Status { status } => status
+            .queued
+            .iter()
+            .map(|j| j.id.clone())
+            .collect::<Vec<_>>(),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(queued(), [first.clone(), behind.clone()]);
+
+    // 5 GiB: still more than the 4 free. It stays first, and the job behind it waits.
+    let (j, from) = resized(&f, &first, 5 << 10).unwrap();
+    assert_eq!((from, j.spec.request.ram_mib), (6 << 10, 5 << 10));
+    let after = f.get(&first);
+    assert_eq!(after.state, JobState::Queued);
+    assert_eq!(
+        (after.passes, after.submitted_at, after.spec.priority),
+        (before.passes, before.submitted_at, before.spec.priority)
+    );
+    let mut want = before.spec.clone();
+    want.request.ram_mib = 5 << 10;
+    assert_eq!(after.spec, want, "only the request changed");
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(queued(), [first.clone(), behind.clone()]);
+    assert_eq!(f.get(&behind).state, JobState::Queued);
+    // The same: nothing changes.
+    let (j, from) = resized(&f, &first, 5 << 10).unwrap();
+    assert_eq!((from, j.spec.request.ram_mib), (5 << 10, 5 << 10));
+    // More, or a job that isn't queued: refused.
+    let e = resized(&f, &first, 6 << 10).unwrap_err();
+    assert_eq!(
+        e,
+        format!(
+            "resize only lowers a job's RAM request: job {first} asks for 5 GiB, and 6 GiB is more"
+        )
+    );
+    let e = resized(&f, &running, 1 << 10).unwrap_err();
+    assert_eq!(
+        e,
+        format!(
+            "job {running} is running on testnode, and only a queued job's RAM request changes"
+        )
+    );
+    let e = resized(&f, "testnode-999", 1 << 10).unwrap_err();
+    assert_eq!(e, "no job testnode-999");
+    assert_eq!(f.get(&first).spec.request.ram_mib, 5 << 10);
+
+    // 2 GiB fits: it starts, and the job behind it after it.
+    resized(&f, &first, 2 << 10).unwrap();
+    let a = f.wait(&first);
+    let b = f.wait(&behind);
+    assert_eq!(
+        (a.state, b.state),
+        (JobState::Succeeded, JobState::Succeeded)
+    );
+    assert!(a.started_at <= b.started_at, "{a:#?}\n{b:#?}");
+    assert_eq!(a.lease.map(|l| l.grant.ram_mib), Some(2 << 10));
+    assert_eq!(f.exec.launched(&first).mem_max, 2 << 30);
+    let e = resized(&f, &first, 1 << 10).unwrap_err();
+    assert_eq!(
+        e,
+        format!("job {first} has ended (succeeded), and only a queued job's RAM request changes")
+    );
+    let log = std::fs::read_to_string(f.paths.daemon_log()).unwrap();
+    assert!(
+        log.contains(&format!(
+            "{first}: resized: asks for 5 GiB of RAM, not 6 GiB"
+        )),
+        "{log}"
+    );
+}
+
 #[test]
 fn run_limit_terms_then_kills() {
     let f = Fixture::new().start();

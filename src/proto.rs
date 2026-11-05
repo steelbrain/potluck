@@ -132,6 +132,16 @@ pub enum Request {
     Cancel {
         job: JobId,
     },
+    /// Lower a queued job's RAM request to `ram_mib`, keeping its place in line: answered by the
+    /// job's owner with [`Response::Resized`]. `auth`, from a command line with a user key, is a
+    /// user's signature of the job's spec as it will stand (the spec as its owner holds it, with
+    /// this request), for its owner; a cluster with users takes a resize only with one.
+    Resize {
+        job: JobId,
+        ram_mib: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth: Option<Box<crate::jobauth::JobAuth>>,
+    },
     /// Set a workspace's hold to end `duration_ms` from now (at most 24 h).
     Hold {
         workspace: WorkspaceId,
@@ -248,6 +258,12 @@ pub enum Response {
     },
     Job {
         job: Box<JobRecord>,
+    },
+    /// What [`Request::Resize`] did: the job as it stands now, and its RAM request before (the
+    /// same as now when nothing changed).
+    Resized {
+        job: Box<JobRecord>,
+        from_ram_mib: u64,
     },
     /// Followed by `len` raw bytes.
     Bytes {

@@ -24,6 +24,10 @@
 - In a cluster with users, a request another member answers (`wait`, `logs`, `why` or `cancel` of
   a job dispatched elsewhere, `cp`, `hold` or `release` of a workspace elsewhere, `env NODE`) is
   signed with the command line's user key; without one, it fails saying so.
+- `potluck resize JOB --ram N` lowers a queued job's RAM request, and the job keeps its place in the
+  queue: its priority, passes and submit time stay. The machine that dispatched the job changes it,
+  only while the job is queued, and only to less; in a cluster with users, the command line signs
+  the job with its new request. See [Jobs](docs/jobs.md#resources).
 
 ### Fixed
 

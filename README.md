@@ -189,6 +189,7 @@ between members and what happens when one is lost.
 | `wait JOB [--max-wait DUR] [-q]` | Stream the output and exit with the job's code; `-q` only waits. |
 | `logs JOB [-f]` | Print the output so far, or follow it. |
 | `cancel JOB` | Drop a queued job, or stop a running one (SIGTERM, then SIGKILL). |
+| `resize JOB --ram N` | Lower a queued job's RAM request; it keeps its place in the queue. |
 | `hold W DUR` | Hold workspace W for DUR from now, at most 24h. |
 | `release W` | End W's hold and remove it; while a job is queued or running in it, only the hold ends. |
 | `cp W:PATH DEST` | Copy a file or directory out of a workspace. |

@@ -10,8 +10,8 @@
   user key signs has authority:
   - admitting and removing machines and users;
   - each job, for the machine it was dispatched on: its command, env, commits, limits and pools;
-  - each request one machine forwards to another (`wait`, `logs`, `why`, `cancel`, `cp`, `hold`,
-    `release`, `env NODE`).
+  - each request one machine forwards to another (`wait`, `logs`, `why`, `cancel`, `resize`,
+    `cp`, `hold`, `release`, `env NODE`).
   
   Machines carry out signed work: they queue, claim and run signed jobs, send their output and
   kept files back, and pass records on. A machine key signs nothing that counts.

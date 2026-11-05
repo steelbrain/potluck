@@ -288,13 +288,16 @@ pub(super) fn pulls_and_pushes(sh: &Arc<Shared>, c: &Arc<Cluster>, now: u64) {
         .filter(|m| !m.this_machine)
         .map(|m| (m.name.clone(), c.up(&m)))
         .collect();
-    // What the others act on: the queue, what runs here, where its own jobs elsewhere run, and
-    // the workspaces here.
+    // What the others act on: the queue (each job's passes, priority and RAM request, which a
+    // resize lowers), what runs here, where its own jobs elsewhere run, and the workspaces here.
     let digest = {
         let st = sh.lock();
         let mut d: Vec<String> = own_queue(&st)
             .iter()
-            .map(|j| format!("q{}:{}:{}", j.id, j.passes, j.spec.priority))
+            .map(|j| {
+                let r = &j.spec.request;
+                format!("q{}:{}:{}:{}", j.id, j.passes, j.spec.priority, r.ram_mib)
+            })
             .collect();
         d.extend(
             st.jobs

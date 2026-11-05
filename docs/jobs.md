@@ -135,6 +135,17 @@ A job gets everything it asks for at once, or waits, so jobs can't deadlock on e
   job in line waiting on that machine, the machine starts only jobs that will end, by their run
   limits, before it expects to be empty.
 
+`potluck resize JOB --ram N` lowers a queued job's RAM request to N, given as `--ram` takes it.
+The job keeps its place in line: its priority, its passes (see [Order](#order)) and its submit
+time stay. The machine the job was dispatched on makes the change (`resize` on another machine
+is forwarded there), and only while the job is queued: a job that is starting, running or has
+ended is refused, and so is more RAM than the job asks for; the same amount changes nothing.
+
+```console
+$ potluck resize studio-41 --ram 2
+job studio-41 now asks for 2 GiB of RAM, not 16 GiB; it keeps its place in the queue
+```
+
 A job may have at most 16384 processes. On Linux that is its unit's `TasksMax`, which counts
 threads too, and a fork past it fails. On macOS it counts processes, potluck's supervisor
 included, and is at most half of `kern.maxprocperuid`, the most processes one user may have

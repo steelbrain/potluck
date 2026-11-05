@@ -6954,3 +6954,359 @@ fn a_workspace_asked_of_its_machine_comes_without_its_path() {
     );
     mesh.stop();
 }
+
+/// The CLI without `--json`, in the repository: its exit code, stdout and stderr.
+fn cli_text(node: &Node, args: &[&str]) -> (i32, String, String) {
+    let out = node.spawn_cli(args).wait_with_output().unwrap();
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// The queued jobs `node`'s `status` lists, in start order, each with its RAM request (MiB).
+fn queued_on(node: &Node) -> Vec<(String, u64)> {
+    node.cli_ok(&["status"])["queued"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|j| {
+            let ram = j["spec"]["request"]["ram_mib"].as_u64().unwrap();
+            (j["id"].as_str().unwrap().to_string(), ram)
+        })
+        .collect()
+}
+
+/// `potluck resize` on b of a job a dispatched goes to a, which lowers the queued job's RAM
+/// request where it stands in line, and b sees the new request in a's next report. b, the only
+/// machine the jobs may run on, has 4 of its 8 GiB free: the first job asks for 6, so the one
+/// behind it, which fits, waits its turn. Lowered to 5 GiB, the first still waits, and the second
+/// behind it; a claim b made from the queue entry before the resize (6 GiB reserved) is refused,
+/// so no grant asks for less than b reserved. Lowered to 3 GiB, it runs on b, and then the second.
+/// The same amount changes nothing; more, a running or an ended job, is refused with exit code 2.
+#[test]
+fn a_resize_lowers_a_queued_jobs_request_where_it_stands() {
+    let w = World::new();
+    let a = w.node("a").start();
+    let b = w.node("b").start();
+    pair(&a, &b);
+    let busy = a.dispatch(&["--on", "node=b", "--ram", "4", "--", "sleep", "60"]);
+    a.running_on(&busy, "b");
+    let first = a.dispatch(&["--on", "node=b", "--ram", "6", "--", "true"]);
+    let behind = a.dispatch(&["--on", "node=b", "--ram", "1", "--", "true"]);
+    wait_until("b sees both queued", || {
+        queued_on(&b) == [(first.clone(), 6 << 10), (behind.clone(), 1 << 10)]
+    });
+    let before = a.get(&first);
+    assert_eq!(before.state, JobState::Queued);
+
+    let (code, stdout, stderr) = cli_text(&b, &["resize", &first, "--ram", "5"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(
+        stdout,
+        format!(
+            "job {first} now asks for 5 GiB of RAM, not 6 GiB; it keeps its place in the queue\n"
+        )
+    );
+    let after = a.get(&first);
+    assert_eq!(
+        (after.state, after.passes, after.submitted_at),
+        (JobState::Queued, before.passes, before.submitted_at)
+    );
+    let mut want = before.spec.clone();
+    want.request.ram_mib = 5 << 10;
+    assert_eq!(after.spec, want, "only the request changed");
+    wait_until("b sees the new request", || {
+        queued_on(&b) == [(first.clone(), 5 << 10), (behind.clone(), 1 << 10)]
+    });
+    assert_eq!(
+        queued_on(&a),
+        [(first.clone(), 5 << 10), (behind.clone(), 1 << 10)]
+    );
+    // b claims the job as its entry before the resize had it: refused.
+    let as_b = client_mesh(&b);
+    let claim = serde_json::json!({
+        "op": "claim",
+        "job": first,
+        "lease": {
+            "grant": {"ram_mib": 6 << 10, "cpu": 1, "gpus": [], "exclusive": false},
+            "granted_at": now_ms(),
+            "deadline": now_ms() + 60_000,
+            "token": "t-before",
+        },
+        "workspace": "b-w99",
+    });
+    let r = as_b.call("a", claim).unwrap();
+    as_b.stop();
+    assert_eq!(r["kind"], "refused", "{r}");
+    assert_eq!(
+        r["reason"],
+        format!("{first} asks for 5 GiB of RAM since it was resized, not the 6 GiB b reserved"),
+        "{r}"
+    );
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(a.get(&first).state, JobState::Queued);
+    assert_eq!(a.get(&behind).state, JobState::Queued);
+
+    // The same: nothing changes.
+    let (code, stdout, _) = cli_text(&b, &["resize", &first, "--ram", "5G"]);
+    assert_eq!(
+        (code, stdout),
+        (
+            0,
+            format!("job {first} asks for 5 GiB of RAM already; nothing changed\n")
+        )
+    );
+    let o = b.cli_ok(&["resize", &first, "--ram", "5120M"]);
+    assert_eq!(
+        (&o["changed"], &o["ram_mib"], &o["from_ram_mib"]),
+        (&false.into(), &(5 << 10).into(), &(5 << 10).into()),
+        "{o}"
+    );
+    // More: refused.
+    let (code, stdout, stderr) = cli_text(&b, &["resize", &first, "--ram", "6"]);
+    assert_eq!((code, stdout.as_str()), (2, ""));
+    assert!(
+        stderr.starts_with(&format!(
+            "potluck: resize only lowers a job's RAM request: job {first} asks for 5 GiB, and 6 GiB is more\n"
+        )),
+        "{stderr}"
+    );
+    let o = b.cli(&["resize", &first, "--ram", "6"]);
+    assert_eq!(o.code, 2);
+    assert_eq!(
+        error_of(&o),
+        format!(
+            "resize only lowers a job's RAM request: job {first} asks for 5 GiB, and 6 GiB is more"
+        )
+    );
+    let o = b.cli(&["resize", &busy, "--ram", "1"]);
+    assert_eq!(
+        (o.code, error_of(&o)),
+        (
+            2,
+            format!("job {busy} is running on b, and only a queued job's RAM request changes")
+        )
+    );
+    let o = b.cli(&["resize", &first, "--ram", "lots"]);
+    assert_eq!(o.code, 2);
+    assert!(
+        error_of(&o).starts_with("--ram: bad RAM amount"),
+        "{}",
+        o.stdout
+    );
+
+    // 3 GiB fits: b runs it, and then the one behind it.
+    let o = a.cli_ok(&["resize", &first, "--ram", "3"]);
+    assert_eq!(
+        (&o["job"], &o["changed"], &o["ram_mib"], &o["from_ram_mib"]),
+        (
+            &first.as_str().into(),
+            &true.into(),
+            &(3 << 10).into(),
+            &(5 << 10).into()
+        ),
+        "{o}"
+    );
+    assert_eq!(o["record"]["spec"]["request"]["ram_mib"], 3 << 10, "{o}");
+    let (x, y) = (a.done(&first), a.done(&behind));
+    for j in [&x, &y] {
+        assert_eq!(
+            (j.state, j.node.as_deref()),
+            (JobState::Succeeded, Some("b")),
+            "{j:#?}"
+        );
+    }
+    assert!(x.started_at <= y.started_at, "{x:#?}\n{y:#?}");
+    assert_eq!(b.stored(&first).spec.request.ram_mib, 3 << 10);
+    let lease = b.stored(&first).lease;
+    assert_eq!(lease.map(|l| l.grant.ram_mib), Some(3 << 10));
+    assert!(!b.daemon_log().contains("WARNING"), "{}", b.daemon_log());
+    let o = b.cli(&["resize", &first, "--ram", "1"]);
+    assert_eq!(
+        (o.code, error_of(&o)),
+        (
+            2,
+            format!(
+                "job {first} has ended (succeeded), and only a queued job's RAM request changes"
+            )
+        )
+    );
+    a.cli_ok(&["cancel", &busy]);
+}
+
+/// In a cluster with users, `resize` signs the job with its lowered request with the user key, as
+/// its owner holds it, for its owner, and the owner takes it only so. c's command line, which has
+/// no user key, can't resize; with the user's key it can, from c. Sent to the owner's socket
+/// unsigned, signed by a key no user has, over a spec that differs in more than its request, for
+/// another machine, or with a nonce taken before, it is refused; relayed without the request's
+/// signature, too. b checks the job granted against the signature, field by field, and runs it.
+#[test]
+fn with_users_a_resized_job_is_signed_and_its_runner_runs_it() {
+    use potluck::jobauth;
+    use potluck::types::JobSpec;
+    let w = World::new();
+    let a = w.node("a").start();
+    let b = w.node("b").start();
+    let c = w.node("c").start();
+    pair(&a, &b);
+    pair(&a, &c);
+    init_users(&a, &[&a, &b, &c]);
+    let user = user_key(&a);
+    let busy = a.dispatch(&["--on", "node=b", "--ram", "4", "--", "sleep", "60"]);
+    a.running_on(&busy, "b");
+    let job = a.dispatch(&[
+        "--on",
+        "node=b",
+        "--ram",
+        "7",
+        "--",
+        "sh",
+        "-c",
+        "echo on $POTLUCK_NODE",
+    ]);
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(a.get(&job).state, JobState::Queued);
+
+    let o = c.cli(&["resize", &job, "--ram", "6"]);
+    assert_eq!(o.code, 2);
+    assert!(
+        error_of(&o).starts_with(
+            "this cluster has users, so a resize is signed with a user's key, and there is none at"
+        ),
+        "{}",
+        o.stdout
+    );
+    let key = a.dir.join("user.key");
+    let o = c.cli_keyed(&c.repo, Some(&key), &["resize", &job, "--ram", "6"]);
+    assert_eq!(o.code, 0, "{}\n{}", o.stdout, o.stderr);
+    assert_eq!(o.json["changed"], true);
+    let held = a.get(&job).spec;
+    assert_eq!(held.request.ram_mib, 6 << 10);
+    let auth = held.auth.clone().unwrap();
+    assert_eq!(auth.key, user.public());
+    let signed = jobauth::open(&auth).unwrap();
+    assert_eq!(
+        signed,
+        JobSpec {
+            auth: None,
+            ..held.clone()
+        }
+    );
+    assert!(jobauth::salted_already(&signed));
+
+    // Straight to a's socket.
+    let ask =
+        |ram_mib: u64, auth: Option<jobauth::JobAuth>| match a.client().call(Request::Resize {
+            job: job.clone(),
+            ram_mib,
+            auth: auth.map(Box::new),
+        }) {
+            Ok(Response::Resized { job, .. }) => Ok(job.spec.request.ram_mib),
+            Ok(other) => panic!("{other:?}"),
+            Err(e) => Err(e.to_string()),
+        };
+    // `change`d, with `ram_mib` as its request, signed with `key` now.
+    let signed_as =
+        |ram_mib: u64, key: &dyn potluck::mesh::identity::Signer, change: &dyn Fn(&mut JobSpec)| {
+            let mut spec = JobSpec {
+                auth: None,
+                ..a.get(&job).spec
+            };
+            spec.request.ram_mib = ram_mib;
+            change(&mut spec);
+            jobauth::sign(&spec, key, now_ms()).auth
+        };
+    let e = ask(5 << 10, None).unwrap_err();
+    assert!(
+        e.starts_with(
+            "this cluster has users, so a resize is signed with a user's key, and this one is unsigned"
+        ),
+        "{e}"
+    );
+    let stranger = tempfile::tempdir().unwrap();
+    let other = potluck::mesh::user::UserKey::load_or_create(&stranger.path().join("k"))
+        .unwrap()
+        .0;
+    let e = ask(5 << 10, signed_as(5 << 10, &other, &|_| {})).unwrap_err();
+    assert!(e.contains("which is no user of this cluster"), "{e}");
+    let e = ask(
+        5 << 10,
+        signed_as(5 << 10, &user, &|s| {
+            s.cmd = vec!["rm".into(), "-rf".into(), "/".into()]
+        }),
+    )
+    .unwrap_err();
+    assert_eq!(
+        e,
+        "the resize's signature is refused: its cmd is not what its signature covers"
+    );
+    let e = ask(5 << 10, signed_as(5 << 10, &user, &|s| s.request.cpu = 8)).unwrap_err();
+    assert_eq!(
+        e,
+        "the resize's signature is refused: its request is not what its signature covers"
+    );
+    let e = ask(
+        5 << 10,
+        signed_as(5 << 10, &user, &|s| s.submitted_from = "c".into()),
+    )
+    .unwrap_err();
+    assert_eq!(
+        e,
+        "the resize's signature is refused: its submitted_from is not what its signature covers"
+    );
+    // Signed for 5 GiB and sent as 4.5: the spec it covers isn't the one resized.
+    let e = ask(4608, signed_as(5 << 10, &user, &|_| {})).unwrap_err();
+    assert_eq!(
+        e,
+        "the resize's signature is refused: its request is not what its signature covers"
+    );
+    // A nonce taken before.
+    let once = signed_as(5 << 10, &user, &|_| {}).unwrap();
+    assert_eq!(ask(5 << 10, Some(once.clone())), Ok(5 << 10));
+    let mut spec = JobSpec {
+        auth: None,
+        ..a.get(&job).spec
+    };
+    spec.request.ram_mib = 4608;
+    let again = jobauth::sign_with_nonce(&spec, &user, once.nonce.clone(), now_ms()).auth;
+    let e = ask(4608, again).unwrap_err();
+    assert!(
+        e.contains("its nonce was taken here before (a replay)"),
+        "{e}"
+    );
+    assert_eq!(a.get(&job).spec.request.ram_mib, 5 << 10);
+    // Relayed by c without the request's signature: a refuses it.
+    let mesh = client_mesh(&c);
+    let req = Request::Resize {
+        job: job.clone(),
+        ram_mib: 4608,
+        auth: signed_as(4608, &user, &|_| {}).map(Box::new),
+    };
+    let e = refusal(relayed(&mesh, "a", &req, None));
+    mesh.stop();
+    assert!(
+        e.contains("needs this cluster's user key") && e.contains("c relayed it unsigned"),
+        "{e}"
+    );
+    assert_eq!(a.get(&job).spec.request.ram_mib, 5 << 10);
+    assert!(b.exec.launch_of(&job).is_none());
+
+    // 3 GiB fits on b, which checks the signed spec and runs it.
+    let o = a.cli_ok(&["resize", &job, "--ram", "3"]);
+    assert_eq!(o["from_ram_mib"], 5 << 10, "{o}");
+    let j = a.done(&job);
+    assert_eq!(
+        (j.state, j.node.as_deref()),
+        (JobState::Succeeded, Some("b")),
+        "{j:#?}"
+    );
+    let ran = b.stored(&job).spec;
+    assert_eq!(ran.request.ram_mib, 3 << 10);
+    assert_eq!(ran.auth, a.get(&job).spec.auth);
+    assert_eq!(ran.auth.unwrap().key, user.public());
+    assert!(output_of(&a, &job).contains("on b"));
+    assert!(!b.daemon_log().contains("WARNING"), "{}", b.daemon_log());
+    a.cli_ok(&["cancel", &busy]);
+}

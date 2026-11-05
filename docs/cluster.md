@@ -118,7 +118,9 @@ From then on:
 - The command line signs every dispatch with its user key, for the machine it dispatches on, and
   refuses to dispatch without one. The daemon there takes a dispatch only when a user signed it,
   for that machine, within 10 minutes of the daemon's clock, and with a nonce it hasn't seen in the
-  day before (see [Dispatching](jobs.md#dispatching)).
+  day before (see [Dispatching](jobs.md#dispatching)). `resize` signs the job with its lowered
+  request the same way, as that machine holds it, and the machine takes it only when the job
+  signed is the one it holds, field by field, but for the request.
 - A machine claims another machine's job only when a user it knows signed it, and runs it only
   after checking the grant: a user it knows signed the job for the machine that granted it, and
   the job granted is the one signed, field by field (repository ids aside, which the dispatching
@@ -137,12 +139,13 @@ From then on:
   last user. A removed user's key signs nothing that counts after; what it signed that the machine
   you removed it on knew of stays. `potluck user list` lists the users.
 - The command line signs each request it sends with its user key. A machine answers a request
-  that another machine forwards (`wait`, `logs`, `why` and `cancel` of a job dispatched elsewhere,
-  `cp`, `hold` and `release` of a workspace elsewhere, `env NODE`) only if a user's key signed it
-  at most 5 minutes before or after the answering machine's clock, and it answers each signed
-  request once. A command line without a user key gets an error saying the request needs this
-  cluster's user key, and where it looked for one. What the local daemon answers itself needs no
-  key: `status`, `nodes`, and requests about this machine's own jobs, workspaces and environment.
+  that another machine forwards (`wait`, `logs`, `why`, `cancel` and `resize` of a job dispatched
+  elsewhere, `cp`, `hold` and `release` of a workspace elsewhere, `env NODE`) only if a user's key
+  signed it at most 5 minutes before or after the answering machine's clock, and it answers each
+  signed request once. A command line without a user key gets an error saying the request needs
+  this cluster's user key, and where it looked for one. What the local daemon answers itself needs
+  no key: `status`, `nodes`, and requests about this machine's own jobs, workspaces and
+  environment.
 
 When first users compete (`user init` on two members at once), the one co-signed by the member
 admitted earliest counts, the founder first. A member admitted before the one you run `user init`
@@ -198,21 +201,22 @@ itself and claims a job from its dispatching machine only when it can start it n
 machine grants each job once; a machine whose claim is refused plans again. A machine runs a job
 granted to it only when the grant asks for the resources, `--on` and workspace the queue entry it
 claimed asked for, which it reserved; otherwise it hands the job back, logs a `WARNING` line, and
-doesn't claim it again while it stays queued. A machine with no
-workspace of the job's repository leaves the job for 3 seconds when a member with one could start it
-by then; `why` says so meanwhile.
+doesn't claim it again while it stays queued. A claim that reserved more RAM than the job asks for
+since a `resize` is refused, and the machine claims the job again from its new request. A machine
+with no workspace of the job's repository leaves the job for 3 seconds when a member with one could
+start it by then; `why` says so meanwhile.
 
 The machine running a job streams its output to the dispatching machine and sends the kept files
 at the end, so `wait` and `logs` work there as on one machine. Kept files that can't be delivered
 for 10 minutes are given up on, and at once if their machine leaves the cluster: the job ends with
 its own exit code and a note saying so (`why` shows it), and the files stay in the job's directory
-on the machine that ran it. `cancel`, `cp`, `hold`, `release` and `env NODE` are forwarded to
-the machine concerned, and `status`, `nodes` and `why` show every member. A machine answers a
-forwarded request about a job only if it dispatched the job or runs it (until the job's end and
-output have reached the dispatching machine), and one about a workspace only if the workspace is
-its own. A `cancel` that reaches the machine running a job goes on to the job's dispatching
-machine, which cancels it. In a cluster with [users](#users), a forwarded request needs a user's
-signature.
+on the machine that ran it. `cancel`, `resize`, `cp`, `hold`, `release` and `env NODE` are
+forwarded to the machine concerned, and `status`, `nodes` and `why` show every member. A machine
+answers a forwarded request about a job only if it dispatched the job or runs it (until the job's
+end and output have reached the dispatching machine), and one about a workspace only if the
+workspace is its own. A `cancel` that reaches the machine running a job goes on to the job's
+dispatching machine, which cancels it. In a cluster with [users](#users), a forwarded request
+needs a user's signature.
 
 The dispatching machine counts the run limit of a job running elsewhere on its own clocks: from
 its grant, then from when the machine running it says it started. A job that machine hasn't ended

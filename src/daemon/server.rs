@@ -290,6 +290,7 @@ pub(crate) fn describe(req: &Request) -> String {
         Request::Wait { job, .. } => ("wait", Some(job)),
         Request::Logs { job, .. } => ("logs", Some(job)),
         Request::Cancel { job } => ("cancel", Some(job)),
+        Request::Resize { job, .. } => ("resize", Some(job)),
         Request::Hold { workspace, .. } => ("hold", Some(workspace)),
         Request::Release { workspace } => ("release", Some(workspace)),
         Request::Copy { workspace, .. } => ("copy", Some(workspace)),
@@ -397,6 +398,7 @@ fn handle_req<W: Write>(
             .ok_or_else(|| format!("no job {job}")),
         Request::Wait { job, timeout_ms } => wait(sh, job, *timeout_ms),
         Request::Cancel { job } => cancel(sh, job),
+        Request::Resize { job, ram_mib, auth } => resize(sh, job, *ram_mib, auth.as_deref()),
         Request::Hold {
             workspace,
             duration_ms,
@@ -1215,6 +1217,128 @@ fn cancel(sh: &Arc<Shared>, id: &str) -> Result<Response, String> {
     sh.notify();
     sh.kick();
     Ok(Response::Job { job: Box::new(job) })
+}
+
+/// Lowers queued job `id`'s RAM request to `ram_mib` ([`Request::Resize`]): only on its owner,
+/// only while it is queued, and only to less than it asks for (the same changes nothing). It keeps
+/// its place in line: its priority, passes, submit time and id. The new spec is the one held with
+/// this request, signed by `auth` when given, checked as a dispatch's signature is
+/// ([`check_signed`]), so it differs from the old in its request alone; in a cluster with users a
+/// user this machine recognizes must have signed it. Without users and without `auth`, the job is
+/// unsigned from then on.
+fn resize(
+    sh: &Arc<Shared>,
+    id: &str,
+    ram_mib: u64,
+    auth: Option<&crate::jobauth::JobAuth>,
+) -> Result<Response, String> {
+    use crate::cli::fmt_mib;
+    let cluster = sh.cluster();
+    // Asked of the mesh before the state is locked.
+    let (users, by_user) = match cluster.as_ref().map(|c| c.mesh()) {
+        Some(m) => (
+            m.users_exist(),
+            auth.is_some_and(|a| m.recognized_user(&a.key)),
+        ),
+        None => (false, false),
+    };
+    let now = now_ms();
+    let (rec, from) = {
+        let mut guard = sh.lock();
+        let st = &mut *guard;
+        let node = st.node.clone();
+        let Some(j) = st.jobs.get(id).filter(|j| j.state == JobState::Queued) else {
+            let only = "only a queued job's RAM request changes";
+            return Err(match st.job(id) {
+                None => format!("no job {id}"),
+                Some(j) if j.state.is_done() => {
+                    format!("job {id} has ended ({}), and {only}", j.state)
+                }
+                Some(j) => {
+                    let on = j
+                        .node
+                        .as_ref()
+                        .map_or(String::new(), |n| format!(" on {n}"));
+                    format!("job {id} is {}{on}, and {only}", j.state)
+                }
+            });
+        };
+        let owner = super::cluster::peer::owner_of(id);
+        if owner != node {
+            return Err(format!(
+                "job {id} is {owner}'s, and only {owner} changes its request"
+            ));
+        }
+        let from = j.spec.request.ram_mib;
+        if ram_mib == from {
+            return Ok(Response::Resized {
+                job: Box::new(j.clone()),
+                from_ram_mib: from,
+            });
+        }
+        if ram_mib > from {
+            return Err(format!(
+                "resize only lowers a job's RAM request: job {id} asks for {}, and {} is more",
+                fmt_mib(from),
+                fmt_mib(ram_mib)
+            ));
+        }
+        if ram_mib == 0 {
+            return Err("ram must be more than 0".into());
+        }
+        let spec = JobSpec {
+            request: crate::types::Request {
+                ram_mib,
+                ..j.spec.request.clone()
+            },
+            auth: auth.cloned(),
+            ..j.spec.clone()
+        };
+        match auth {
+            None if users => return Err(
+                "this cluster has users, so a resize is signed with a user's key, and this one is unsigned (the command line signs with the key at $POTLUCK_USER_KEY, or user.key beside its node.toml)".into(),
+            ),
+            None => {}
+            Some(a) => {
+                crate::jobauth::check_dispatch(&spec, &node, now)
+                    .map_err(|e| format!("the resize's signature is refused: {e}"))?;
+                if users && !by_user {
+                    return Err(format!(
+                        "the resize is signed with key {0}, which is no user of this cluster; a user adds it with `potluck user add NAME {0}`",
+                        a.key
+                    ));
+                }
+                take_nonce_of(
+                    st,
+                    &a.nonce,
+                    now,
+                    "the resize's signature is refused: its nonce was taken here before (a replay); a resize is signed anew each time",
+                )?;
+            }
+        }
+        let Some(j) = st.jobs.get_mut(id) else {
+            return Err(format!("no job {id}"));
+        };
+        j.spec = spec;
+        let rec = j.clone();
+        st.save_job(id);
+        (rec, from)
+    };
+    sh.log.log(format!(
+        "{id}: resized: asks for {} of RAM, not {}",
+        fmt_mib(ram_mib),
+        fmt_mib(from)
+    ));
+    // The members see the new request in this machine's next report, and plan with it.
+    if let Some(c) = &cluster {
+        c.push_soon();
+    }
+    sh.notify();
+    sh.kick();
+    Ok(Response::Resized {
+        job: Box::new(rec),
+        from_ram_mib: from,
+    })
 }
 
 /// Makes W's hold end `duration_ms` from now (at most 24 hours). The hold is the caller's

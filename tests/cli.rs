@@ -3487,6 +3487,7 @@ fn every_command_answers_in_json_without_a_daemon() {
         &["logs", "j-1"],
         &["logs", "j-1", "--follow"],
         &["cancel", "j-1"],
+        &["resize", "j-1", "--ram", "2"],
         &["hold", "n-w1", "5m"],
         &["release", "n-w1"],
         &["cp", "n-w1:x", dest],

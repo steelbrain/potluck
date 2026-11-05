@@ -128,6 +128,16 @@ pub(super) fn claim(
             }
             s => return refused(format!("{id} is {s}")),
         }
+        // Reserved from its queue entry before a resize lowered its request: granted, it would
+        // ask for less than the entry claimed, which the runner refuses to run. Refused, the
+        // runner claims it again from the next report, which has the new request.
+        if lease.grant.ram_mib > j.spec.request.ram_mib {
+            return refused(format!(
+                "{id} asks for {} of RAM since it was resized, not the {} {from} reserved",
+                crate::cli::fmt_mib(j.spec.request.ram_mib),
+                crate::cli::fmt_mib(lease.grant.ram_mib)
+            ));
+        }
         if let Some(w) = &j.spec.workspace
             && node_of_ws(w) != from
         {
