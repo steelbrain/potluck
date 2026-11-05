@@ -1272,7 +1272,10 @@ fn find_returns_what_a_cut_short_start_left() {
     else {
         unreachable!()
     };
-    assert_eq!((*tasks_max, lease.as_str()), (1000, "test-find"));
+    // Inv::start asks for 1000; a machine whose kern.maxprocperuid is under 2000 caps it (a
+    // GitHub runner's is 1333).
+    let limit = 1000.min(max_procs_per_user() / 2);
+    assert_eq!((*tasks_max, lease.as_str()), (limit, "test-find"));
     assert_eq!(boot, &boot_session());
     let mut adopted = found.clone();
     let s = wait_for(Duration::from_secs(10), || {
