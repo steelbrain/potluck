@@ -7215,7 +7215,9 @@ fn a_resize_lowers_a_queued_jobs_request_where_it_stands() {
         o.stdout
     );
 
-    // 3 GiB fits: b runs it, and then the one behind it.
+    // 3 GiB fits: b runs it, and the one behind it, which waited its turn until then.
+    assert_eq!(a.get(&behind).state, JobState::Queued);
+    let resized_at = now_ms();
     let o = a.cli_ok(&["resize", &first, "--ram", "3"]);
     assert_eq!(
         (&o["job"], &o["changed"], &o["ram_mib"], &o["from_ram_mib"]),
@@ -7236,7 +7238,15 @@ fn a_resize_lowers_a_queued_jobs_request_where_it_stands() {
             "{j:#?}"
         );
     }
-    assert!(x.started_at <= y.started_at, "{x:#?}\n{y:#?}");
+    // b reserved both only after the resize: the one behind waited behind the first until then.
+    // Granted in one plan, the two may start in either order.
+    for id in [&first, &behind] {
+        let granted = b.stored(id).lease.map(|l| l.granted_at);
+        assert!(
+            granted.is_some_and(|t| t >= resized_at),
+            "{id}: reserved at {granted:?}, resized at {resized_at}"
+        );
+    }
     assert_eq!(b.stored(&first).spec.request.ram_mib, 3 << 10);
     let lease = b.stored(&first).lease;
     assert_eq!(lease.map(|l| l.grant.ram_mib), Some(3 << 10));
