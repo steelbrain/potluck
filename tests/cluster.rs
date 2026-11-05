@@ -6152,6 +6152,40 @@ fn a_job_queued_before_users_runs_only_where_it_was_dispatched() {
         assert!(a.get(id).spec.auth.is_none(), "{id}");
     }
     assert_eq!(a.get("a-901").state, JobState::Queued);
+    // A resize lowers a-901's request and signs it with no user's key: b, up and able to run it,
+    // still doesn't take it, and why still says only a may. Nor does a signature sent straight
+    // to a's socket stay on it.
+    let o = a.cli_ok(&["resize", "a-901", "--ram", "512M"]);
+    assert_eq!(
+        (&o["changed"], &o["ram_mib"]),
+        (&true.into(), &512.into()),
+        "{o}"
+    );
+    let mut spec = a.get("a-901").spec;
+    assert_eq!((spec.request.ram_mib, spec.auth.is_none()), (512, true));
+    spec.request.ram_mib = 256;
+    let signed = potluck::jobauth::sign(&spec, &user_key(&a), now_ms()).auth;
+    match a.client().call(Request::Resize {
+        job: "a-901".into(),
+        ram_mib: 256,
+        auth: signed.map(Box::new),
+    }) {
+        Ok(Response::Resized { job, .. }) => {
+            assert_eq!((job.spec.request.ram_mib, job.spec.auth), (256, None))
+        }
+        other => panic!("{other:?}"),
+    }
+    std::thread::sleep(Duration::from_secs(2));
+    let j = a.get("a-901");
+    assert_eq!((j.state, j.spec.auth.is_none()), (JobState::Queued, true));
+    assert!(b.exec.launch_of("a-901").is_none());
+    assert!(!b.daemon_log().contains("a-901"), "{}", b.daemon_log());
+    let why = a.cli_ok(&["why", "a-901"]);
+    assert!(
+        why["lines"].as_array().unwrap().iter().any(|l| l
+            == "it was queued before the cluster had users, and no user signed it: only a, where it was dispatched, may run it (`potluck cancel a-901` ends it)"),
+        "{why}"
+    );
     // a-902 runs on a once a is free.
     a.cli_ok(&["cancel", "a-900"]);
     let j = a.done("a-902");

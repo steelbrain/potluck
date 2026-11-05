@@ -1106,10 +1106,11 @@ fn cancel(sh: &Arc<Shared>, id: &str) -> Result<Response, String> {
 /// Lowers queued job `id`'s RAM request to `ram_mib` ([`Request::Resize`]): only on its owner,
 /// only while it is queued, and only to less than it asks for (the same changes nothing). It keeps
 /// its place in line: its priority, passes, submit time and id. The new spec is the one held with
-/// this request, signed by `auth` when given, checked as a dispatch's signature is
-/// ([`check_signed`]), so it differs from the old in its request alone; in a cluster with users a
-/// user this machine recognizes must have signed it. Without users and without `auth`, the job is
-/// unsigned from then on.
+/// this request, signed by `auth`, checked as a dispatch's signature is ([`check_signed`]), so it
+/// differs from the old in its request alone; a user this machine recognizes must have signed it.
+/// A job queued before the cluster had users stays unsigned, and this machine's alone: its new
+/// spec is signed by no one, whatever `auth` came (the request itself is authorized as any other
+/// is, from this machine's socket or relayed with a user's signature).
 fn resize(
     sh: &Arc<Shared>,
     id: &str,
@@ -1170,6 +1171,10 @@ fn resize(
         if ram_mib == 0 {
             return Err("ram must be more than 0".into());
         }
+        // No user signed one queued before the cluster had users, and a resize signs it with no
+        // user's key: it stays on this machine alone.
+        let before_users = j.spec.auth.is_none();
+        let auth = auth.filter(|_| !before_users);
         let spec = JobSpec {
             request: crate::types::Request {
                 ram_mib,
@@ -1179,7 +1184,7 @@ fn resize(
             ..j.spec.clone()
         };
         match auth {
-            None if users => return Err(
+            None if users && !before_users => return Err(
                 "this cluster has users, so a resize is signed with a user's key, and this one is unsigned (the command line signs with the key at $POTLUCK_USER_KEY, or user.key beside its node.toml)".into(),
             ),
             None => {}

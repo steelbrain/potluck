@@ -132,9 +132,9 @@ A cluster paired with potluck 0.1.1 has no users until `user init` runs on one o
 until then the admissions and removals its members signed with their machine keys keep them
 members. A member still on 0.1.1 can admit and remove machines that way, and runs the jobs that
 0.1.1 members dispatch, until it updates. The jobs queued before the cluster had users stay
-unsigned, and `user init` doesn't sign them: each stays queued on the machine it was dispatched on
-and runs only there, and no other machine claims it. One that machine can't run (its `--on` names
-another) stays queued until you cancel it, and holds back no other job:
+unsigned, and neither `user init` nor `resize` signs them: each stays queued on the machine it was
+dispatched on and runs only there, and no other machine claims it. One that machine can't run (its
+`--on` names another) stays queued until you cancel it, and holds back no other job:
 
 ```console
 studio$ potluck why studio-7

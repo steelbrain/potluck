@@ -26,7 +26,8 @@
 - `potluck resize JOB --ram N` lowers a queued job's RAM request, and the job keeps its place in the
   queue: its priority, passes and submit time stay. The machine that dispatched the job changes it,
   only while the job is queued, and only to less; in a cluster with users, the command line signs
-  the job with its new request. See [Jobs](docs/jobs.md#resources).
+  the job with its new request, unless the job was queued before the cluster had users. See
+  [Jobs](docs/jobs.md#resources).
 - `potluck why` of a job that has ended says the most memory it used beside what it reserved:
   `peak memory 1.2 GiB of the 16 GiB it reserved`.
 

@@ -1253,9 +1253,10 @@ impl Cx<'_> {
     }
 
     /// For `resize`: the job's spec as its owner holds it, with `ram_mib` as its RAM request,
-    /// signed with this command line's user key when it has one (for its owner, its ids salted
-    /// already: [`crate::jobauth::salted_already`]). Without a key it goes unsigned, unless the
-    /// cluster has users: then it is refused here.
+    /// signed with this command line's user key (for its owner, its ids salted already:
+    /// [`crate::jobauth::salted_already`]). None, unsigned, for a job queued before the cluster
+    /// had users, which no user signs (it stays on its machine alone), and without a key in a
+    /// cluster without users; without a key in a cluster with users, any other is refused here.
     fn signed_resize(
         &mut self,
         job: &str,
@@ -1266,6 +1267,7 @@ impl Cx<'_> {
             if self
                 .membership_for_signing()?
                 .is_some_and(|m| m.users_exist)
+                && !self.held_spec(job).is_ok_and(|s| s.auth.is_none())
             {
                 anyhow::bail!(
                     "this cluster has users, so a resize is signed with a user's key, and there is none at {} (resize from the machine where a user's key is; or make one here with `potluck user key` and have a user run `potluck user add NAME KEY`)",
@@ -1274,12 +1276,10 @@ impl Cx<'_> {
             }
             return Ok(None);
         };
-        let held = match self.call(Req::Get {
-            job: job.to_string(),
-        })? {
-            Response::Job { job } => job.spec,
-            other => return Err(unexpected("get", &other)),
-        };
+        let held = self.held_spec(job)?;
+        if held.auth.is_none() {
+            return Ok(None);
+        }
         let spec = crate::types::JobSpec {
             request: crate::types::Request {
                 ram_mib,
@@ -1291,6 +1291,16 @@ impl Cx<'_> {
         Ok(crate::jobauth::sign(&spec, &key, now_ms())
             .auth
             .map(Box::new))
+    }
+
+    /// Job `job`'s spec as its owner holds it.
+    fn held_spec(&mut self, job: &str) -> anyhow::Result<crate::types::JobSpec> {
+        match self.call(Req::Get {
+            job: job.to_string(),
+        })? {
+            Response::Job { job } => Ok(job.spec),
+            other => Err(unexpected("get", &other)),
+        }
     }
 
     fn hold(&mut self, workspace: &str, duration: &str) -> anyhow::Result<Report> {
