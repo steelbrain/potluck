@@ -5768,7 +5768,6 @@ fn user_init_again_signs_the_jobs_a_first_run_left() {
             "made": false,
             "signed_jobs": [],
             "jobs_not_signed": {},
-            "machines_not_signed": {},
             "reminders": [],
         })
     );

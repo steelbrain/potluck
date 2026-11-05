@@ -1588,7 +1588,7 @@ impl Cx<'_> {
                     Response::Ok => {}
                     other => return Err(unexpected("user init", &other)),
                 }
-                let signed = self.sign_unsigned_jobs(&key, &m.node);
+                let (signed_jobs, not_signed) = self.sign_unsigned_jobs(&key, &m.node);
                 let members: Vec<&str> = m.members.iter().map(|e| e.name.as_str()).collect();
                 let warning = match m.elders.as_slice() {
                     [] => None,
@@ -1606,24 +1606,23 @@ impl Cx<'_> {
                     notes.push(format!("made a user key at {}", path.display()));
                 }
                 notes.extend(warning.clone());
-                notes.extend(signed.notes());
-                let jobs = signed
-                    .said("it")
-                    .map(|s| format!("; {s}"))
-                    .unwrap_or_default();
-                let mut doc = json!({
-                    "user": name,
-                    "key": key.public(),
-                    "file": path,
-                    "made": made,
-                    "members": members,
-                    "warning": warning,
-                });
-                signed.add_to(&mut doc);
+                let (said, not_signed_notes, not_signed) =
+                    jobs_signed(&m.node, "it", &signed_jobs, not_signed);
+                notes.extend(not_signed_notes);
+                let jobs = said.map(|s| format!("; {s}")).unwrap_or_default();
                 Ok(Report {
                     note: notes.join("\npotluck: "),
                     ..Report::new(
-                        doc,
+                        json!({
+                            "user": name,
+                            "key": key.public(),
+                            "file": path,
+                            "made": made,
+                            "members": members,
+                            "warning": warning,
+                            "signed_jobs": signed_jobs,
+                            "jobs_not_signed": not_signed,
+                        }),
                         format!(
                             "{name} is the cluster's first user; signed in {}: {}{jobs}",
                             if members.len() == 1 {
@@ -1720,25 +1719,29 @@ impl Cx<'_> {
                 names.join(", ")
             );
         };
-        let signed = self.sign_unsigned_jobs(key, &m.node);
-        let jobs = match signed.said("the first user") {
+        let (signed_jobs, not_signed) = self.sign_unsigned_jobs(key, &m.node);
+        let failed = !not_signed.is_empty();
+        let (said, notes, not_signed) =
+            jobs_signed(&m.node, "the first user", &signed_jobs, not_signed);
+        let jobs = match said {
             Some(s) => s,
-            None if signed.refused.is_empty() && signed.machines.is_empty() => {
-                "no job is left to sign".to_string()
-            }
+            None if !failed => format!(
+                "no job {} dispatched before the first user is left to sign",
+                m.node
+            ),
             None => "signed no jobs".to_string(),
         };
-        let mut doc = json!({
-            "user": user.name,
-            "key": key.public(),
-            "file": path,
-            "made": false,
-        });
-        signed.add_to(&mut doc);
         Ok(Report {
-            note: signed.notes().join("\npotluck: "),
+            note: notes.join("\npotluck: "),
             ..Report::new(
-                doc,
+                json!({
+                    "user": user.name,
+                    "key": key.public(),
+                    "file": path,
+                    "made": false,
+                    "signed_jobs": signed_jobs,
+                    "jobs_not_signed": not_signed,
+                }),
                 format!("{} is already a user of this cluster; {jobs}", user.name),
             )
         })
@@ -1746,20 +1749,21 @@ impl Cx<'_> {
 
     /// For `user init`: signs with `key` this machine's jobs that haven't ended and that no user
     /// signed (dispatched before the cluster had users), each as its daemon holds it, for `node`
-    /// (this machine), so that other members may run them.
-    fn sign_unsigned_jobs(&mut self, key: &UserKey, node: &str) -> SignedJobs {
-        let mut done = SignedJobs::default();
+    /// (this machine), so that other members may run them. Returns the jobs signed, and those
+    /// that weren't with why (None: none was).
+    fn sign_unsigned_jobs(
+        &mut self,
+        key: &UserKey,
+        node: &str,
+    ) -> (Vec<String>, Vec<(Option<String>, String)>) {
+        let none = |why: String| {
+            let why = format!("the jobs {node} dispatched before users were not signed: {why}");
+            (Vec::new(), vec![(None, why)])
+        };
         let jobs = match self.call(Req::UnsignedJobs) {
             Ok(Response::Jobs { jobs }) => jobs,
-            Ok(other) => {
-                let why = format!("{:#}", unexpected("unsigned jobs", &other));
-                done.machines.push((node.to_string(), why));
-                return done;
-            }
-            Err(e) => {
-                done.machines.push((node.to_string(), format!("{e:#}")));
-                return done;
-            }
+            Ok(other) => return none(format!("{:#}", unexpected("unsigned jobs", &other))),
+            Err(e) => return none(format!("{e:#}")),
         };
         let (mut signed, mut refused) = (Vec::new(), Vec::new());
         // A bounded request each, however many jobs there are.
@@ -1785,21 +1789,19 @@ impl Cx<'_> {
                     refused: r,
                 }) => {
                     signed.extend(s);
-                    refused.extend(r);
+                    refused.extend(r.into_iter().map(|(job, why)| (Some(job), why)));
                 }
                 Ok(other) => {
                     let why = format!("{:#}", unexpected("sign jobs", &other));
-                    refused.extend(batch.iter().map(|j| (j.id.clone(), why.clone())));
+                    refused.extend(batch.iter().map(|j| (Some(j.id.clone()), why.clone())));
                 }
                 Err(e) => {
                     let why = format!("{e:#}");
-                    refused.extend(batch.iter().map(|j| (j.id.clone(), why.clone())));
+                    refused.extend(batch.iter().map(|j| (Some(j.id.clone()), why.clone())));
                 }
             }
         }
-        done.signed.push((node.to_string(), signed));
-        done.refused = refused;
-        done
+        (signed, refused)
     }
 
     fn text_request(&mut self, req: Req, what: &str) -> anyhow::Result<Report> {
@@ -1935,84 +1937,37 @@ fn broken_pipe(e: &anyhow::Error) -> bool {
     })
 }
 
-/// What `potluck user init` signed of the jobs dispatched before the cluster had users that
-/// haven't ended.
-#[derive(Default)]
-struct SignedJobs {
-    /// The jobs signed, by the machine that dispatched them.
-    signed: Vec<(String, Vec<String>)>,
-    /// Jobs not signed, and why.
-    refused: Vec<(String, String)>,
-    /// Machines none of whose jobs were signed, and why.
-    machines: Vec<(String, String)>,
-}
-
-impl SignedJobs {
-    /// "signed 3 jobs a and b dispatched before {before} that haven't ended (a 2, b 1)"; None
-    /// when none was.
-    fn said(&self, before: &str) -> Option<String> {
-        let by: Vec<(&str, usize)> = self
-            .signed
-            .iter()
-            .filter(|(_, jobs)| !jobs.is_empty())
-            .map(|(node, jobs)| (node.as_str(), jobs.len()))
-            .collect();
-        let n: usize = by.iter().map(|(_, k)| k).sum();
-        let (jobs, have) = match n {
-            0 => return None,
-            1 => ("job", "hasn't"),
-            _ => ("jobs", "haven't"),
-        };
-        let nodes: Vec<&str> = by.iter().map(|(node, _)| *node).collect();
-        let each = match by.len() {
-            1 => String::new(),
-            _ => {
-                let each: Vec<String> = by.iter().map(|(node, k)| format!("{node} {k}")).collect();
-                format!(" ({})", each.join(", "))
-            }
-        };
-        Some(format!(
-            "signed {n} {jobs} {} dispatched before {before} that {have} ended{each}",
-            and_list(&nodes)
-        ))
-    }
-
-    /// What wasn't signed, and why: a line each.
-    fn notes(&self) -> Vec<String> {
-        let machines = self.machines.iter().map(|(node, why)| {
-            format!("the jobs {node} dispatched before users were not signed: {why}")
-        });
-        let jobs =
-            (self.refused.iter()).map(|(job, why)| format!("job {job} was not signed: {why}"));
-        machines.chain(jobs).collect()
-    }
-
-    /// Adds `signed_jobs`, `jobs_not_signed` and `machines_not_signed` to `doc`.
-    fn add_to(&self, doc: &mut Value) {
-        let signed: Vec<&String> = self.signed.iter().flat_map(|(_, jobs)| jobs).collect();
-        let map = |rows: &[(String, String)]| -> serde_json::Map<String, Value> {
-            rows.iter()
-                .map(|(k, why)| (k.clone(), json!(why)))
-                .collect()
-        };
-        if let Some(doc) = doc.as_object_mut() {
-            doc.insert("signed_jobs".into(), json!(signed));
-            doc.insert("jobs_not_signed".into(), Value::Object(map(&self.refused)));
-            doc.insert(
-                "machines_not_signed".into(),
-                Value::Object(map(&self.machines)),
-            );
-        }
-    }
-}
-
-/// "a", "a and b", "a, b and c".
-fn and_list(items: &[&str]) -> String {
-    match items {
-        [] => String::new(),
-        [one] => one.to_string(),
-        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
-    }
+/// What `potluck user init` says of the jobs machine `node` dispatched before users that it
+/// signed (`signed`) and didn't (`not_signed`, as [`Cx::sign_unsigned_jobs`] returns them):
+/// "signed 2 jobs NODE dispatched before {before} that haven't ended" (None when it signed none),
+/// a note for each it didn't sign, and `jobs_not_signed` for `--json`.
+fn jobs_signed(
+    node: &str,
+    before: &str,
+    signed: &[String],
+    not_signed: Vec<(Option<String>, String)>,
+) -> (Option<String>, Vec<String>, serde_json::Map<String, Value>) {
+    let said = match signed.len() {
+        0 => None,
+        1 => Some(format!(
+            "signed 1 job {node} dispatched before {before} that hasn't ended"
+        )),
+        n => Some(format!(
+            "signed {n} jobs {node} dispatched before {before} that haven't ended"
+        )),
+    };
+    let notes = not_signed
+        .iter()
+        .map(|(job, why)| match job {
+            Some(job) => format!("job {job} was not signed: {why}"),
+            None => why.clone(),
+        })
+        .collect();
+    let not_signed = not_signed
+        .into_iter()
+        .map(|(job, why)| (job.unwrap_or_default(), json!(why)))
+        .collect();
+    (said, notes, not_signed)
 }
 
 fn unexpected(what: &str, resp: &Response) -> anyhow::Error {

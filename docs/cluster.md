@@ -102,9 +102,9 @@ line's `node.toml`, with mode 0600. Only the command line reads it; the daemon n
 first user's admission is signed by the user key and co-signed by this machine's machine key, and
 the user key signs every member in again, in one batch with it, so no member drops out. On a
 machine in no cluster, `user init` founds one with that machine as its only member. Once the
-cluster has users, `user init` with a user's key makes no records and signs the jobs a first run
-left unsigned (its signing cut short: the daemon restarted, the connection dropped); with any
-other key it refuses.
+cluster has users, `user init` with a user's key makes no records and signs the jobs of the
+machine it runs on that a first run left unsigned (its signing cut short: the daemon restarted,
+the connection dropped); with any other key it refuses.
 
 From then on:
 
