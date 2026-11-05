@@ -30,8 +30,8 @@ In a cluster with users, a machine whose root is hostile can still:
 
 - read the source, command and env of each job granted to it, and fetch the commits of every
   queued job its pools may run and of each job it runs, with the history and files they reach
-  (not the repository's other branches, tags or commits), and learn whether the dispatching
-  machine has an object whose id it knows;
+  and the branches and tags whose tips they reach (no other branch, tag or commit), and learn
+  whether the dispatching machine has an object whose id it knows;
 - see the queue entries of jobs its pools may run (resources, priority, repository ids and
   commits, the signing user's key) and every member's facts, address and version;
 - report any result, output and kept files for the jobs it runs, or none, and hold a job it

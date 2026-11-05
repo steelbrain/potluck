@@ -10,7 +10,7 @@ mod common;
 
 use potluck::config::Paths;
 use potluck::mesh::{Handler, Mesh, MeshConfig, Peer, Stream};
-use potluck::tunnel;
+use potluck::tunnel::{self, Wants};
 use potluck::workspace::{SyncReport, Workspaces};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -228,9 +228,10 @@ impl Proxy {
     }
 }
 
-/// What the source serves: repository id to git dir, and each serve's outcome. A repository with
-/// commits in `views` is served as the daemon serves its mirrors: a [`tunnel::View`] of those
-/// commits, made in `view_root` for that one fetch.
+/// What the source serves: repository id to git dir, and each serve's outcome. A repository is
+/// served as a daemon in a cluster without users serves its mirrors (all of it, any object), or,
+/// with commits in `views`, as one with users does: a [`tunnel::View`] of those commits, made in
+/// `view_root` for that one fetch.
 struct Source {
     repos: Mutex<HashMap<String, PathBuf>>,
     views: Mutex<HashMap<String, Vec<String>>>,
@@ -256,14 +257,14 @@ impl Handler for Source {
         };
         let commits = self.views.lock().unwrap().get(&id).cloned();
         let result = match commits {
-            None => tunnel::serve_upload_pack(stream, &dir),
+            None => tunnel::serve_upload_pack(stream, &dir, Wants::Any),
             Some(commits) => {
                 static N: AtomicU64 = AtomicU64::new(0);
                 let at = self
                     .view_root
                     .join(format!("{}.git", N.fetch_add(1, Ordering::SeqCst)));
                 tunnel::View::create(at, &dir, &commits)
-                    .and_then(|view| tunnel::serve_upload_pack(stream, view.path()))
+                    .and_then(|view| tunnel::serve_upload_pack(stream, view.path(), Wants::Tips))
             }
         };
         let _ = self
@@ -610,36 +611,22 @@ fn a_mirror_syncs_over_the_mesh() {
     assert!(!mirrored.contains("refs/heads/doomed") && !mirrored.contains("refs/tags/old"));
     assert_eq!(c.served(1), [Ok(())]);
 
-    // A commit on no branch or tag (a job's detached HEAD, since moved on): a git dir whose refs
-    // don't name it doesn't serve it; a view of it does, and fetch_pin gets it.
+    // A commit on no branch or tag (a job's detached HEAD, since moved on): fetch_pin gets it.
     let tree = git(repo, &["rev-parse", "HEAD^{tree}"]);
     let loose = git(
         repo,
         &["commit-tree", &tree, "-p", "HEAD", "-m", "detached"],
     );
-    let fetch_pin = |c: &Cluster| {
-        let (paths, id, url, sha) = (
-            c.runner_paths.clone(),
-            c.repo_id.clone(),
-            c.url(),
-            loose.clone(),
-        );
-        within("fetch_pin", move || {
-            Workspaces::new(paths).fetch_pin(&id, &url, &sha, "job-1")
-        })
-    };
-    let err = format!("{:#}", fetch_pin(&c).unwrap_err());
-    assert!(
-        err.contains("not allow request for unadvertised object"),
-        "{err}"
+    let (paths, id, url, sha) = (
+        c.runner_paths.clone(),
+        c.repo_id.clone(),
+        c.url(),
+        loose.clone(),
     );
-    assert_eq!(c.served(1), [Ok(())]);
-    c.handler
-        .views
-        .lock()
-        .unwrap()
-        .insert(c.repo_id.clone(), vec![loose.clone()]);
-    fetch_pin(&c).unwrap();
+    within("fetch_pin", move || {
+        Workspaces::new(paths).fetch_pin(&id, &url, &sha, "job-1")
+    })
+    .unwrap();
     assert_eq!(
         git(&mirror, &["rev-parse", "refs/potluck/pins/job-1"]),
         loose
@@ -672,32 +659,42 @@ fn has(repo: &Path, sha: &str) -> bool {
         .success()
 }
 
-/// A view, as the daemon serves its mirrors: a runner syncs as its daemon does and gets the
-/// view's commit by its id, with what it reaches, and no branch or tag. Any other commit,
-/// tree or blob of the repository is refused, by id, in protocol v0 and v2 alike, and also to a
-/// client that sends its wants raw, ignoring what was advertised. Two fetches at once each get a
-/// view of their own, and every view is gone once its fetch is over.
+/// A view, as a daemon in a cluster with users serves its mirrors: a runner syncs as its daemon
+/// does and gets the view's commit and the branches and tags that it reaches (main, x and their
+/// tags, an annotated tag's own object included). Any other commit, branch, tag, tree or blob of
+/// the repository is refused, by id, in protocol v0 and v2 alike, and also to a client that sends
+/// its wants raw, ignoring what was advertised; so is an ancestor no ref names. A view of
+/// another commit then drops x and its tag from the runner's mirror. Two fetches at once each
+/// get a view of their own, and every view is gone once its fetch is over.
 #[test]
-fn a_view_serves_its_commits_and_nothing_else() {
+fn a_view_serves_its_commits_and_what_they_reach() {
     let c = cluster();
     let repo = &c.repo;
+    let root = commit_file(repo, "root.txt", b"root\n", "root");
     let base = commit_file(repo, "base.txt", b"base\n", "base");
+    git(repo, &["tag", "-a", "-m", "release", "v0"]);
+    git(repo, &["tag", "lw"]);
     git(repo, &["checkout", "-q", "-b", "x"]);
     let a = commit_file(repo, "a.txt", b"job a\n", "a");
     git(repo, &["tag", "-a", "-m", "on a", "va"]);
     git(repo, &["checkout", "-q", "-b", "y", "main"]);
     let b = commit_file(repo, "b.txt", b"secret b\n", "b");
+    git(repo, &["tag", "-a", "-m", "on b", "vy"]);
     git(repo, &["checkout", "-q", "--detach", "main"]);
     let t = commit_file(repo, "t.txt", b"secret t\n", "t");
     git(repo, &["tag", "-a", "-m", "only a tag has it", "vt"]);
     git(repo, &["checkout", "-q", "main"]);
-    let b_tree = git(repo, &["rev-parse", "y^{tree}"]);
-    let b_blob = git(repo, &["rev-parse", "y:b.txt"]);
-    c.handler
-        .views
-        .lock()
-        .unwrap()
-        .insert(c.repo_id.clone(), vec![a.clone()]);
+    let rev = |r: &str| git(repo, &["rev-parse", r]);
+    let (v0, va, vy) = (rev("v0"), rev("va"), rev("vy"));
+    let (b_tree, b_blob) = (rev("y^{tree}"), rev("y:b.txt"));
+    let view_of = |commit: &str| {
+        c.handler
+            .views
+            .lock()
+            .unwrap()
+            .insert(c.repo_id.clone(), vec![commit.to_string()]);
+    };
+    view_of(&a);
     let url = c.url();
     let mut serves = 0;
     let ok = |out: &Output| {
@@ -708,13 +705,30 @@ fn a_view_serves_its_commits_and_nothing_else() {
         );
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     };
+    // The source's own branches and tags (sha refname), of those names.
+    let source_refs = |names: &[&str]| {
+        let mut args = vec!["for-each-ref", "--format=%(objectname) %(refname)"];
+        args.extend_from_slice(names);
+        git(repo, &args)
+    };
 
-    // What it advertises: a, by its id.
+    // What it advertises: a by its id, and the branches and tags a reaches.
     let ls = ok(&c.runner_git(c.root.path(), &["ls-remote", &url]));
     serves += 1;
-    assert_eq!(ls, format!("{a}\trefs/potluck/commits/{a}"));
+    let want = [
+        format!("{base}\tHEAD"),
+        format!("{base}\trefs/heads/main"),
+        format!("{a}\trefs/heads/x"),
+        format!("{a}\trefs/potluck/commits/{a}"),
+        format!("{base}\trefs/tags/lw"),
+        format!("{v0}\trefs/tags/v0"),
+        format!("{base}\trefs/tags/v0^{{}}"),
+        format!("{va}\trefs/tags/va"),
+        format!("{a}\trefs/tags/va^{{}}"),
+    ];
+    assert_eq!(ls, want.join("\n"));
 
-    // A runner's first sync, then the commit it lacks, as its daemon fetches them.
+    // A runner's first sync and the next, as its daemon fetches them.
     let mirror = c.root.path().join("mirror.git");
     let to = mirror.to_str().unwrap();
     ok(&c.runner_git(
@@ -722,41 +736,52 @@ fn a_view_serves_its_commits_and_nothing_else() {
         &["clone", "--bare", "--quiet", "--", &url, to],
     ));
     serves += 1;
-    ok(&c.runner_git(
-        &mirror,
-        &[
-            "fetch",
-            "--quiet",
-            "--prune",
-            "--no-tags",
-            &url,
-            "+refs/heads/*:refs/heads/*",
-            "+refs/tags/*:refs/tags/*",
-        ],
-    ));
+    let sync = |c: &Cluster| {
+        ok(&c.runner_git(
+            &mirror,
+            &[
+                "fetch",
+                "--quiet",
+                "--prune",
+                "--no-tags",
+                &url,
+                "+refs/heads/*:refs/heads/*",
+                "+refs/tags/*:refs/tags/*",
+            ],
+        ));
+    };
+    sync(&c);
     serves += 1;
-    assert_eq!(refs(&mirror), "");
-    let pin = format!("+{a}:refs/potluck/pins/job-a");
-    ok(&c.runner_git(&mirror, &["fetch", "--quiet", "--no-tags", &url, &pin]));
-    serves += 1;
-    assert!(has(&mirror, &a) && has(&mirror, &base));
-    for other in [&b, &t, &b_tree, &b_blob] {
+    let reached = [
+        "refs/heads/main",
+        "refs/heads/x",
+        "refs/tags/lw",
+        "refs/tags/v0",
+        "refs/tags/va",
+    ];
+    assert_eq!(refs(&mirror), source_refs(&reached));
+    assert!(has(&mirror, &a) && has(&mirror, &root));
+    for other in [&b, &t, &vy, &b_tree, &b_blob] {
         assert!(!has(&mirror, other), "{other}");
     }
-    // Every ref it has: a's tag doesn't come along.
+    // Every ref it has.
     let into = c.bare("all.git");
     ok(&c.runner_git(&into, &["fetch", "--quiet", &url, "+refs/*:refs/*"]));
     serves += 1;
+    let mut names: Vec<String> = reached.iter().map(|n| n.to_string()).collect();
+    names.push(format!("refs/potluck/commits/{a}"));
+    names.sort();
     assert_eq!(
         git(&into, &["for-each-ref", "--format=%(refname)"]),
-        format!("refs/potluck/commits/{a}")
+        names.join("\n")
     );
 
     // Anything else, by its id.
     for (what, sha) in [
         ("a commit on another branch", &b),
         ("a commit only a tag has", &t),
-        ("the parent of the view's commit", &base),
+        ("a tag on another branch", &vy),
+        ("an ancestor no ref names", &root),
         ("another commit's tree", &b_tree),
         ("another commit's blob", &b_blob),
     ] {
@@ -775,7 +800,7 @@ fn a_view_serves_its_commits_and_nothing_else() {
         }
     }
     // Sent raw: git upload-pack refuses it.
-    for sha in [&b, &base, &b_tree] {
+    for sha in [&b, &root, &b_tree] {
         let wants = format!(
             "{}0000{}",
             pkt(&format!("want {sha} side-band-64k ofs-delta\n")),
@@ -799,7 +824,21 @@ fn a_view_serves_its_commits_and_nothing_else() {
         assert!(!lines.iter().flatten().any(|l| l.starts_with(b"PACK")));
     }
 
-    // Two fetches at once.
+    // A view of b instead: the runner's next sync drops x and va, and gets y and vy.
+    view_of(&b);
+    sync(&c);
+    serves += 1;
+    let reached = [
+        "refs/heads/main",
+        "refs/heads/y",
+        "refs/tags/lw",
+        "refs/tags/v0",
+        "refs/tags/vy",
+    ];
+    assert_eq!(refs(&mirror), source_refs(&reached));
+    view_of(&a);
+
+    // Two fetches at once, of a by its id.
     let both: Vec<_> = (0..2)
         .map(|i| {
             let into = c.bare(&format!("at-once-{i}.git"));

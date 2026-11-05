@@ -14,24 +14,25 @@
 //!   (git shows them) with a non-zero exit. Only fetching: git names the service it wants in
 //!   `GIT_EXT_SERVICE`, and anything but `git-upload-pack` is refused.
 //! - **The server.** The owner's daemon reads the header's repository id (its stream header
-//!   `upload-pack`, parsed as the cluster's `StreamHeader`), makes a [`View`] of its own mirror
-//!   of that repository with the commits of its jobs that the asker may run or runs, and serves
-//!   it with [`serve_upload_pack`] through [`crate::daemon::GitTunnel`]; an unknown id gets
+//!   `upload-pack`, parsed as the cluster's `StreamHeader`), serves its own mirror of that
+//!   repository if one of its jobs that the asker may run or runs names it, and calls
+//!   [`serve_upload_pack`] through [`crate::daemon::GitTunnel`]; an unknown id gets
 //!   [`refuse_upload_pack`], which git shows as `fatal: remote error: <message>`. `git
 //!   upload-pack` runs in a process group of its own and is killed with its children if either
 //!   side goes away; it is always reaped before the call returns.
-//!
-//! A fetch gets only what the served git dir's refs name: `git upload-pack` speaks protocol v0
-//! (v2 would take a want of any object) with `uploadpack.allow*SHA1InWant` off, so a want of
-//! anything but a ref's tip is refused (`allowReachableSHA1InWant` would also take any tree or
-//! blob by its id). A [`View`]'s refs are commits by id, none of them a branch or tag (a job's
-//! commit may be on no branch any more by the time a runner asks for it): a runner's sync of its
-//! branches and tags gets none, and it fetches each commit it lacks by its id.
+//! - **What is served.** `git upload-pack` speaks protocol v0, whatever the client asks for.
+//!   Without users, the whole mirror, and a fetch can want any object it has ([`Wants::Any`]),
+//!   as protocol v2 would take: a job's commit may be on no branch any more by the time a runner
+//!   asks for it. In a cluster with users, a [`View`] of the mirror for that one fetch, whose refs
+//!   are those jobs' commits by id and the mirror's branches and tags that they reach, and a fetch
+//!   can want only those refs' tips ([`Wants::Tips`]; `allowReachableSHA1InWant` would also take
+//!   any tree or blob by its id, and v2 any object at all).
 
 use crate::config::{NodeConfig, Paths};
 use crate::mesh::{Mesh, MeshConfig, Stream};
 use anyhow::{Context, bail};
 use serde_json::{Value, json};
+use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::AsFd;
@@ -180,15 +181,26 @@ fn err_pkt(message: &str) -> Vec<u8> {
     pkt
 }
 
-/// The prefix of a [`View`]'s refs: `refs/potluck/commits/<sha>`, none of them a branch or tag.
+/// The refs of a [`View`] that name its commits: `refs/potluck/commits/<sha>`.
 const VIEW_REFS: &str = "refs/potluck/commits";
 
-/// A git dir that serves some commits of a repository and nothing else of it, for
-/// [`serve_upload_pack`]: its only refs are those commits (`refs/potluck/commits/<sha>`), and it
-/// reads the repository's objects through `objects/info/alternates`, so nothing is copied and
-/// nothing is written into the repository. A fetch from it can want those commits (and gets
-/// what they reach that it lacks), not another branch, tag or object of the repository. Removed
-/// with everything in it when dropped.
+/// What a fetch from [`serve_upload_pack`] may want.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Wants {
+    /// Any object the git dir has (`uploadpack.allowAnySHA1InWant`).
+    Any,
+    /// Only the tips of its refs: every `uploadpack.allow*SHA1InWant` off, on the command line,
+    /// after every config file, so no config can let more through.
+    Tips,
+}
+
+/// A git dir that serves some commits of a repository and what they reach, for
+/// [`serve_upload_pack`] with [`Wants::Tips`]. Its refs are those commits
+/// (`refs/potluck/commits/<sha>`) and the repository's branches and tags whose tips they reach
+/// (an annotated tag's own object is its ref's tip), and it reads the repository's objects
+/// through `objects/info/alternates`, so nothing is copied and nothing is written into the
+/// repository. A fetch from it gets those refs and what they reach, and no other branch, tag
+/// or object of the repository. Removed with everything in it when dropped.
 #[derive(Debug)]
 pub struct View {
     dir: PathBuf,
@@ -196,9 +208,7 @@ pub struct View {
 
 impl View {
     /// Makes a view at `dir` (which must not exist) of `commits` of the repository at `git_dir`.
-    /// Only full shas count: 40 hex digits, or 64 when the first is that long (a SHA-256
-    /// repository). A commit the repository lacks gets a ref all the same; a fetch of it fails
-    /// (git says "not our ref").
+    /// Only full shas of commits the repository has count.
     pub fn create(
         dir: PathBuf,
         git_dir: &Path,
@@ -216,15 +226,30 @@ impl View {
                     objects.display()
                 ))
             })?;
-        let mut commits: Vec<String> = commits
+        let asked: BTreeSet<String> = commits
             .into_iter()
             .map(|c| c.as_ref().to_ascii_lowercase())
             .filter(|c| {
                 (c.len() == 40 || c.len() == 64) && c.bytes().all(|b| b.is_ascii_hexdigit())
             })
             .collect();
+        let commits = existing_commits(git_dir, &asked)?;
+        let mut refs: Vec<(String, String)> = commits
+            .iter()
+            .map(|c| (format!("{VIEW_REFS}/{c}"), c.clone()))
+            .collect();
+        if !commits.is_empty() {
+            refs.extend(reached_refs(git_dir, &commits)?);
+        }
+        // `packed-refs` must be sorted by name, as git compares them (bytes).
+        refs.sort();
         let sha256 = commits.first().is_some_and(|c| c.len() == 64);
-        commits.retain(|c| (c.len() == 64) == sha256);
+        // The repository's own default branch, if it names one.
+        let head = std::fs::read_to_string(git_dir.join("HEAD"))
+            .ok()
+            .filter(|h| h.starts_with("ref: refs/heads/") && h.lines().count() == 1)
+            .unwrap_or_else(|| "ref: refs/heads/main\n".into());
+
         if let Some(parent) = dir.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -232,8 +257,8 @@ impl View {
         let view = View { dir };
         let d = &view.dir;
         std::fs::create_dir_all(d.join("objects/info"))?;
-        std::fs::create_dir_all(d.join(VIEW_REFS))?;
-        std::fs::write(d.join("HEAD"), "ref: refs/heads/main\n")?;
+        std::fs::create_dir_all(d.join("refs"))?;
+        std::fs::write(d.join("HEAD"), head)?;
         let config = if sha256 {
             "[core]\n\trepositoryformatversion = 1\n\tbare = true\n[extensions]\n\tobjectformat = sha256\n"
         } else {
@@ -245,9 +270,13 @@ impl View {
         if let Ok(shallow) = std::fs::read(git_dir.join("shallow")) {
             std::fs::write(d.join("shallow"), shallow)?;
         }
-        for c in &commits {
-            std::fs::write(d.join(VIEW_REFS).join(c), format!("{c}\n"))?;
+        // One file, whatever the names: loose refs that differ only in case would be one file on
+        // a filesystem that ignores case.
+        let mut packed = String::from("# pack-refs with: sorted \n");
+        for (name, oid) in &refs {
+            packed.push_str(&format!("{oid} {name}\n"));
         }
+        std::fs::write(d.join("packed-refs"), packed)?;
         Ok(view)
     }
 
@@ -263,39 +292,88 @@ impl Drop for View {
     }
 }
 
+/// Those of `commits` that are commits in the repository at `git_dir` (`git cat-file
+/// --batch-check`).
+fn existing_commits(git_dir: &Path, commits: &BTreeSet<String>) -> io::Result<Vec<String>> {
+    if commits.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut child = crate::gitinfo::git(git_dir)
+        .args(["cat-file", "--batch-check=%(objectname) %(objecttype)"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    let input: String = commits.iter().map(|c| format!("{c}\n")).collect();
+    let writer = thread::spawn(move || stdin.write_all(input.as_bytes()));
+    let out = child.wait_with_output()?;
+    let _ = writer.join();
+    if !out.status.success() {
+        return Err(io::Error::other(format!(
+            "git cat-file in {}: {}",
+            git_dir.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.strip_suffix(" commit"))
+        .filter(|c| commits.contains(*c))
+        .map(str::to_string)
+        .collect())
+}
+
+/// The branches and tags of the repository at `git_dir` whose tips one of `commits` reaches (a
+/// tag's peeled), as (name, object): `git for-each-ref --merged` of each, which counts a ref
+/// any one of them reaches.
+fn reached_refs(git_dir: &Path, commits: &[String]) -> io::Result<Vec<(String, String)>> {
+    let mut cmd = crate::gitinfo::git(git_dir);
+    cmd.args(["for-each-ref", "--format=%(objectname) %(refname)"]);
+    cmd.args(commits.iter().map(|c| format!("--merged={c}")));
+    cmd.args(["refs/heads/", "refs/tags/"]);
+    let out = crate::gitinfo::output(&mut cmd).map_err(|e| io::Error::other(format!("{e:#}")))?;
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.split_once(' '))
+        .map(|(oid, name)| (name.to_string(), oid.to_string()))
+        .collect())
+}
+
 /// Runs `git upload-pack` on `git_dir` with its stdin and stdout piped through `stream`, until
 /// the fetch is done or either side goes away, for the daemon's [`crate::mesh::Handler::stream`].
-/// The client can want only the tips of `git_dir`'s refs (see the module docs).
+/// The client can want what `wants` says.
 ///
 /// The process (and anything it started) is killed if the stream breaks or stops taking bytes
 /// for five minutes, and is reaped before this returns. If `git upload-pack` fails before it
 /// sends anything, the client gets its error as a git error packet. `Err` when the stream broke,
 /// or `git upload-pack` couldn't run or failed (with its stderr).
-pub fn serve_upload_pack(mut stream: Stream, git_dir: &Path) -> io::Result<()> {
+pub fn serve_upload_pack(mut stream: Stream, git_dir: &Path, wants: Wants) -> io::Result<()> {
     // Before anything is started: these fail on a socket the other side has reset (macOS
     // refuses setsockopt then), and returning after the spawn would leave the child unreaped.
     let reader = stream.try_clone()?;
     reader.set_read_timeout(Some(POLL))?;
     stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
     let mut cmd = crate::gitinfo::git(git_dir);
-    // On the command line, after every config file: no config can let more through.
-    cmd.args([
-        "-c",
-        "uploadpack.allowAnySHA1InWant=false",
-        "-c",
-        "uploadpack.allowReachableSHA1InWant=false",
-        "-c",
-        "uploadpack.allowTipSHA1InWant=false",
-        "upload-pack",
-        &format!("--timeout={UPLOAD_PACK_TIMEOUT_S}"),
-    ])
-    .arg(git_dir)
-    // Protocol v0, whatever the daemon's environment says: the header carries no version.
-    .env_remove("GIT_PROTOCOL")
-    .stdin(Stdio::piped())
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped())
-    .process_group(0);
+    match wants {
+        Wants::Any => cmd.args(["-c", "uploadpack.allowAnySHA1InWant=true"]),
+        Wants::Tips => cmd.args([
+            "-c",
+            "uploadpack.allowAnySHA1InWant=false",
+            "-c",
+            "uploadpack.allowReachableSHA1InWant=false",
+            "-c",
+            "uploadpack.allowTipSHA1InWant=false",
+        ]),
+    };
+    cmd.args(["upload-pack", &format!("--timeout={UPLOAD_PACK_TIMEOUT_S}")])
+        .arg(git_dir)
+        // Protocol v0, whatever the daemon's environment says: the header carries no version.
+        .env_remove("GIT_PROTOCOL")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
@@ -652,52 +730,94 @@ mod tests {
     #[test]
     fn views() {
         let tmp = tempfile::tempdir().unwrap();
-        let repo = tmp.path().join("r.git");
-        let init = std::process::Command::new("git")
-            .args(["init", "-q", "--bare"])
-            .arg(&repo)
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .status()
-            .unwrap();
-        assert!(init.success());
-        let refs = |view: &View| -> Vec<String> {
-            let mut names: Vec<String> = std::fs::read_dir(view.path().join(VIEW_REFS))
-                .unwrap()
-                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-                .collect();
-            names.sort();
-            names
+        let repo = tmp.path().join("r");
+        let git = |args: &[&str]| -> String {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid"])
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{args:?}: {out:?}");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
         };
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&["init", "-q", "-b", "trunk"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "base"]);
+        let base = git(&["rev-parse", "HEAD"]);
+        git(&["tag", "-a", "-m", "on base", "v0"]);
+        git(&["checkout", "-q", "-b", "x"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "a"]);
+        let a = git(&["rev-parse", "HEAD"]);
+        git(&["checkout", "-q", "-b", "y", "trunk"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "b"]);
+        let b = git(&["rev-parse", "HEAD"]);
+        let tree = git(&["rev-parse", "HEAD^{tree}"]);
+        let v0 = git(&["rev-parse", "v0"]);
+        let git_dir = repo.join(".git");
         let read = |view: &View, f: &str| std::fs::read_to_string(view.path().join(f)).unwrap();
-        let (a, b, c) = ("a".repeat(40), "B".repeat(40), "c".repeat(64));
+
+        // Only commits it has count, by their full ids, whatever their case.
         let at = tmp.path().join("views/1.git");
-        let view = View::create(at.clone(), &repo, [&a, "HEAD", &b, &c, &a[..39]]).unwrap();
-        assert_eq!(refs(&view), [a.clone(), b.to_lowercase()]);
-        assert_eq!(read(&view, &format!("{VIEW_REFS}/{a}")), format!("{a}\n"));
+        let missing = "0".repeat(40);
+        let asked = [
+            a.to_uppercase(),
+            missing,
+            tree,
+            "HEAD".into(),
+            a[..39].into(),
+        ];
+        let view = View::create(at.clone(), &git_dir, &asked).unwrap();
+        // With the branches and tags a reaches.
+        assert_eq!(
+            read(&view, "packed-refs"),
+            format!(
+                "# pack-refs with: sorted \n{base} refs/heads/trunk\n{a} refs/heads/x\n\
+                 {a} {VIEW_REFS}/{a}\n{v0} refs/tags/v0\n"
+            )
+        );
         assert!(read(&view, "config").contains("repositoryformatversion = 0"));
-        let objects = repo.join("objects").canonicalize().unwrap();
+        let objects = git_dir.join("objects").canonicalize().unwrap();
         assert_eq!(
             read(&view, "objects/info/alternates"),
             format!("{}\n", objects.display())
         );
-        assert_eq!(read(&view, "HEAD"), "ref: refs/heads/main\n");
+        assert_eq!(read(&view, "HEAD"), "ref: refs/heads/y\n");
         // Never made over another.
-        assert!(View::create(at.clone(), &repo, [&a]).is_err());
+        assert!(View::create(at.clone(), &git_dir, [&a]).is_err());
         drop(view);
         assert!(!at.exists());
 
-        let view = View::create(tmp.path().join("views/2.git"), &repo, [&c, &a]).unwrap();
-        assert_eq!(refs(&view), [c]);
-        assert!(read(&view, "config").contains("objectformat = sha256"));
+        // Each ref any of them reaches; none, and no ref but its own, for none.
+        let view = View::create(tmp.path().join("views/2.git"), &git_dir, [&a, &b]).unwrap();
+        let names: Vec<String> = read(&view, "packed-refs")
+            .lines()
+            .skip(1)
+            .map(|l| l.split(' ').nth(1).unwrap().to_string())
+            .collect();
+        let mut want = vec![
+            "refs/heads/trunk".to_string(),
+            "refs/heads/x".into(),
+            "refs/heads/y".into(),
+            format!("{VIEW_REFS}/{a}"),
+            format!("{VIEW_REFS}/{b}"),
+            "refs/tags/v0".into(),
+        ];
+        want.sort();
+        assert_eq!(names, want);
+        let view = View::create(tmp.path().join("views/3.git"), &git_dir, ["nope"]).unwrap();
+        assert_eq!(read(&view, "packed-refs"), "# pack-refs with: sorted \n");
 
         let gone = View::create(
-            tmp.path().join("views/3.git"),
+            tmp.path().join("views/4.git"),
             &tmp.path().join("gone"),
             [&a],
         );
         assert!(gone.unwrap_err().to_string().contains("can't read"));
-        assert!(!tmp.path().join("views/3.git").exists());
+        assert!(!tmp.path().join("views/4.git").exists());
     }
 
     #[test]

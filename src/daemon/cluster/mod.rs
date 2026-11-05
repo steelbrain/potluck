@@ -81,8 +81,14 @@ pub trait Tunnel: Send + Sync {
     /// The URL the mirror of `repo_id` syncs from, through `owner`, with the `potluck` binary
     /// the daemon runs its helpers from.
     fn fetch_url(&self, potluck_bin: &Path, owner: &str, repo_id: &str) -> String;
-    /// On the owner: serves `git upload-pack` of `git_dir` on a stream a runner opened.
-    fn serve_upload_pack(&self, git_dir: &Path, stream: Stream) -> anyhow::Result<()>;
+    /// On the owner: serves `git upload-pack` of `git_dir` on a stream a runner opened, taking
+    /// the wants that `wants` allows.
+    fn serve_upload_pack(
+        &self,
+        git_dir: &Path,
+        wants: crate::tunnel::Wants,
+        stream: Stream,
+    ) -> anyhow::Result<()>;
 }
 
 /// The tunnel of cluster-design.md ([`crate::tunnel`]):
@@ -94,8 +100,13 @@ impl Tunnel for GitTunnel {
     fn fetch_url(&self, potluck_bin: &Path, owner: &str, repo_id: &str) -> String {
         crate::tunnel::fetch_url(potluck_bin, owner, repo_id)
     }
-    fn serve_upload_pack(&self, git_dir: &Path, stream: Stream) -> anyhow::Result<()> {
-        Ok(crate::tunnel::serve_upload_pack(stream, git_dir)?)
+    fn serve_upload_pack(
+        &self,
+        git_dir: &Path,
+        wants: crate::tunnel::Wants,
+        stream: Stream,
+    ) -> anyhow::Result<()> {
+        Ok(crate::tunnel::serve_upload_pack(stream, git_dir, wants)?)
     }
 }
 

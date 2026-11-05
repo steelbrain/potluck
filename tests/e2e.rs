@@ -2301,106 +2301,216 @@ fn has_object(repo: &Path, sha: &str) -> bool {
         .success()
 }
 
-/// A runner gets from the job's owner only the commits of the jobs it may run or runs: b, running
-/// a's job A (a commit on branch x), has in its mirror that commit and what it reaches, and none
-/// of the project's branches and tags; not job B's commit (on branch y, running on a), nor a
-/// commit only a tag has. Asked for by their ids through the tunnel as b, a serves job A's
-/// commit and refuses the others.
-#[test]
-fn a_runner_gets_only_the_commits_of_its_jobs() {
-    let a = Node::new();
-    let b = Node::new();
-    pair(&a, &b);
-    let proj = &a.proj;
-    let commit = |file: &str| {
-        std::fs::write(proj.join(file), format!("{file}\n")).unwrap();
-        git(proj, &["add", file]);
-        git(proj, &["commit", "-qm", file]);
-        git(proj, &["rev-parse", "HEAD"])
-    };
-    let base = git(proj, &["rev-parse", "HEAD"]);
-    git(proj, &["checkout", "-q", "-b", "y"]);
-    let job_b_commit = commit("b.txt");
-    let on_a = format!("node={}", a.name);
-    let job_b = a.dispatch(&["--timeout", "1m", "--on", &on_a, "--", "sleep", "30"]);
-    a.running(&job_b);
-    git(proj, &["checkout", "-q", "--detach", BRANCH]);
-    let tagged = commit("t.txt");
-    git(proj, &["tag", "-a", "-m", "only a tag has it", "vt"]);
-    git(proj, &["checkout", "-q", "-b", "x", BRANCH]);
-    let job_a_commit = commit("a.txt");
-    let on_b = format!("node={}", b.name);
-    let job_a = a.dispatch(&["--timeout", "1m", "--on", &on_b, "--", "sleep", "30"]);
-    let j = a.running(&job_a);
-    let logs = || format!("{}\n{}", a.daemon_log(), b.daemon_log());
-    assert_eq!(j.node.as_deref(), Some(b.name.as_str()), "{}", logs());
-    assert_eq!(j.spec.repo.commit, job_a_commit);
+/// a's project with a tag v0 on its first commit and three commits from there: job B's on
+/// branch y (tagged vy), running on a; one only the tag vt has; and job A's on branch x, running on
+/// b. In a cluster with users when `users`.
+struct TwoBranches {
+    /// Dropped first, while a, which owns the job b runs, is still there to take its cancel.
+    b: Node,
+    a: Node,
+    job_a: JobRecord,
+    job_b_commit: String,
+    tagged: String,
+    vy: String,
+    /// b's mirror of the project.
+    mirror: PathBuf,
+    /// a's.
+    owners: PathBuf,
+}
 
-    let mirror = mirrors_of(&b)
-        .into_iter()
-        .find(|m| has_object(m, &job_a_commit))
-        .unwrap_or_else(|| panic!("no mirror on b has job A's commit\n{}", logs()));
-    assert!(has_object(&mirror, &base));
-    for (what, sha) in [("job B's commit", &job_b_commit), ("the tag's", &tagged)] {
-        assert!(!has_object(&mirror, sha), "b's mirror has {what}");
+impl TwoBranches {
+    fn new(users: bool) -> TwoBranches {
+        let a = Node::new();
+        let b = Node::new();
+        pair(&a, &b);
+        if users {
+            a.cli_ok(&["user", "init", "--name", "owner"]);
+            let start = Instant::now();
+            while b.cli_ok(&["user", "list"])["users"]
+                .as_array()
+                .is_none_or(|u| u.is_empty())
+            {
+                assert!(start.elapsed() < Duration::from_secs(30), "b has no user");
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+        let proj = a.proj.clone();
+        let commit = |file: &str| {
+            std::fs::write(proj.join(file), format!("{file}\n")).unwrap();
+            git(&proj, &["add", file]);
+            git(&proj, &["commit", "-qm", file]);
+            git(&proj, &["rev-parse", "HEAD"])
+        };
+        git(&proj, &["tag", "-a", "-m", "release", "v0"]);
+        git(&proj, &["checkout", "-q", "-b", "y"]);
+        let job_b_commit = commit("b.txt");
+        git(&proj, &["tag", "-a", "-m", "on y", "vy"]);
+        let vy = git(&proj, &["rev-parse", "vy"]);
+        let on_a = format!("node={}", a.name);
+        let job_b = a.dispatch(&["--timeout", "1m", "--on", &on_a, "--", "sleep", "30"]);
+        a.running(&job_b);
+        git(&proj, &["checkout", "-q", "--detach", BRANCH]);
+        let tagged = commit("t.txt");
+        git(&proj, &["tag", "-a", "-m", "only a tag has it", "vt"]);
+        git(&proj, &["checkout", "-q", "-b", "x", BRANCH]);
+        let job_a_commit = commit("a.txt");
+        let on_b = format!("node={}", b.name);
+        let job_a = a.dispatch(&["--timeout", "1m", "--on", &on_b, "--", "sleep", "30"]);
+        let job_a = a.running(&job_a);
+        assert_eq!(
+            job_a.node.as_deref(),
+            Some(b.name.as_str()),
+            "{}\n{}",
+            a.daemon_log(),
+            b.daemon_log()
+        );
+        assert_eq!(job_a.spec.repo.commit, job_a_commit);
+        let with_a = |n: &Node| {
+            mirrors_of(n)
+                .into_iter()
+                .find(|m| has_object(m, &job_a_commit))
+                .unwrap_or_else(|| panic!("no mirror on {} has job A's commit", n.name))
+        };
+        let (mirror, owners) = (with_a(&b), with_a(&a));
+        TwoBranches {
+            b,
+            a,
+            job_a,
+            job_b_commit,
+            tagged,
+            vy,
+            mirror,
+            owners,
+        }
     }
-    let branches_and_tags = git(
-        &mirror,
-        &[
-            "for-each-ref",
-            "--format=%(refname)",
-            "refs/heads",
-            "refs/tags",
-        ],
-    );
-    assert_eq!(branches_and_tags, "", "b's mirror");
 
-    // Through the tunnel, as b.
-    let url = potluck::tunnel::fetch_url(Path::new(BIN), &a.name, &j.spec.repo.id);
-    let into = b.dir.path().join("into.git");
-    git(
-        b.dir.path(),
-        &["init", "-q", "--bare", into.to_str().unwrap()],
-    );
-    let fetch = |args: &[&str]| {
+    /// `git <args>` in a new bare repository, through the tunnel to a as b.
+    fn as_b(&self, args: &[&str]) -> std::process::Output {
+        let into = tempfile::tempdir_in(self.b.dir.path()).unwrap();
+        git(into.path(), &["init", "-q", "--bare"]);
         Command::new("git")
             .arg("-C")
-            .arg(&into)
+            .arg(into.path())
             .args(["-c", "protocol.ext.allow=always"])
             .args(args)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("POTLUCK_HOME", &b.paths.home)
-            .env("POTLUCK_CONFIG", &b.paths.config)
+            .env("POTLUCK_HOME", &self.b.paths.home)
+            .env("POTLUCK_CONFIG", &self.b.paths.config)
             .output()
             .unwrap()
-    };
-    let ls = fetch(&["ls-remote", &url]);
-    assert!(
-        ls.status.success(),
-        "{}",
-        String::from_utf8_lossy(&ls.stderr)
-    );
-    assert_eq!(
-        String::from_utf8_lossy(&ls.stdout).trim(),
-        format!("{job_a_commit}\trefs/potluck/commits/{job_a_commit}")
-    );
-    for sha in [&job_b_commit, &tagged] {
-        let out = fetch(&["fetch", "--quiet", &url, sha]);
-        let err = String::from_utf8_lossy(&out.stderr);
-        assert!(
-            !out.status.success() && err.contains("not allow request for unadvertised object"),
-            "{sha}: {err}"
-        );
-        assert!(!has_object(&into, sha));
     }
-    let out = fetch(&["fetch", "--quiet", &url, &job_a_commit]);
+
+    fn url(&self) -> String {
+        potluck::tunnel::fetch_url(Path::new(BIN), &self.a.name, &self.job_a.spec.repo.id)
+    }
+}
+
+/// `sha refname` of `repo`'s branches and tags, or of those `names` only.
+fn branches_and_tags(repo: &Path, names: &[&str]) -> String {
+    let mut args = vec!["for-each-ref", "--format=%(objectname) %(refname)"];
+    match names {
+        [] => args.extend(["refs/heads", "refs/tags"]),
+        names => args.extend_from_slice(names),
+    }
+    git(repo, &args)
+}
+
+/// Without users a runner's mirror is the owner's, every branch and tag, and any commit of it
+/// can be fetched through the tunnel: b, running a's job A, has job B's commit too, and the one
+/// only a tag has.
+#[test]
+fn without_users_a_runners_mirror_has_every_branch_and_tag() {
+    let t = TwoBranches::new(false);
+    assert_eq!(
+        branches_and_tags(&t.mirror, &[]),
+        branches_and_tags(&t.owners, &[])
+    );
+    for sha in [&t.job_b_commit, &t.tagged, &t.vy] {
+        assert!(has_object(&t.mirror, sha), "{sha}");
+    }
+    let out = t.as_b(&["fetch", "--quiet", &t.url(), &t.job_b_commit]);
     assert!(
         out.status.success(),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(has_object(&into, &job_a_commit));
+}
+
+/// With users, a runner gets from the job's owner only the commits of the jobs it may run or
+/// runs and the branches and tags they reach: b, running a's job A (on branch x), has in its
+/// mirror x, the branches whose tips A's commit contains, and v0 on an ancestor of it; not y and
+/// its tag vy (job B's, running on a), nor the commit only vt has. Asked for by their ids through
+/// the tunnel as b, a refuses those. When b runs a job from another branch, w, later, its next
+/// sync drops x from its mirror and brings w.
+#[test]
+fn with_users_a_runner_gets_only_its_jobs_commits_and_what_they_reach() {
+    let t = TwoBranches::new(true);
+    let logs = || format!("{}\n{}", t.a.daemon_log(), t.b.daemon_log());
+    let branch = format!("refs/heads/{BRANCH}");
+    let reached = ["refs/heads/main", &branch, "refs/heads/x", "refs/tags/v0"];
+    assert_eq!(
+        branches_and_tags(&t.mirror, &[]),
+        branches_and_tags(&t.owners, &reached),
+        "{}",
+        logs()
+    );
+    for sha in [&t.job_b_commit, &t.tagged, &t.vy] {
+        assert!(!has_object(&t.mirror, sha), "b's mirror has {sha}");
+    }
+
+    let ls = t.as_b(&["ls-remote", &t.url()]);
+    let ls = String::from_utf8_lossy(&ls.stdout).into_owned();
+    let a = &t.job_a.spec.repo.commit;
+    assert!(
+        ls.contains(&format!("{a}\trefs/potluck/commits/{a}")),
+        "{ls}"
+    );
+    for not in [
+        "refs/heads/y",
+        "refs/tags/vy",
+        "refs/tags/vt",
+        &t.job_b_commit,
+        &t.tagged,
+        &t.vy,
+    ] {
+        assert!(!ls.contains(not), "{not} in {ls}");
+    }
+    for sha in [&t.job_b_commit, &t.tagged, &t.vy] {
+        let out = t.as_b(&["fetch", "--quiet", &t.url(), sha]);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !out.status.success() && err.contains("not allow request for unadvertised object"),
+            "{sha}: {err}"
+        );
+    }
+    let out = t.as_b(&["fetch", "--quiet", &t.url(), a]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // A job from branch w on b, once A is over.
+    t.a.cli_ok(&["cancel", &t.job_a.id]);
+    t.a.wait_for(&t.job_a.id, "ended", 60, |r| r.state.is_done());
+    let proj = &t.a.proj;
+    git(proj, &["checkout", "-q", "-b", "w", BRANCH]);
+    std::fs::write(proj.join("c.txt"), "c\n").unwrap();
+    git(proj, &["add", "c.txt"]);
+    git(proj, &["commit", "-qm", "c"]);
+    let on_b = format!("node={}", t.b.name);
+    let job_c =
+        t.a.dispatch(&["--timeout", "1m", "--on", &on_b, "--", "true"]);
+    let (code, j, _) = t.a.wait(&job_c);
+    assert_eq!(code, 0, "{j}\n{}", logs());
+    let reached = ["refs/heads/main", &branch, "refs/heads/w", "refs/tags/v0"];
+    assert_eq!(
+        branches_and_tags(&t.mirror, &[]),
+        branches_and_tags(&t.owners, &reached),
+        "{}",
+        logs()
+    );
 }
 
 // ---------------------------------------------------------------------------------------------

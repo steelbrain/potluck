@@ -7,6 +7,7 @@ use super::{CState, Cluster, KV_CANCELS, KV_ENDINGS, KV_LOG_BASE, capable, save}
 use crate::daemon::state::State;
 use crate::daemon::{Shared, files, runner};
 use crate::proto::{Response, ServerResponse, read_msg};
+use crate::tunnel::Wants;
 use crate::types::{
     EXIT_CANCELLED, EXIT_LOST, EXIT_TIMEOUT, JobId, JobRecord, JobState, Lease, Millis, NodeName,
     RepoRef, WorkspaceId,
@@ -1259,14 +1260,15 @@ impl Drop for PartDir {
     }
 }
 
-/// A runner's mirror syncs from this machine: `git upload-pack` of a view of this machine's own
-/// mirror of a repository ([`crate::tunnel::View`]), made for this one fetch, whose only refs are
-/// the commits there of this machine's jobs that the asker may fetch ([`fetchable`]) as they
-/// stand when it asks: it can fetch those, not the mirror's branches, tags or other objects. A
-/// dispatch syncs that mirror from its source and pins its commits there until the job ends, so
-/// the mirror has every commit a queued job needs. The source recorded at the latest dispatch may not: worktrees
-/// of one project keep their submodules' git dirs apart, and a submodule commit made in one
-/// worktree is only in its own. The source is served only if the mirror is gone.
+/// A runner's mirror syncs from this machine: `git upload-pack` of this machine's own mirror of a
+/// repository that its jobs the asker may fetch name ([`fetchable`]), as they stand when it asks.
+/// Without users, the whole mirror, any object of it ([`Wants::Any`]: members are trusted then).
+/// With users, a view of it made for this one fetch ([`crate::tunnel::View`]): those jobs'
+/// commits there and the branches and tags they reach, and nothing else of the mirror. A dispatch
+/// syncs that mirror from its source and pins its commits there until the job ends, so the mirror
+/// has every commit a queued job needs. The source recorded at the latest dispatch may not:
+/// worktrees of one project keep their submodules' git dirs apart, and a submodule commit made in
+/// one worktree is only in its own. The source is served only if the mirror is gone.
 pub(super) fn upload_pack(
     sh: &Shared,
     c: &Cluster,
@@ -1297,31 +1299,36 @@ pub(super) fn upload_pack(
     };
     let mirror = sh.paths.mirror(repo_id);
     let dir = if mirror.is_dir() { mirror } else { source };
-    static VIEWS: AtomicU64 = AtomicU64::new(0);
-    let name = format!(
-        "{}-{}.git",
-        std::process::id(),
-        VIEWS.fetch_add(1, Ordering::Relaxed)
-    );
-    let view = match crate::tunnel::View::create(
-        sh.paths.upload_pack_views().join(name),
-        &dir,
-        &commits,
-    ) {
-        Ok(v) => v,
-        Err(e) => {
-            sh.log.log(format!(
-                "cluster: serving {repo_id} ({}) to {from}: {e}",
-                dir.display()
-            ));
-            let _ = crate::tunnel::refuse_upload_pack(
-                stream,
-                &format!("{} can't serve repository {repo_id}: {e}", c.node),
-            );
-            return;
+    let view = if taker.users {
+        static VIEWS: AtomicU64 = AtomicU64::new(0);
+        let name = format!(
+            "{}-{}.git",
+            std::process::id(),
+            VIEWS.fetch_add(1, Ordering::Relaxed)
+        );
+        let at = sh.paths.upload_pack_views().join(name);
+        match crate::tunnel::View::create(at, &dir, &commits) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                sh.log.log(format!(
+                    "cluster: serving {repo_id} ({}) to {from}: {e}",
+                    dir.display()
+                ));
+                let _ = crate::tunnel::refuse_upload_pack(
+                    stream,
+                    &format!("{} can't serve repository {repo_id}: {e}", c.node),
+                );
+                return;
+            }
         }
+    } else {
+        None
     };
-    if let Err(e) = c.opts.tunnel.serve_upload_pack(view.path(), stream) {
+    let (git_dir, wants) = match &view {
+        Some(v) => (v.path(), Wants::Tips),
+        None => (dir.as_path(), Wants::Any),
+    };
+    if let Err(e) = c.opts.tunnel.serve_upload_pack(git_dir, wants, stream) {
         sh.log.log(format!(
             "cluster: serving {repo_id} ({}) to {from}: {e:#}",
             dir.display()

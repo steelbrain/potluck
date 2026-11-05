@@ -159,14 +159,15 @@ the other members need no access to its remotes. A member keeps a bare mirror of
 each of its submodule repositories from the first time a job from it is queued that the member could
 run (the dispatching machine, at dispatch). Mirrors are fed from the dispatching machine over the
 cluster's connections with git's own protocol, so only the objects a mirror lacks travel. The
-dispatching machine serves a member only the commits of its jobs that are queued, for a member that
-may take them, or that run on that member, each by its id with the history and files it reaches: no
-other branch, tag or commit of the repository. The dispatching machine's mirrors are exact copies of
-the source's branches and tags, force-updates and deletions included; another member's mirrors have
-no branches or tags. A job that runs git in its workspace writes the mirror's branches and tags (a
-worktree shares them): a branch or tag that changed since the last sync is reset to the source's at
-the next sync. A mirror that changed that way, or that fails its checks and is cloned again from the
-source, is reported in the daemon's log and in the log and `why` of the job the sync was for:
+dispatching machine serves a repository only while one of its jobs names it and is queued, or runs
+on the member that asks. Mirrors are exact copies of the source's branches and tags, force-updates
+and deletions included. In a cluster with users, the dispatching machine serves a member only the
+commits of those jobs, by their ids, with the history and files they reach, and the branches and
+tags whose tips those commits reach: other branches and tags don't come along. A job that runs git
+in its workspace writes the mirror's branches and tags (a worktree shares them): a branch or tag
+that changed since the last sync is reset to the source's at the next sync. A mirror that changed
+that way, or that fails its checks and is cloned again from the source, is reported in the daemon's
+log and in the log and `why` of the job the sync was for:
 
 ```console
 --- potluck: warning: mini: the mirror of app-7c27480694ae7212 had changed since its last sync, so something other than potluck wrote to it (a job running git in its workspace, for one), and was reset to its source's branches and tags: refs/heads/scratch was made here, at f988fe3f3570 ---
