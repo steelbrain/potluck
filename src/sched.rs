@@ -11,27 +11,36 @@
 //! - **Feasibility.** The machine must be in one of the job's pools, facts (`on`) must match, the
 //!   RAM must fit the capacity, the selectors must fit the machine's GPUs, and a job pinned to a
 //!   workspace runs only on that workspace's machine. A job this machine can never run is skipped:
-//!   it is neither blocked here nor passed over.
+//!   it is neither blocked here nor passed over, and holds nothing.
 //! - **Workspaces.** One invocation at a time runs in a workspace, and invocations dispatched into
 //!   it run first come, first served, whatever their priorities: a later one doesn't start while
 //!   an earlier one waits. A pinned job waiting for its own workspace (an invocation runs in it, or
-//!   an earlier one goes first) holds no reservation and is not passed over.
+//!   an earlier one goes first) holds no reservation, holds nothing and is not passed over.
 //! - **Order.** By effective priority ([`crate::types::effective_priority`]), then submit time, then
-//!   job id.
-//! - **Aging.** A job is passed over when another job, submitted later, is granted something it
-//!   waits for: a GPU one of its selectors matches; RAM, when it didn't fit in the RAM free just
-//!   before; anything, when it is exclusive and waits for the machine to empty; or its place, when
-//!   it could have had what it asks for just before that start and not after. Passed jobs could
-//!   run on this machine and are still waiting; they are returned in [`Plan::passed`] (once per
-//!   plan) and the caller adds one to their `passes`.
-//! - **No jumping the line.** The first job in order that can't start holds the machine: no job
-//!   after it in order starts there until it does, even one that would fit now. So a job starts
-//!   ahead of another only by going ahead of it in order, that is, by a higher priority (after
-//!   aging), and an exclusive job waits only for what already runs to end. Its reservation says
-//!   when what it needs is expected free, if every holder runs to its deadline (for `why`).
+//!   job id. Jobs are granted in that order, so when several jobs want the same free resources the
+//!   first in order gets them.
+//! - **Filling.** A job that fits in what is free now starts, even while a job ahead of it in order
+//!   waits on this machine for something it lacks.
+//! - **Holding the line.** A job holds the line when it was dispatched with `--hold-line`
+//!   ([`crate::types::JobSpec::hold_line`]) or has been queued for [`HOLD_LINE_AFTER_MS`] (30
+//!   minutes) since it was submitted (a job queued again after its machine was lost keeps its
+//!   submit time). The first job in order that holds the line and can't start holds this machine:
+//!   no job after it in order starts here until it does, even one that would fit now. So jobs
+//!   fill in ahead of a job for at most 30 minutes after it was submitted: an exclusive job then
+//!   waits for what runs then to end (and for jobs ahead of it in order).
+//! - **Aging.** A waiting job is passed over when a job after it in order starts here (it fills in
+//!   ahead of it), or when a job submitted later and ahead of it in order (by a higher priority,
+//!   after aging) is granted something it waits for: a GPU one of its selectors matches; RAM, when
+//!   it didn't fit in the RAM free just before; anything, when it is exclusive and waits for the
+//!   machine to empty; or its place, when it could have had what it asks for just before that
+//!   start and not after. Passed jobs could run on this machine and are still waiting; they are
+//!   returned in [`Plan::passed`] (once per plan) and the caller adds one to their `passes`.
+//! - **Reservations.** For `why`: when what the first job in order that can't start needs is
+//!   expected free, and the same for the job holding the line, if every holder (the jobs this plan
+//!   starts included) runs to its deadline.
 //! - **No preemption.** Nothing here stops a running job.
 
-use crate::types::{Facts, Gpu, Grant, JobId, Millis, NodeName, Request, WorkspaceId};
+use crate::types::{Facts, Gpu, Grant, JobId, MINUTE_MS, Millis, NodeName, Request, WorkspaceId};
 use crate::types::{effective_priority, gpu_matches};
 use std::cmp::{Ordering, Reverse};
 use std::collections::BTreeMap;
@@ -40,6 +49,9 @@ use std::collections::BTreeMap;
 mod sim;
 #[cfg(test)]
 pub(crate) mod tests;
+
+/// A job queued this long (since it was submitted) holds the line, `--hold-line` or not.
+pub const HOLD_LINE_AFTER_MS: u64 = 30 * MINUTE_MS;
 
 /// A job running on this machine.
 #[derive(Clone, Debug)]
@@ -64,6 +76,31 @@ pub struct Queued {
     pub workspace: Option<(WorkspaceId, NodeName, bool)>,
     /// The pools it runs in ([`crate::types::JobSpec::pools`]; empty: the default pool).
     pub pools: Vec<String>,
+    /// Dispatched with `--hold-line` ([`crate::types::JobSpec::hold_line`]).
+    pub hold_line: bool,
+}
+
+impl Queued {
+    /// Why it holds the line at `now`, if it does: it was dispatched with `--hold-line`, or it
+    /// has been queued for [`HOLD_LINE_AFTER_MS`].
+    pub fn holds_line(&self, now: Millis) -> Option<HoldsLine> {
+        if self.hold_line {
+            Some(HoldsLine::Asked)
+        } else if now.saturating_sub(self.submitted_at) >= HOLD_LINE_AFTER_MS {
+            Some(HoldsLine::Waited)
+        } else {
+            None
+        }
+    }
+}
+
+/// Why a job holds the line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HoldsLine {
+    /// It was dispatched with `--hold-line`.
+    Asked,
+    /// It has been queued for [`HOLD_LINE_AFTER_MS`].
+    Waited,
 }
 
 /// One machine as the scheduler sees it.
@@ -80,11 +117,21 @@ pub struct MachineView<'a> {
 pub struct Plan {
     /// Jobs to start now, with what each is granted, in start order.
     pub start: Vec<(JobId, Grant)>,
-    /// Waiting jobs these starts passed over: a later-submitted job was granted something each
-    /// waits for (each gets one more pass).
+    /// Waiting jobs these starts passed over: a job after each in order started, or a
+    /// later-submitted job was granted something each waits for (each gets one more pass).
     pub passed: Vec<JobId>,
     /// The first blocked job's reservation, if a job is blocked.
     pub reservation: Option<Reservation>,
+    /// The job holding the line, if one does: the first in order that holds it
+    /// ([`Queued::holds_line`]) and can't start. No job after it in order starts.
+    pub line: Option<Line>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Line {
+    /// Its reservation.
+    pub reservation: Reservation,
+    pub why: HoldsLine,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -164,18 +211,26 @@ fn cmp_job_ids(a: &str, b: &str) -> Ordering {
     na.cmp(nb).then(sa.cmp(&sb)).then(a.cmp(b))
 }
 
-/// Which queued jobs to start on this machine now, which waiting jobs that passes over, and the
-/// first blocked job's reservation. See the module docs for the rules.
+/// Which queued jobs to start on this machine now, which waiting jobs that passes over, the first
+/// blocked job's reservation and the job holding the line. See the module docs for the rules.
 pub fn plan(now: Millis, machine: &MachineView, queue: &[Queued]) -> Plan {
     let mut load = Load::new(now, machine);
     let mut out = Plan::default();
     let heads = workspace_heads(machine, queue);
+    let order = order(queue);
+    // Each job's place in order.
+    let mut place = vec![0; queue.len()];
+    for (pos, &i) in order.iter().enumerate() {
+        place[i] = pos;
+    }
     // Jobs that could run here and wait for something another job may get (aging candidates).
     let mut waiting: Vec<usize> = Vec::new();
     // Each start: the job, its grant, and the machine's load just before it.
     let mut starts: Vec<(usize, Grant, Vec<Hold>)> = Vec::new();
+    let mut first = None;
+    let mut line = None;
 
-    for i in order(queue) {
+    for &i in &order {
         let q = &queue[i];
         if feasible(machine, q).is_err() {
             continue;
@@ -187,17 +242,15 @@ pub fn plan(now: Millis, machine: &MachineView, queue: &[Queued]) -> Plan {
             // earlier goes first. No reservation, and no other start passes it over.
             continue;
         }
-        // Behind the first job that can't start: it holds the machine.
-        if out.reservation.is_some() {
+        // Behind the job holding the line: nothing starts.
+        if line.is_some() {
             waiting.push(i);
             continue;
         }
         let Some(grant) = load.grant(q) else {
             waiting.push(i);
-            out.reservation = Some(Reservation {
-                job: q.job.clone(),
-                at: load.free_at(q),
-            });
+            first.get_or_insert(i);
+            line = q.holds_line(now).map(|why| (i, why));
             continue;
         };
         starts.push((i, grant.clone(), load.holds.clone()));
@@ -205,12 +258,24 @@ pub fn plan(now: Millis, machine: &MachineView, queue: &[Queued]) -> Plan {
         out.start.push((q.job.clone(), grant));
     }
 
+    // With what this plan starts holding what it was granted: jobs that filled in ahead of the
+    // first blocked one may hold what it needs.
+    let reserve = |i: usize| Reservation {
+        job: queue[i].job.clone(),
+        at: load.free_at(&queue[i]),
+    };
+    out.reservation = first.map(reserve);
+    out.line = line.map(|(i, why)| Line {
+        reservation: reserve(i),
+        why,
+    });
     out.passed = waiting
         .into_iter()
         .filter(|&w| {
             starts.iter().any(|(s, grant, before)| {
-                queue[w].submitted_at < queue[*s].submitted_at
-                    && passes_over(&load.at(before), &queue[*s], grant, &queue[w])
+                place[*s] > place[w]
+                    || (queue[w].submitted_at < queue[*s].submitted_at
+                        && passes_over(&load.at(before), &queue[*s], grant, &queue[w]))
             })
         })
         .map(|w| queue[w].job.clone())
@@ -250,8 +315,8 @@ pub(crate) fn workspace_heads<'q>(
     heads
 }
 
-/// Whether start `s`, granted `grant` on a machine loaded as `before`, passes over the waiting job
-/// `w`: `s` was granted something `w` needs and lacks.
+/// Whether start `s`, ahead of the waiting job `w` in order and granted `grant` on a machine loaded
+/// as `before`, passes over `w`: `s` was granted something `w` needs and lacks.
 ///
 /// - a GPU one of `w`'s selectors matches;
 /// - RAM, when `w` didn't fit in the RAM free before `s` started;
@@ -495,7 +560,7 @@ impl<'m, 'a> Load<'m, 'a> {
 
     /// The GPUs (indices) a job with these selectors would wait for, and when they are all
     /// expected free, not before `base`. Among GPUs free by that time, those freed latest are
-    /// picked, so GPUs free sooner stay open to jobs that backfill.
+    /// picked, so GPUs free sooner stay open to jobs that fill in.
     pub fn gpu_wait(&self, sels: &[String], base: Millis) -> (Millis, Vec<usize>) {
         let gpus = &self.machine.facts.gpus;
         let free_at: Vec<Millis> = gpus.iter().map(|g| self.gpu_free_at(&g.id)).collect();
@@ -515,8 +580,8 @@ impl<'m, 'a> Load<'m, 'a> {
         (times.last().copied().unwrap_or(base), Vec::new())
     }
 
-    /// When what `q`, first in order and unable to start, needs is expected free, if every
-    /// holder runs to its deadline.
+    /// When what `q`, unable to start, needs is expected free, if every holder runs to its
+    /// deadline.
     fn free_at(&self, q: &Queued) -> Millis {
         let r = &q.request;
         if r.exclusive {

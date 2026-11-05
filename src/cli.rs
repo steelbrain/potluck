@@ -255,6 +255,10 @@ pub struct DispatchArgs {
     /// Nothing else runs on the machine beside this job, and it holds every GPU there.
     #[arg(long)]
     pub exclusive: bool,
+    /// While this job waits on a machine, no job behind it in the queue starts there, even one
+    /// that fits now. Without it, such jobs start ahead of it until it has been queued for 30m.
+    #[arg(long)]
+    pub hold_line: bool,
     /// A fact the machine must have, KEY=VALUE: gpu=nvidia, gpu_driver=amdgpu (Linux only),
     /// ram_gib=32, kernel=6.12. macos and linux stand alone for any version, or take one:
     /// macos=27 (macOS 27.x), linux=7.2 (kernel 7.2.x). Keys: os, os_version, kernel, arch, gpu,
@@ -784,6 +788,7 @@ impl Cx<'_> {
             keep: r.keep,
             rerun_if_lost: !args.no_rerun && args.workspace.is_none(),
             kill_on_stall: args.kill_on_stall,
+            hold_line: r.hold_line,
             recipe: r.recipe,
             // The daemon names it: it numbers the job and owns it, with the node.toml it read
             // when it started (this process may read another, or one edited since). A signed

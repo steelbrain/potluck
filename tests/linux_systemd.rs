@@ -208,6 +208,7 @@ fn record(cmd: &[&str]) -> JobRecord {
             keep: Vec::new(),
             rerun_if_lost: false,
             kill_on_stall: false,
+            hold_line: false,
             recipe: None,
             submitted_from: "test".into(),
             pools: Vec::new(),

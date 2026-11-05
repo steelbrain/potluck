@@ -155,6 +155,10 @@ pub fn effective_priority(priority: u8, passes: u32) -> u8 {
 
 pub const DEFAULT_PRIORITY: u8 = 3;
 
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
 /// A repository's id on the machine it lives on, `<name>-<8 hex>`, from its common git dir (`git
 /// rev-parse --git-common-dir`). The name is the main worktree's directory: the common dir's
 /// parent when the common dir is called `.git`, else the common dir's own name without a `.git`
@@ -394,6 +398,11 @@ pub struct JobSpec {
     pub rerun_if_lost: bool,
     /// End the job early when it stalls (otherwise it is only marked stalled).
     pub kill_on_stall: bool,
+    /// `--hold-line` (a recipe's `hold_line`): while it can't start on a machine, no job behind it
+    /// in order starts there ([`crate::sched`]). False in records from before it, and not written
+    /// when false, so a spec without it signs and reads as before.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub hold_line: bool,
     pub recipe: Option<String>,
     /// The machine that dispatched it: the one that owns it. In a signed spec, this machine's
     /// name as its daemon told the command line, so the signature binds the owner.
@@ -1065,6 +1074,17 @@ mod tests {
         // Nor pools nor a signature: the default pool, unsigned.
         assert!(spec.pools.is_empty() && spec.auth.is_none());
         assert!(spec.runs_in("default") && !spec.runs_in("cloud"));
+        // Nor --hold-line: it doesn't hold the line, and is written without the field, as before.
+        assert!(!spec.hold_line);
+        let text = serde_json::to_value(&spec).unwrap();
+        assert!(text.get("hold_line").is_none(), "{text}");
+        let held = JobSpec {
+            hold_line: true,
+            ..spec
+        };
+        let text = serde_json::to_value(&held).unwrap();
+        assert_eq!(text["hold_line"], true, "{text}");
+        assert_eq!(serde_json::from_value::<JobSpec>(text).unwrap(), held);
     }
 
     #[test]

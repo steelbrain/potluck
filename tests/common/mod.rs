@@ -315,6 +315,7 @@ pub fn spec(cmd: &[&str]) -> JobSpec {
         keep: vec![],
         rerun_if_lost: true,
         kill_on_stall: false,
+        hold_line: false,
         recipe: None,
         submitted_from: "studio".into(),
         pools: Vec::new(),

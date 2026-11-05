@@ -569,6 +569,7 @@ impl State {
                 (w.clone(), node, self.ws_busy(w))
             }),
             pools: j.spec.pools.clone(),
+            hold_line: j.spec.hold_line,
         }
     }
 

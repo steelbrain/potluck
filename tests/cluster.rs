@@ -1338,6 +1338,90 @@ fn priority_and_aging_across_machines() {
     assert_eq!(a.get(&high).passes, 0);
 }
 
+/// Filling in across machines: on b, a small job of a's starts while an exclusive job of a's ahead
+/// of it waits for b to empty, and the exclusive job is passed over once. An exclusive job
+/// dispatched with `--hold-line` holds the line on b: a small job dispatched after it waits,
+/// though it fits, until the exclusive job has run. `why` on a says which job holds the line and
+/// why.
+#[test]
+fn small_jobs_fill_in_unless_the_exclusive_job_holds_the_line() {
+    let w = World::new();
+    let a = w.node("a").start();
+    let b = w.node("b").start();
+    pair(&a, &b);
+    let lines = |job: &str| -> Vec<String> {
+        a.cli_ok(&["why", job])["lines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| l.as_str().unwrap().to_string())
+            .collect()
+    };
+    let on_b = |args: &[&str]| {
+        let mut all = vec!["--on", "node=b", "--ram", "1"];
+        all.extend_from_slice(args);
+        a.dispatch(&all)
+    };
+    let busy = on_b(&["--", "sleep", "60"]);
+    a.running_on(&busy, "b");
+
+    let excl = on_b(&["--exclusive", "--", "true"]);
+    let small = on_b(&["--", "sleep", "60"]);
+    a.running_on(&small, "b");
+    let j = a.get(&excl);
+    assert_eq!((j.state, j.passes), (JobState::Queued, 1));
+    let why = lines(&excl);
+    assert!(
+        why.iter()
+            .any(|l| l.starts_with("first in line on b: expected to start within")),
+        "{why:?}"
+    );
+    assert!(!why.iter().any(|l| l.contains("holds the line")), "{why:?}");
+    a.cli_ok(&["cancel", &excl]);
+    a.done(&excl);
+
+    let held = on_b(&["--exclusive", "--hold-line", "--", "true"]);
+    assert!(a.get(&held).spec.hold_line);
+    let behind = on_b(&["--", "true"]);
+    wait_until("b sees both queued", || {
+        b.cli_ok(&["status"])["queued"]
+            .as_array()
+            .is_some_and(|q| q.len() == 2)
+    });
+    // b plans for a few ticks with a's report in hand.
+    std::thread::sleep(Duration::from_secs(1));
+    assert_eq!(a.get(&behind).state, JobState::Queued);
+    assert!(b.exec.launch_of(&behind).is_none());
+    let why = lines(&behind);
+    let waits = format!(
+        "waits behind job {held}, which holds the line on b (dispatched with --hold-line) and is \
+         expected to start within "
+    );
+    assert!(why.iter().any(|l| l.starts_with(&waits)), "{why:?}");
+    let fits =
+        format!("it fits on b now, but nothing behind job {held} starts there until it does");
+    assert!(why.contains(&fits), "{why:?}");
+    let why = lines(&held);
+    let holds = "holds the line on b (dispatched with --hold-line): nothing behind it starts there \
+                 until it does";
+    assert!(why.iter().any(|l| l == holds), "{why:?}");
+
+    a.cli_ok(&["cancel", &busy]);
+    a.cli_ok(&["cancel", &small]);
+    let (h, s) = (a.done(&held), a.done(&behind));
+    assert_eq!(
+        (h.state, s.state),
+        (JobState::Succeeded, JobState::Succeeded)
+    );
+    assert_eq!(h.node.as_deref(), Some("b"));
+    let granted = s.lease.as_ref().map(|l| l.granted_at);
+    assert!(
+        granted >= h.ended_at,
+        "{behind} granted at {granted:?}, before {held} ended at {:?}",
+        h.ended_at
+    );
+}
+
 /// A runner keeps its ended record of a job it ran before for a while (b ran it, was lost, and
 /// stopped its copy when back). When its plan passes over that job, queued again, the pass goes
 /// to the owner, not onto that old record.
@@ -4666,9 +4750,9 @@ fn a_cold_machine_waits_for_a_warm_one_then_takes_the_job() {
     assert!(b.exec.launch_of(&job).is_none());
 }
 
-/// --exclusive among several machines. While an exclusive job waits for b to empty, jobs c can run
-/// as well go to c: on b they would end after b is expected to empty. While it runs, b runs
-/// nothing else: a job only b can run waits for its end, and one c can run goes to c.
+/// --exclusive among several machines. While an exclusive job holding the line (`--hold-line`)
+/// waits for b to empty, jobs c can run as well go to c: b starts nothing behind it. While it runs,
+/// b runs nothing else: a job only b can run waits for its end, and one c can run goes to c.
 #[test]
 fn exclusive_across_machines() {
     let w = World::new();
@@ -4680,7 +4764,15 @@ fn exclusive_across_machines() {
     wait_until("b sees c", || b.node_alive("c"));
     let busy = a.dispatch(&["--on", "node=b", "--ram", "1", "--", "sleep", "60"]);
     a.running_on(&busy, "b");
-    let excl = a.dispatch(&["--on", "node=b", "--exclusive", "--", "sleep", "3"]);
+    let excl = a.dispatch(&[
+        "--on",
+        "node=b",
+        "--exclusive",
+        "--hold-line",
+        "--",
+        "sleep",
+        "3",
+    ]);
     let others: Vec<String> = (0..3)
         .map(|_| a.dispatch(&["--on", "cpu_model=fast", "--ram", "1", "--", "sleep", "1"]))
         .collect();
@@ -7367,9 +7459,9 @@ fn queued_on(node: &Node) -> Vec<(String, u64)> {
 
 /// `potluck resize` on b of a job a dispatched goes to a, which lowers the queued job's RAM
 /// request where it stands in line, and b sees the new request in a's next report. b, the only
-/// machine the jobs may run on, has 4 of its 8 GiB free: the first job asks for 6, so the one
-/// behind it, which fits, waits its turn. Lowered to 5 GiB, the first still waits, and the second
-/// behind it; a claim b made from the queue entry before the resize (6 GiB reserved) is refused,
+/// machine the jobs may run on, has 4 of its 8 GiB free: the first job asks for 6 and holds the
+/// line (`--hold-line`), so the one behind it, which fits, waits its turn. Lowered to 5 GiB, the
+/// first still waits, and the second behind it; a claim b made from the queue entry before the resize (6 GiB reserved) is refused,
 /// so no grant asks for less than b reserved. Lowered to 3 GiB, it runs on b, and then the second.
 /// The same amount changes nothing; more, a running or an ended job, is refused with exit code 2.
 #[test]
@@ -7380,7 +7472,7 @@ fn a_resize_lowers_a_queued_jobs_request_where_it_stands() {
     pair(&a, &b);
     let busy = a.dispatch(&["--on", "node=b", "--ram", "4", "--", "sleep", "60"]);
     a.running_on(&busy, "b");
-    let first = a.dispatch(&["--on", "node=b", "--ram", "6", "--", "true"]);
+    let first = a.dispatch(&["--on", "node=b", "--ram", "6", "--hold-line", "--", "true"]);
     let behind = a.dispatch(&["--on", "node=b", "--ram", "1", "--", "true"]);
     wait_until("b sees both queued", || {
         queued_on(&b) == [(first.clone(), 6 << 10), (behind.clone(), 1 << 10)]

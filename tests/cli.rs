@@ -586,7 +586,7 @@ fn dispatch_resolves_the_committed_recipe_under_the_flags() {
     assert_eq!(spec.labels.get("who").map(String::as_str), Some("me"));
     assert_eq!(spec.key.as_deref(), Some("k1"));
     assert_eq!(spec.recipe.as_deref(), Some("gpu-tests"));
-    assert!(spec.rerun_if_lost && !spec.kill_on_stall);
+    assert!(spec.rerun_if_lost && !spec.kill_on_stall && !spec.hold_line);
     assert_eq!(spec.repo.commit, git(repo.path(), &["rev-parse", "HEAD"]));
     assert_eq!(spec.repo.branch.as_deref(), Some("feature"));
 
@@ -679,6 +679,7 @@ fn dispatch_flags_override_and_json() {
             "--gpu",
             "any",
             "--exclusive",
+            "--hold-line",
             "--priority",
             "5",
             "--cpu",
@@ -718,7 +719,7 @@ fn dispatch_flags_override_and_json() {
     assert_eq!(spec.cmd, ["make", "check"]);
     assert_eq!(spec.request.ram_mib, 512);
     assert_eq!(spec.request.gpus, ["amd", "any"]);
-    assert!(spec.request.exclusive && spec.kill_on_stall);
+    assert!(spec.request.exclusive && spec.kill_on_stall && spec.hold_line);
     assert_eq!((spec.priority, spec.request.cpu), (5, 2));
     assert_eq!(spec.keep, ["a", "b"]);
     assert_eq!(spec.timeout_ms, 15 * 60_000, "the recipe's timeout");
@@ -2536,13 +2537,15 @@ fn nested_dispatch_refuses_options_it_cannot_honour() {
         );
         assert!(!marker.exists(), "{extra:?}");
     }
-    // --priority and --cpu need nothing in place: it starts at once, sharing the job's CPU.
+    // --priority, --hold-line and --cpu need nothing in place: it starts at once, sharing the
+    // job's CPU.
     let r = run(inside_job(&fake, cwd.path()).args([
         "dispatch",
         "--timeout",
         "1m",
         "--priority",
         "5",
+        "--hold-line",
         "--cpu",
         "4",
         "--",

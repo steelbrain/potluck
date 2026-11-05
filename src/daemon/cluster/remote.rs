@@ -64,6 +64,7 @@ pub(super) fn queued_of(st: &State, j: &JobRecord) -> Queued {
             (w.clone(), node, busy)
         }),
         pools: j.spec.pools.clone(),
+        hold_line: j.spec.hold_line,
     }
 }
 

@@ -883,6 +883,7 @@ fn spec(cmd: &str) -> JobSpec {
         keep: vec![],
         rerun_if_lost: true,
         kill_on_stall: false,
+        hold_line: false,
         recipe: None,
         submitted_from: String::new(),
         pools: Vec::new(),
@@ -1499,9 +1500,10 @@ fn resized(f: &Fixture, job: &str, ram_mib: u64) -> Result<(JobRecord, u64), Str
 }
 
 /// A resize lowers a queued job's RAM request where it stands in line: its priority, passes,
-/// submit time and id stay, so the job dispatched after it, which fits but may not jump the line,
-/// stays behind it; once its request fits, it runs, and so does the one behind it, which waited
-/// until then. The same amount changes nothing; more, or a job that runs or has ended, is refused.
+/// submit time, id and `--hold-line` stay, so the job dispatched after it, which fits but waits
+/// behind it, stays behind it; once its request fits, it runs, and so does the one behind it, which
+/// waited until then. The same amount changes nothing; more, or a job that runs or has ended, is
+/// refused.
 #[test]
 fn resize_lowers_a_queued_jobs_request_in_place() {
     let f = Fixture::new().start();
@@ -1512,6 +1514,7 @@ fn resize_lowers_a_queued_jobs_request_in_place() {
     f.wait_for(&running, "running", |j| j.state == JobState::Running);
     let mut first = spec("sleep 0.3");
     first.request.ram_mib = 6 << 10;
+    first.hold_line = true;
     let first = f.dispatch(first);
     let behind = f.dispatch(spec("sleep 0.3"));
     std::thread::sleep(Duration::from_millis(300));
@@ -3832,6 +3835,74 @@ fn a_job_queued_into_a_workspace_that_failed_to_seed_fails_and_says_so() {
         log.contains(&format!("{second}: failed: workspace {ws} is gone")),
         "{log}"
     );
+}
+
+fn why(f: &Fixture, job: &str) -> Vec<String> {
+    match f.client().call(Request::Why { job: job.into() }).unwrap() {
+        Response::Why { why } => why.lines,
+        other => panic!("{other:?}"),
+    }
+}
+
+/// On one machine, a small job starts while an exclusive job ahead of it waits for the machine to
+/// empty, and `why` of the exclusive job says it is first in line. Once the exclusive job has been
+/// queued for 30 minutes (the wall clock the loop plans with stepped on), it holds the line: a small
+/// job dispatched then waits behind it, though it fits. When the machine empties, the exclusive job
+/// runs, then the small one.
+#[test]
+fn an_exclusive_job_queued_for_30_minutes_holds_the_line() {
+    let f = Fixture::new().start();
+    let busy = f.dispatch(spec("sleep 30"));
+    f.wait_for(&busy, "running", |j| j.state == JobState::Running);
+    let mut e = spec("true");
+    e.request.exclusive = true;
+    let excl = f.dispatch(e);
+    let small = f.dispatch(spec("sleep 30"));
+    f.wait_for(&small, "running", |j| j.state == JobState::Running);
+    let j = f.get(&excl);
+    assert_eq!((j.state, j.passes), (JobState::Queued, 1));
+    let lines = why(&f, &excl);
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.starts_with("first in line on testnode: expected to start within")),
+        "{lines:?}"
+    );
+    assert!(
+        !lines.iter().any(|l| l.contains("holds the line")),
+        "{lines:?}"
+    );
+
+    f.clock.step_wall(31 * 60_000);
+    let late = f.dispatch(spec("true"));
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(f.get(&late).state, JobState::Queued);
+    assert!(
+        f.exec
+            .launched
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|l| l.job != late)
+    );
+
+    for j in [&busy, &small] {
+        f.client().call(Request::Cancel { job: j.clone() }).unwrap();
+    }
+    let (x, l) = (f.wait(&excl), f.wait(&late));
+    assert_eq!(
+        (x.state, l.state),
+        (JobState::Succeeded, JobState::Succeeded)
+    );
+    let launched: Vec<String> = f
+        .exec
+        .launched
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|l| l.job.clone())
+        .collect();
+    assert_eq!(launched, [busy, small, excl, late]);
 }
 
 #[test]

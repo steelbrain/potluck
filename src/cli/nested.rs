@@ -132,8 +132,8 @@ pub fn check(
 
 /// The first option on the command line that only means something for a job of its own, and so
 /// can't apply to a dispatch run in place inside job `job`: (the option, why, in plain words).
-/// `--priority` and `--cpu` aren't among them: in place a command starts at once and shares the
-/// job's CPU.
+/// `--priority`, `--hold-line` and `--cpu` aren't among them: in place a command starts at once
+/// and shares the job's CPU.
 pub fn refused_option(args: &DispatchArgs, job: &str) -> Option<(&'static str, String)> {
     let checks: [(bool, &'static str, String); 10] = [
         (

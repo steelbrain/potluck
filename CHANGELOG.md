@@ -41,6 +41,16 @@
 - A machine runs another machine's job only when a user signed it. In a cluster paired with 0.1.1,
   the jobs queued before `user init` stay unsigned: each stays queued on the machine it was
   dispatched on and runs only there, and `potluck why` says so.
+- Scheduling: a queued job that fits in what is free on a machine starts there, even while a job
+  ahead of it in order waits on that machine. In 0.1.1 nothing behind the first waiting job started
+  there. Each job that starts behind a waiting one passes it over, and the waiting job's priority
+  rises by one, up to 4. See [Order](docs/jobs.md#order).
+- `dispatch --hold-line`, and a recipe's `hold_line = true`, keep the 0.1.1 rule for one job: while
+  it waits on a machine, no job behind it starts there. A job queued for 30 minutes holds the line
+  the same way without it, so a plain `--exclusive` job waits for at most 30 minutes of jobs
+  starting ahead of it, then for the jobs running then to end. `potluck why` of a job waiting
+  behind it names the job holding the line and why: "waits behind job studio-7, which holds the
+  line on studio (dispatched with --hold-line)".
 
 ### Fixed
 

@@ -32,6 +32,7 @@ fn record(id: &str, state: JobState) -> JobRecord {
             keep: Vec::new(),
             rerun_if_lost: true,
             kill_on_stall: false,
+            hold_line: false,
             recipe: None,
             submitted_from: "studio".into(),
             pools: Vec::new(),
@@ -241,23 +242,157 @@ fn exclusive() {
     assert_eq!(why.blockers[0].holder.as_deref(), Some("a"));
 }
 
+/// A job that fits starts while the first in line waits; behind a job holding the line it waits,
+/// and says for whom and why.
 #[test]
-fn order_behind_the_reservation() {
-    let mut w = World::new(vec![Machine::new("msi", 32, vec![nv()])]);
-    w.runs(0, "r", 8, &[NV], false, -30, 90, 0);
-    w.runs(0, "r2", 8, &[], false, -10, 180, 0);
-    w.queue(job("g").gpu("nvidia").ram(16).at(-20));
-    w.queue(job("long").ram(12).mins(120).at(-5));
+fn order_behind_the_line() {
+    let world = |g: Queued| {
+        let mut w = World::new(vec![Machine::new("msi", 32, vec![nv()])]);
+        w.runs(0, "r", 8, &[NV], false, -30, 90, 0);
+        w.runs(0, "r2", 8, &[], false, -10, 180, 0);
+        w.queue(g);
+        w.queue(job("long").ram(12).mins(120).at(-5));
+        w
+    };
+    let g = || job("g").gpu("nvidia").ram(16).at(-20);
+    let gone = |why: &WhyView, text: &str| {
+        assert!(
+            !why.lines.iter().any(|l| l.contains(text)),
+            "{text:?} in:\n{}",
+            why.lines.join("\n")
+        );
+    };
+
+    // g waits on the GPU, and holds nothing: long fills in.
+    let w = world(g());
     let why = w.why("long");
     has(&why, "1 job is ahead of it in the queue");
     has(
         &why,
-        "waits behind job g, first in line on msi, expected to start within 1h",
+        "can start now on msi; the scheduler takes it on its next pass",
     );
-    has(&why, "it fits on msi now, but waits its turn behind job g");
+    gone(&why, "behind");
+    // long, filling in, holds the RAM g needs then: the estimate counts it.
+    let why = w.why("g");
+    has(
+        &why,
+        "job long holds 12 GiB there starting now with a 2h run limit",
+    );
+    has(
+        &why,
+        "first in line on msi: expected to start within 2h (when the jobs holding what it needs \
+         reach their run limits)",
+    );
+    gone(&why, "holds the line");
+
+    // With --hold-line, long waits behind it.
+    let w = world(g().hold_line());
+    let why = w.why("long");
+    has(
+        &why,
+        "waits behind job g, which holds the line on msi (dispatched with --hold-line) and is \
+         expected to start within 1h",
+    );
+    has(
+        &why,
+        "it fits on msi now, but nothing behind job g starts there until it does",
+    );
     assert_eq!(kinds(&why), ["order"]);
     assert_eq!(why.blockers[0].holder.as_deref(), Some("g"));
     assert_eq!(why.blockers[0].free_by, Some(m(60)));
+    let why = w.why("g");
+    has(
+        &why,
+        "first in line on msi: expected to start within 1h (when the jobs holding what it needs \
+         reach their run limits)",
+    );
+    has(
+        &why,
+        "holds the line on msi (dispatched with --hold-line): nothing behind it starts there \
+         until it does",
+    );
+    assert_eq!(kinds(&why), [format!("gpu:{NV}")]);
+
+    // Queued for 30 minutes, it holds the line without --hold-line.
+    let w = world(g().at(-30));
+    let why = w.why("long");
+    has(
+        &why,
+        "waits behind job g, which holds the line on msi (queued for 30m or more) and is \
+         expected to start within 1h",
+    );
+    has(
+        &why,
+        "it fits on msi now, but nothing behind job g starts there until it does",
+    );
+    has(
+        &w.why("g"),
+        "holds the line on msi (queued for 30m or more): nothing behind it starts there until it \
+         does",
+    );
+
+    // A job held behind it that doesn't fit now says what it lacks, and not that it fits.
+    let mut w = world(g().hold_line());
+    w.queue(job("big").ram(20).at(-4));
+    let why = w.why("big");
+    has(
+        &why,
+        "waits behind job g, which holds the line on msi (dispatched with --hold-line) and is \
+         expected to start within 1h",
+    );
+    has(
+        &why,
+        "waits on RAM: needs 20 GiB, 16 GiB of 32 GiB free on msi",
+    );
+    gone(&why, "it fits");
+    assert_eq!(kinds(&why), ["ram", "order"]);
+}
+
+/// A job holding the line that isn't the first in line: a job ahead of it waits too, and jobs
+/// between the two fill in.
+#[test]
+fn a_holder_behind_the_first_in_line() {
+    let mut w = World::new(vec![Machine::new("msi", 32, vec![nv()])]);
+    w.runs(0, "r", 4, &[NV], false, -30, 90, 0);
+    w.queue(job("a").gpu("nvidia").prio(4).at(-5));
+    w.queue(job("f").prio(4).mins(5).at(-1));
+    w.queue(job("h").excl().at(-2).hold_line());
+    w.queue(job("s").ram(1).at(-1));
+    let why = w.why("a");
+    has(
+        &why,
+        "first in line on msi: expected to start within 1h (when the jobs holding what it needs \
+         reach their run limits)",
+    );
+    assert!(
+        !why.lines.iter().any(|l| l.contains("holds the line")),
+        "{:?}",
+        why.lines
+    );
+    has(
+        &w.why("f"),
+        "can start now on msi; the scheduler takes it on its next pass",
+    );
+    let why = w.why("h");
+    has(
+        &why,
+        "holds the line on msi (dispatched with --hold-line): nothing behind it starts there \
+         until it does",
+    );
+    assert!(
+        !why.lines.iter().any(|l| l.starts_with("first in line")),
+        "{:?}",
+        why.lines
+    );
+    let why = w.why("s");
+    has(
+        &why,
+        "waits behind job h, which holds the line on msi (dispatched with --hold-line)",
+    );
+    has(
+        &why,
+        "it fits on msi now, but nothing behind job h starts there until it does",
+    );
 }
 
 #[test]
@@ -936,8 +1071,8 @@ fn sync_behind() {
 fn a_machine_plans_without_the_jobs_it_cannot_take_yet() {
     let mut w = World::new(vec![Machine::new("studio", 48, vec![])]);
     w.runs(0, "a", 32, &[], false, -1, 30, 0);
-    // Ahead in line, but studio's mirrors lack its commits.
-    w.queue(job("big").ram(40).prio(5));
+    // Ahead in line and holding it, but studio's mirrors lack its commits.
+    w.queue(job("big").ram(40).prio(5).hold_line());
     // Fits in the 16 GiB free now, but runs past a's end, when big would need its RAM.
     w.queue(job("q").ram(10).mins(60));
     let views: Vec<MachineView> = w.machines.iter().map(|m| m.view()).collect();

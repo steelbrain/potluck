@@ -203,10 +203,10 @@ fn priority_five_starts_first() {
     }
 }
 
-/// (c) Nothing starts behind a job blocked on the GPU, even jobs that would fit and end long
-/// before it: they start once it has, as RAM frees.
+/// (c) Jobs that fit start while the first job waits on the GPU, until it has been queued for 30
+/// minutes: then it holds the line, and a job that would fit waits for it.
 #[test]
-fn nothing_jumps_a_blocked_job() {
+fn jobs_fill_in_until_the_first_has_waited_30_minutes() {
     let running = vec![(run("r", 8, &[NV], 60), 60), (run("r2", 16, &[], 120), 120)];
     let jobs = vec![
         (job("gpu").gpu("nvidia").ram(16).mins(120).at(0), 30),
@@ -215,37 +215,119 @@ fn nothing_jumps_a_blocked_job() {
     ];
     let mut sim = Sim::new(Machine::new("msi", 32, vec![nv()]), running, jobs);
     sim.run_until(600);
+    // short takes the 8 GiB free; long waits for RAM.
+    assert_eq!(sim.start_of("short"), m(1));
+    // short's 8 GiB come back at 31, when gpu has waited 31 minutes: long waits behind it.
     assert_eq!(sim.start_of("gpu"), m(60));
-    // The GPU job's 16 GiB come back when it ends at 90.
+    // gpu's 16 GiB come back when it ends at 90.
+    assert_eq!(sim.start_of("long"), m(90));
+    // Filled in ahead of once: passed over once.
+    assert_eq!(sim.started["gpu"].1, 1);
+
+    // With --hold-line, nothing starts behind it from the first.
+    let running = vec![(run("r", 8, &[NV], 60), 60), (run("r2", 16, &[], 120), 120)];
+    let jobs = vec![
+        (
+            job("gpu").gpu("nvidia").ram(16).mins(120).at(0).hold_line(),
+            30,
+        ),
+        (job("short").ram(8).mins(30).at(1), 30),
+        (job("long").ram(8).mins(120).at(2), 120),
+    ];
+    let mut sim = Sim::new(Machine::new("msi", 32, vec![nv()]), running, jobs);
+    sim.run_until(600);
+    assert_eq!(sim.started["gpu"], (m(60), 0));
     assert_eq!(sim.start_of("short"), m(90));
     assert_eq!(sim.start_of("long"), m(90));
 }
 
-/// (d) An exclusive job waits only for what already runs: jobs arriving meanwhile, short or long,
-/// wait for it, and it starts when it would have alone.
+/// (d) An exclusive job with --hold-line waits only for what already runs: jobs arriving
+/// meanwhile, short or long, wait for it, and it starts when it would have alone. Without it, jobs
+/// that fit start ahead of it while small jobs keep arriving, until it has been queued for 30
+/// minutes; then it waits for what runs then to end.
 #[test]
-fn exclusive_waits_only_for_what_runs() {
+fn an_exclusive_job_waits_at_most_30_minutes_of_filling() {
     let machine = || Machine::new("ms01", 64, vec![nv(), amd()]);
-    let running = || vec![(run("r1", 4, &[], 30), 30), (run("r2", 4, &[NV], 50), 50)];
-    let excl = || (job("excl").excl().ram(16).mins(30).at(1), 20);
-    let mut jobs = vec![excl(), (job("short").ram(4).gpu("amd").mins(10).at(10), 10)];
+    let running = || vec![(run("r1", 4, &[], 30), 30), (run("r2", 4, &[NV], 20), 20)];
+    let stream = || {
+        (0..30)
+            .map(|i| (job(&format!("s-{i}")).ram(4).mins(20).at(2 + 5 * i), 20))
+            .collect::<Vec<_>>()
+    };
+    let excl = || job("excl").excl().ram(16).mins(30).at(1);
+    let mut alone = Sim::new(machine(), running(), vec![(excl(), 20)]);
+    alone.run_until(600);
+    assert_eq!(alone.start_of("excl"), m(30));
+
+    let mut held = Sim::new(machine(), running(), stream());
+    held.arrivals.push((excl().hold_line(), 20 * MINUTE_MS));
+    held.arrivals.sort_by_key(|(q, _)| q.submitted_at);
+    held.run_until(600);
+    assert_eq!(held.start_of("excl"), m(30));
+    // Everything that arrived meanwhile starts when it ends, after its 20 minutes.
     for i in 0..10 {
+        assert_eq!(held.start_of(&format!("s-{i}")), m(50), "s-{i}");
+    }
+
+    let mut busy = Sim::new(machine(), running(), stream());
+    busy.arrivals.push((excl(), 20 * MINUTE_MS));
+    busy.arrivals.sort_by_key(|(q, _)| q.submitted_at);
+    busy.run_until(600);
+    // s-0 to s-5 (2 to 27) fill in at once; from 31 excl holds the line, and s-6 (32) waits.
+    for i in 0..6 {
+        assert_eq!(busy.start_of(&format!("s-{i}")), m(2 + 5 * i), "s-{i}");
+    }
+    // s-5, started at 27, ends last of what ran at 31.
+    assert_eq!(busy.start_of("excl"), m(47));
+    // Passed over by each job that filled in ahead of it, its priority 4 since.
+    assert_eq!(busy.started["excl"].1, 6);
+    // s-6 to s-12 arrived meanwhile: they start when it ends, after its 20 minutes.
+    for i in 6..13 {
+        assert_eq!(busy.start_of(&format!("s-{i}")), m(67), "s-{i}");
+    }
+    // Then the stream fills in as it arrives again.
+    for i in 13..30 {
+        assert_eq!(busy.start_of(&format!("s-{i}")), m(2 + 5 * i), "s-{i}");
+    }
+}
+
+/// A job waiting on a busy GPU is passed over by every job that starts after it in order, CPU-only
+/// ones too: its priority rises by one each time, and stops at 4. A priority-5 job dispatched later
+/// still goes first.
+#[test]
+fn filling_in_ages_the_waiting_job_up_to_4() {
+    let mut jobs = vec![
+        (job("gpu").prio(1).gpu("nvidia").at(0), 10),
+        (job("urgent").prio(5).gpu("nvidia").at(25), 10),
+    ];
+    for i in 0..12 {
         jobs.push((
-            job(&format!("long-{i}")).ram(4).mins(120).at(2 + 5 * i),
-            120,
+            job(&format!("c-{i}")).prio(1).ram(1).mins(5).at(1 + 5 * i),
+            2,
         ));
     }
-    let mut busy = Sim::new(machine(), running(), jobs);
-    busy.run_until(600);
-    let mut alone = Sim::new(machine(), running(), vec![excl()]);
-    alone.run_until(600);
-
-    assert_eq!(alone.start_of("excl"), m(50));
-    assert_eq!(busy.start_of("excl"), m(50));
-    // Everything that arrived meanwhile starts when it ends, after its 20 minutes.
-    assert_eq!(busy.start_of("short"), m(70));
-    for i in 0..10 {
-        assert_eq!(busy.start_of(&format!("long-{i}")), m(70), "long-{i}");
+    let mut sim = Sim::new(
+        Machine::new("msi", 64, vec![nv()]),
+        vec![(run("x", 4, &[NV], 60), 60)],
+        jobs,
+    );
+    // c-0 to c-5 (1 to 26) each start at once, after gpu in order.
+    for (t, passes, eff) in [(1, 1, 2), (6, 2, 3), (11, 3, 4), (16, 4, 4), (29, 6, 4)] {
+        sim.run_until(t);
+        let q = sim.queue.iter().find(|q| q.job == "gpu").unwrap();
+        let got = (q.passes, effective_priority(q.priority, q.passes));
+        assert_eq!(got, (passes, eff), "at {t}");
+    }
+    sim.run_until(600);
+    for i in 0..6 {
+        assert_eq!(sim.start_of(&format!("c-{i}")), m(1 + 5 * i), "c-{i}");
+    }
+    // urgent gets the GPU first, passing gpu over once more.
+    assert_eq!(sim.start_of("urgent"), m(60));
+    assert_eq!(sim.started["gpu"], (m(70), 7));
+    // From 30 gpu holds the line: c-6 (31) to c-11 (56) wait for it, though they would fit.
+    for i in 6..12 {
+        assert_eq!(sim.start_of(&format!("c-{i}")), m(70), "c-{i}");
     }
 }
 

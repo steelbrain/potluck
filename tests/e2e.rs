@@ -1461,11 +1461,12 @@ fn exclusive_waits_for_an_empty_machine() {
         "--ram",
         "1G",
         "--exclusive",
+        "--hold-line",
         "--",
         "sleep",
         "1",
     ]);
-    // Would fit by RAM, but the exclusive job waits for the machine and it ends after A's limit.
+    // Would fit by RAM, but the exclusive job waits for the machine and holds the line.
     let c = n.dispatch(&["--timeout", "10m", "--ram", "1G", "--", "true"]);
     std::thread::sleep(Duration::from_secs(1));
     assert_eq!(n.get(&b).state, JobState::Queued);
@@ -1485,7 +1486,7 @@ fn exclusive_waits_for_an_empty_machine() {
 }
 
 #[test]
-fn priority_aging_and_no_jumping_the_line() {
+fn priority_aging_and_holding_the_line() {
     let n = Node::new();
     // 8 GiB capacity: A takes 6, until the test lets it end (a fixed sleep would race with the
     // dispatches below, which take seconds in a slow run).
@@ -1521,12 +1522,13 @@ fn priority_aging_and_no_jumping_the_line() {
         "5G",
         "--priority",
         "5",
+        "--hold-line",
         "--",
         "sleep",
         "1",
     ]);
-    // Small and short, and it fits beside A, but `high` is ahead of it in line and waits: it
-    // waits its turn.
+    // Small and short, and it fits beside A, but `high` is ahead of it in line, waits and holds
+    // the line: it waits its turn.
     let small = n.dispatch(&["--timeout", "20s", "--ram", "1G", "--", "sleep", "1"]);
     std::thread::sleep(Duration::from_secs(3));
     assert_eq!(

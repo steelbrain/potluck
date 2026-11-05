@@ -788,6 +788,7 @@ fn feasible_somewhere(
             (w.clone(), node, st.ws_busy(w))
         }),
         pools: spec.pools.clone(),
+        hold_line: spec.hold_line,
     };
     // Only machines that are up count: a job none of them can run is refused now, not queued
     // for a machine that may never come back. A member updating counts as up.

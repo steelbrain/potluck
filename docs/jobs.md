@@ -137,9 +137,8 @@ A job gets everything it asks for at once, or waits, so jobs can't deadlock on e
   in hex (`10de:2c19`), a GPU id from `potluck nodes` (`10de:2c19@0000:01:00.0` on Linux, `mac0`
   on macOS), or an alias from the machine's config. The job finds its GPU ids in `POTLUCK_GPUS`.
 - `--exclusive`: the job starts only when nothing else runs on the machine, nothing starts beside
-  it, and it holds every GPU there. Nothing is paused or killed to make room. While it is the first
-  job in line waiting on that machine, the machine starts only jobs that will end, by their run
-  limits, before it expects to be empty.
+  it, and it holds every GPU there. Nothing is paused or killed to make room. While it waits, other
+  jobs that fit start on the machine until it holds the line (see [Order](#order)).
 
 `potluck resize JOB --ram N` lowers a queued job's RAM request to N, given as `--ram` takes it.
 The job keeps its place in line: its priority, its passes (see [Order](#order)) and its submit
@@ -239,15 +238,25 @@ moved W elsewhere first, fails at start; see [Workspaces](workspaces.md).
 
 ## Order
 
-Jobs start by priority, `--priority 1` to `5` (5 highest, default 3), then by submit time. A job
-starts ahead of another only by a higher priority: while the first job in line on a machine waits
-for what it needs, no job behind it starts there, even one that would fit now (`why` says "it
-fits on NODE now, but waits its turn behind job JOB"). So an `--exclusive` job waits only for the
-jobs already running to end. Each time a job is passed over, meaning a job submitted after it
-is granted something it was waiting for, its priority rises by one, up to 4, so priority-5 jobs
-still go first. A job waiting only for its own workspace (see [Workspaces](workspaces.md)), or
-one a machine can never run, doesn't hold that machine. Running jobs are never stopped for
-priority.
+Jobs start by priority, `--priority 1` to `5` (5 highest, default 3), then by submit time. When
+jobs want the same free RAM or GPU, the first in that order gets it. A job that fits in what is
+free on a machine starts there even while a job ahead of it waits on that machine: a small job
+starts while a `--gpu` job waits for its GPU, or an `--exclusive` job for the machine to empty.
+
+A job holds the line when it was dispatched with `--hold-line` (a recipe's `hold_line = true`), or
+once it has been queued for 30 minutes. While a job that holds the line waits on a machine, no job
+behind it starts there, even one that would fit now (`why` says "waits behind job JOB, which holds
+the line on NODE (dispatched with --hold-line)", or "(queued for 30m or more)"). Only jobs of a
+higher priority start ahead of it, so an `--exclusive --hold-line` job waits only for the jobs
+already running to end, and a plain `--exclusive` job for at most 30 minutes of jobs starting ahead
+of it, then for the jobs running then to end. A job queued again after its machine was lost counts
+the 30 minutes from its submit time.
+
+Each time a job is passed over, its priority rises by one, up to 4, so priority-5 jobs still go
+first. A job is passed over when a job behind it starts on a machine where it waits, or when a job
+submitted after it is granted something it was waiting for. A job waiting only for its own
+workspace (see [Workspaces](workspaces.md)), or one a machine can never run, holds nothing there
+and is not passed over. Running jobs are never stopped for priority.
 
 ## Keys, kept files and labels
 
@@ -412,15 +421,15 @@ $ potluck dispatch gpu-tests --timeout 1h -- cargo test --features gpu -- render
 ```
 
 A recipe's fields are `cmd` (required), `timeout`, `priority`, `ram`, `cpu`, `gpu`, `exclusive`,
-`on`, `hold`, `keep`, `without_submodules` (a list of `--without-submodule` patterns), `env`,
-`unset_env` (a list of variable names, as `--unset-env` takes them) and `pools` (a list of pools, as
-`--pool` takes them; `--pool` replaces it). Unknown fields are refused, so a misspelled option can't
-be dropped silently. `on` is a table, as above, or a list in `--on`'s form: `on = ["macos=27", "gpu=apple"]`.
+`hold_line`, `on`, `hold`, `keep`, `without_submodules` (a list of `--without-submodule`
+patterns), `env`, `unset_env` (a list of variable names, as `--unset-env` takes them) and `pools`
+(a list of pools, as `--pool` takes them; `--pool` replaces it). Unknown fields are refused, so a
+misspelled option can't be dropped silently. `on` is a table, as above, or a list in `--on`'s form: `on = ["macos=27", "gpu=apple"]`.
 Options on the command line replace the recipe's; `on` and `env` merge key by key, the command line
 last, with `os`, `macos` and `linux` counting as one key, so `--on macos` replaces a recipe's
 `os = "linux"`. `env` and `unset_env` merge the same way, as one set of keys: the recipe's
 `unset_env` removes what `[env]` sets, `--env K=V` sets K although the recipe's `unset_env` names
 it, and `--unset-env K` removes K although `[env]` or the recipe's `env` sets it. A recipe that
 names one variable in both its `env` and its `unset_env` is refused. A recipe's
-`exclusive = true` can't be turned off from the command line. `[env]` applies to every job
-dispatched from the repository.
+`exclusive = true` and `hold_line = true` can't be turned off from the command line. `[env]`
+applies to every job dispatched from the repository.

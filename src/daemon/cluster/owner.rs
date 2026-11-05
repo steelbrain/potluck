@@ -1415,6 +1415,7 @@ mod tests {
             keep: Vec::new(),
             rerun_if_lost: true,
             kill_on_stall: false,
+            hold_line: false,
             recipe: None,
             submitted_from: "a".into(),
             pools: pools.iter().map(|p| p.to_string()).collect(),

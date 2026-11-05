@@ -77,6 +77,9 @@ pub struct Recipe {
     pub cpu: Option<u32>,
     #[serde(default)]
     pub exclusive: bool,
+    /// `--hold-line`: while the job can't start on a machine, no job behind it starts there.
+    #[serde(default)]
+    pub hold_line: bool,
     /// A table (`{ macos = "27" }`) or a list in `--on`'s syntax (`["macos", "gpu=apple"]`).
     #[serde(default, deserialize_with = "table_or_list")]
     pub on: BTreeMap<String, String>,
@@ -245,6 +248,8 @@ pub struct Resolved {
     pub timeout_ms: u64,
     pub priority: u8,
     pub request: Request,
+    /// `--hold-line` or the recipe's `hold_line`.
+    pub hold_line: bool,
     pub on: BTreeMap<String, String>,
     pub hold_ms: Option<u64>,
     pub keep: Vec<String>,
@@ -257,7 +262,7 @@ pub struct Resolved {
 /// Applies `args` over the named recipe (if any) of `file`. Options given on the command line
 /// replace the recipe's; `on` and `env` merge key by key, the command line last, and so do `env`
 /// and `unset_env` together (see `resolve_env`); `--exclusive` can only add exclusivity (a
-/// recipe's `exclusive = true` stays).
+/// recipe's `exclusive = true` stays), and `--hold-line` likewise (`hold_line = true` stays).
 pub fn resolve(file: &ProjectFile, args: &DispatchArgs) -> anyhow::Result<Resolved> {
     let empty = Recipe::default();
     let recipe = match &args.recipe {
@@ -393,6 +398,7 @@ pub fn resolve(file: &ProjectFile, args: &DispatchArgs) -> anyhow::Result<Resolv
         timeout_ms,
         priority,
         request,
+        hold_line: args.hold_line || recipe.hold_line,
         on,
         hold_ms,
         keep,
@@ -594,6 +600,24 @@ env = { SHARED = "recipe" }
         );
         assert_eq!(r.env.get("SHARED").map(String::as_str), Some("flag"));
         assert_eq!(r.on.get("os").map(String::as_str), Some("macos"));
+    }
+
+    /// `hold_line = true` in a recipe, or `--hold-line`, makes the job hold the line; without
+    /// either it doesn't, and the flag can't turn the recipe's off.
+    #[test]
+    fn hold_line_comes_from_the_recipe_or_the_flag() {
+        let file = parse(
+            "[recipe.held]\ncmd = [\"a\"]\ntimeout = \"1m\"\nhold_line = true\n\
+             [recipe.plain]\ncmd = [\"a\"]\ntimeout = \"1m\"\n",
+        )
+        .unwrap();
+        let held = |argv: &[&str]| resolve(&file, &args(argv)).unwrap().hold_line;
+        assert!(held(&["held"]));
+        assert!(!held(&["plain"]));
+        assert!(held(&["plain", "--hold-line"]));
+        assert!(held(&["--hold-line", "--timeout", "1m", "--", "true"]));
+        assert!(!held(&["--timeout", "1m", "--", "true"]));
+        assert!(parse("[recipe.x]\ncmd = [\"a\"]\nhold_line = \"yes\"\n").is_err());
     }
 
     #[test]
