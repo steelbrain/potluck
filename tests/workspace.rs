@@ -2773,7 +2773,8 @@ fn deleting_a_big_workspace_holds_up_no_sync() {
     // Once the tree is going (or gone from its place), beta's mirror syncs, and alpha's: neither
     // waits for the rest of the deletion.
     let start = Instant::now();
-    while out.exists() && std::fs::read_dir(&out).unwrap().count() == 100 {
+    // The removal can take the tree away between any two looks at it: gone counts as going.
+    while std::fs::read_dir(&out).is_ok_and(|d| d.count() == 100) {
         assert!(start.elapsed() < Duration::from_secs(60), "never started");
         std::thread::sleep(Duration::from_millis(1));
     }
