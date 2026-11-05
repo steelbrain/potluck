@@ -47,6 +47,19 @@ pub trait WorkspaceProvider: Send + Sync {
     }
     fn create(&self, id: &WorkspaceId, repo: &RepoRef) -> anyhow::Result<PathBuf>;
     fn verify(&self, root: &Path, repo: &RepoRef) -> anyhow::Result<()>;
+    /// `dispatch --advance`: checks workspace `id` at `root`, at commit `from` as its record says,
+    /// out at `repo`'s commits, keeping its untracked and ignored files, and moves its pins to
+    /// them ([`Workspaces::advance`]). A provider that can't says so.
+    fn advance(
+        &self,
+        id: &WorkspaceId,
+        root: &Path,
+        from: &str,
+        repo: &RepoRef,
+    ) -> anyhow::Result<()> {
+        let _ = (id, root, from, repo);
+        anyhow::bail!("this machine's workspaces can't be advanced")
+    }
     fn remove(&self, record: &WorkspaceRecord) -> anyhow::Result<()>;
     fn size(&self, root: &Path) -> anyhow::Result<u64>;
     /// Removes the mirrors and bases with repository ids from before ids were salted with the
@@ -96,6 +109,15 @@ impl WorkspaceProvider for Workspaces {
     }
     fn verify(&self, root: &Path, repo: &RepoRef) -> anyhow::Result<()> {
         Workspaces::verify(self, root, repo)
+    }
+    fn advance(
+        &self,
+        id: &WorkspaceId,
+        root: &Path,
+        from: &str,
+        repo: &RepoRef,
+    ) -> anyhow::Result<()> {
+        Workspaces::advance(self, id, root, from, repo)
     }
     fn remove(&self, record: &WorkspaceRecord) -> anyhow::Result<()> {
         Workspaces::remove(self, record)

@@ -152,6 +152,7 @@ impl Env {
             held_until: 0,
             pending: 0,
             size_bytes: None,
+            advanced_by: None,
         }
     }
 }
@@ -1299,6 +1300,144 @@ fn seeding_with_nested_submodules() {
     e.ws.remove(&e.record("t-w1", &repo1, &w1)).unwrap();
 }
 
+/// `dispatch --advance`: a workspace checked out at a descendant commit, its submodules with it.
+/// Tracked files become the new commit's (a job's changes to them go), untracked and ignored ones
+/// stay unless the commit has a file in their place, and the workspace's pins move. A commit that
+/// doesn't descend, or other submodules, change nothing.
+#[test]
+fn advance_checks_a_workspace_out_at_a_descendant_and_keeps_build_output() {
+    let e = env();
+    let (app, lib, _inner) = submodule_fixture(&e.path("src"));
+    write(&app, ".gitignore", "/target/\n");
+    write(&app, "old.txt", "to be removed\n");
+    commit(&app, "app 1b", 1_700_000_050);
+    let repo1 = gitinfo::inspect(&app).unwrap();
+    e.sync(&repo1);
+    let id = "t-w1".to_string();
+    let w = e.ws.create(&id, &repo1).unwrap();
+
+    // What jobs leave: changes to tracked files, in the top and in a submodule, and build output.
+    write(&w, "src/app.c", "int main() { return 1; }\n");
+    write(&w, "vendor/lib/lib.c", "int lib = 99;\n");
+    write(&w, "target/app.o", "object\n");
+    write(&w, "build.log", "built\n");
+    write(&w, "new.txt", "made by a job\n");
+
+    // The next commit: app.c changed, new.txt committed, old.txt gone, lib moved on.
+    write(&lib, "lib.c", "int lib = 2;\n");
+    commit(&lib, "lib 2", 1_700_000_100);
+    let app_lib = app.join("vendor/lib");
+    git(&app_lib, &["fetch", "-q", "origin"]);
+    git(&app_lib, &["checkout", "-q", "--detach", "origin/main"]);
+    write(&app, "src/app.c", "int main() { return 2; }\n");
+    write(&app, "new.txt", "committed\n");
+    std::fs::remove_file(app.join("old.txt")).unwrap();
+    commit(&app, "app 2", 1_700_000_100);
+    let repo2 = gitinfo::inspect(&app).unwrap();
+    e.sync(&repo2);
+
+    e.ws.advance(&id, &w, &repo1.commit, &repo2).unwrap();
+    e.ws.verify(&w, &repo2).unwrap();
+    let read = |rel: &str| std::fs::read_to_string(w.join(rel)).unwrap();
+    assert_eq!(read("src/app.c"), "int main() { return 2; }\n");
+    assert_eq!(read("vendor/lib/lib.c"), "int lib = 2;\n");
+    assert_eq!(read("vendor/lib/inner/inner.txt"), "inner 1\n");
+    assert_eq!(read("new.txt"), "committed\n");
+    assert!(!w.join("old.txt").exists());
+    assert_eq!(read("target/app.o"), "object\n");
+    assert_eq!(read("build.log"), "built\n");
+    assert_eq!(
+        git(&w, &["status", "--porcelain", "--ignore-submodules=none"]),
+        "?? build.log"
+    );
+    assert_eq!(
+        git(&w, &["status", "--porcelain", "--ignored", "--", "target"]),
+        "!! target/"
+    );
+    // HEAD is detached, in the top and the submodules: no branch of a mirror moved.
+    for d in ["", "vendor/lib", "vendor/lib/inner"] {
+        assert_eq!(
+            git(&w.join(d), &["rev-parse", "--abbrev-ref", "HEAD"]),
+            "HEAD",
+            "{d}"
+        );
+    }
+    // The workspace's pins are at the new commits, in every mirror it uses.
+    let pin = format!("refs/potluck/pins/{id}");
+    let mut want = vec![(repo2.id.clone(), repo2.commit.clone())];
+    want.extend(
+        repo2
+            .submodules
+            .iter()
+            .map(|s| (s.repo_id.clone(), s.commit.clone())),
+    );
+    for (repo_id, commit) in &want {
+        assert_eq!(
+            e.workspace_pins(repo_id),
+            std::slice::from_ref(&pin),
+            "{repo_id}"
+        );
+        assert_eq!(
+            refs(&e.mirror(repo_id), &[&pin]).get(&pin),
+            Some(commit),
+            "{repo_id}"
+        );
+    }
+
+    // Again at the same commit: tracked files are made the commit's again; nothing else moves.
+    write(&w, "src/app.c", "changed again\n");
+    e.ws.advance(&id, &w, &repo2.commit, &repo2).unwrap();
+    assert_eq!(read("src/app.c"), "int main() { return 2; }\n");
+    assert_eq!(read("build.log"), "built\n");
+
+    // Back to a commit it doesn't descend from: refused, nothing changed.
+    let err = format!(
+        "{:#}",
+        e.ws.advance(&id, &w, &repo2.commit, &repo1).unwrap_err()
+    );
+    assert!(err.contains("doesn't descend from"), "{err}");
+    e.ws.verify(&w, &repo2).unwrap();
+
+    // Other submodules than the workspace's: a nested one left out, or one the commit removes.
+    write(&app, "src/app.c", "int main() { return 3; }\n");
+    commit(&app, "app 3", 1_700_000_200);
+    let without = gitinfo::inspect_without(&app, &mut |_| Ok(vec!["vendor/lib/inner".into()]))
+        .unwrap()
+        .repo;
+    e.sync(&without);
+    let err = format!(
+        "{:#}",
+        e.ws.advance(&id, &w, &repo2.commit, &without).unwrap_err()
+    );
+    assert!(
+        err.contains("its submodules aren't the workspace's")
+            && err.contains("the workspace has vendor/lib/inner, which this dispatch doesn't"),
+        "{err}"
+    );
+    git(&app, &["rm", "-q", "-r", "vendor/lib"]);
+    commit(&app, "app 4", 1_700_000_300);
+    let removed = gitinfo::inspect(&app).unwrap();
+    e.sync(&removed);
+    let err = format!(
+        "{:#}",
+        e.ws.advance(&id, &w, &repo2.commit, &removed).unwrap_err()
+    );
+    assert!(
+        err.contains("the workspace has vendor/lib, vendor/lib/inner, which this dispatch doesn't"),
+        "{err}"
+    );
+    e.ws.verify(&w, &repo2).unwrap();
+    assert_eq!(read("src/app.c"), "int main() { return 2; }\n");
+
+    // Removal drops the moved pins too.
+    let mut rec = e.record(&id, &repo2, &w);
+    rec.commit = repo2.commit.clone();
+    e.ws.remove(&rec).unwrap();
+    for (repo_id, _) in &want {
+        assert!(e.workspace_pins(repo_id).is_empty(), "{repo_id}");
+    }
+}
+
 /// Repository ids come from directory names: one that starts with a dot or has two dots in a row
 /// still makes an id that mirrors, bases and workspaces accept.
 #[test]
@@ -1416,6 +1555,7 @@ fn relative_state_directory() {
         held_until: 0,
         pending: 0,
         size_bytes: None,
+        advanced_by: None,
     };
     ws.remove(&record).unwrap();
     assert!(!root.exists());

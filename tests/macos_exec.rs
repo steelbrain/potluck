@@ -30,6 +30,7 @@ fn job(cmd: &[&str]) -> JobRecord {
                 carried: vec![],
             },
             workspace: None,
+            advance: false,
             cmd: cmd.iter().map(|s| s.to_string()).collect(),
             env: BTreeMap::new(),
             unset_env: Default::default(),

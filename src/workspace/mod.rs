@@ -96,9 +96,16 @@
 //! commit holds, which still counts as clean; a project that needs their content fetches it in its
 //! job.
 //!
+//! **Advancing** (`dispatch --advance`, [`Workspaces::advance`]): a workspace is checked out at a
+//! commit that descends from its own, the top and each submodule with `git checkout --force
+//! --detach`. Tracked files become the commit's, and untracked and ignored files (build output)
+//! stay unless the commit has a file in their place. The commit's submodules must be the ones the
+//! workspace has; nothing is seeded.
+//!
 //! Each workspace also has a TMPDIR beside its tree ([`Paths::workspace_tmp`]), created with it and
 //! removed with it. [`Workspaces::create`] pins every commit it seeds under
-//! `refs/potluck/pins/<workspace id>`; [`Workspaces::remove`] drops those pins.
+//! `refs/potluck/pins/<workspace id>`, [`Workspaces::advance`] moves those pins to the commits it
+//! checks out, and [`Workspaces::remove`] drops them.
 //!
 //! **Lifecycle policy** ([`tick`]): held until `held_until` (at least 5 minutes after each
 //! invocation, extended by holds up to 24 hours from each request), then idle. On each machine the

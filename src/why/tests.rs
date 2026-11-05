@@ -23,6 +23,7 @@ fn record(id: &str, state: JobState) -> JobRecord {
                 carried: Vec::new(),
             },
             workspace: None,
+            advance: false,
             cmd: vec!["true".into()],
             env: BTreeMap::new(),
             unset_env: Default::default(),

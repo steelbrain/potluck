@@ -213,6 +213,11 @@ pub struct DispatchArgs {
     /// Run inside this existing workspace (on its machine).
     #[arg(long)]
     pub workspace: Option<String>,
+    /// With --workspace: the workspace may be at an older commit that this one descends from.
+    /// When the job starts, the workspace is checked out at this commit, and its untracked and
+    /// ignored files (build output) are kept.
+    #[arg(long, requires = "workspace")]
+    pub advance: bool,
     /// Hold the workspace this long after the job (at least 5m, at most 24h).
     #[arg(long, value_name = "DUR")]
     pub hold: Option<String>,
@@ -707,6 +712,7 @@ impl Cx<'_> {
             on: r.on,
             repo,
             workspace: args.workspace.clone(),
+            advance: args.advance,
             cmd: r.cmd,
             env: r.env,
             unset_env: r.unset_env,
@@ -1456,6 +1462,7 @@ mod tests {
             held_until: 0,
             pending: 0,
             size_bytes: None,
+            advanced_by: None,
         };
         assert_eq!(
             released("studio-w5", Some(&w)),

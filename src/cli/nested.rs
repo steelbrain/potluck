@@ -135,7 +135,7 @@ pub fn check(
 /// `--priority` and `--cpu` aren't among them: in place a command starts at once and shares the
 /// job's CPU.
 pub fn refused_option(args: &DispatchArgs, job: &str) -> Option<(&'static str, String)> {
-    let checks: [(bool, &'static str, String); 8] = [
+    let checks: [(bool, &'static str, String); 9] = [
         (
             !args.keep.is_empty(),
             "--keep",
@@ -179,6 +179,11 @@ pub fn refused_option(args: &DispatchArgs, job: &str) -> Option<(&'static str, S
             format!(
                 "it runs with the mirrors job {job}'s dispatch carried commits into (its POTLUCK_MIRROR_ variables)"
             ),
+        ),
+        (
+            args.advance,
+            "--advance",
+            format!("it runs in job {job}'s workspace, which stays at the commit job {job} runs"),
         ),
     ];
     checks

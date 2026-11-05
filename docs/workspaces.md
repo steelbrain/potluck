@@ -8,8 +8,20 @@ one when it starts, unless it names one with `--workspace`.
   checkout, and git writes only the files that differ. Before each job, HEAD and each submodule's
   HEAD are checked against the dispatched commits.
 - **Reuse.** `--workspace W` runs the job in W, on W's machine, after the jobs already running or
-  queued there. W must be at the same commit. If W or its machine is gone, the dispatch fails at
-  once.
+  queued there. W must be at the same commit; when the dispatch's commit descends from W's, the
+  refusal says `--advance` would take it. If W or its machine is gone, the dispatch fails at once.
+- **Advance.** With `--advance`, `--workspace W` also takes a commit that descends from W's, in
+  the repository it is dispatched from. When the job starts, W and its submodules are checked out
+  at the job's commits with `git checkout --force`: tracked files become the commit's, and changes
+  earlier jobs made to them are discarded, even when W was at that commit already. Untracked and
+  ignored files, such as build output in `target/`, are kept, unless the commit has a file at the
+  same path. W is then at the new commit, and its holds, reminders and `status` say so;
+  `status --json` names the job that moved it (`advanced_by`). The job fails at start, leaving W
+  as it was, if W's submodules aren't the job's (the commit adds or removes one, or
+  `--without-submodule` leaves out other ones than W's first dispatch did), or if an `--advance`
+  queued before it moved W to a commit this one doesn't descend from. A job queued into W at the
+  old commit without `--advance` fails at start, naming the job that moved W. `--advance` without
+  `--workspace` is refused.
 - **Held.** After each job a workspace is held for at least 5 minutes. `--hold DUR` holds it DUR
   after the job ends, up to 24 hours. `potluck hold W DUR` makes the hold end DUR from now, at most
   24 hours, and can be repeated. A hold belongs to the branch whose job or `potluck hold` set when
@@ -28,7 +40,8 @@ in it, only the hold ends, and the job running in it then doesn't hold it again 
 `potluck cp W:PATH DEST` copies a file or directory out of a workspace, from any member, with
 permission bits (setuid, setgid and sticky bits are dropped). A symlink to a file inside the
 workspace is copied as that file; other symlinks are skipped, and so are files whose names aren't
-valid UTF-8. A build, then tests in the same tree:
+valid UTF-8. A build, then tests in the same tree, and the tests again after a fix is committed,
+with the build output kept:
 
 ```console
 $ potluck dispatch --timeout 10m --hold 1h -- cargo build --tests
@@ -41,7 +54,14 @@ $ potluck dispatch --timeout 5m --workspace studio-w5 -- cargo test
 job studio-7
 workspace studio-w5
 $ potluck wait -q studio-7
-potluck: job studio-7 succeeded, exit code 0
+potluck: job studio-7 failed, exit code 101
+$ git commit -qam 'Fix the parser test'
+$ potluck dispatch --timeout 5m --workspace studio-w5 --advance -- cargo test
+job studio-8
+workspace studio-w5
+$ potluck wait -q studio-8
+potluck: job studio-8 succeeded, exit code 0
+potluck: workspace studio-w5 on studio is held for this branch for 54m10s more (commit 0c7a2d91e4b3); `potluck release studio-w5` ends it
 $ potluck cp studio-w5:Cargo.lock /tmp/
 copied 1 file (147 B) from studio-w5:Cargo.lock to /tmp/Cargo.lock
 $ potluck hold studio-w5 3h

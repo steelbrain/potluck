@@ -816,6 +816,317 @@ fn workspaces_seed_reuse_cp_hold_idle_remove_release() {
     );
 }
 
+/// Commits everything in `dir`; returns the new HEAD.
+fn commit_all(dir: &Path, msg: &str) -> String {
+    git(dir, &["add", "-A"]);
+    git(dir, &["commit", "-qm", msg]);
+    git(dir, &["rev-parse", "HEAD"])
+}
+
+/// The submodule vendor/lib at a new commit of lib, with `text` in lib.txt.
+fn new_lib_commit(n: &Node, text: &str) {
+    let lib = n.dir.path().join("repos/lib");
+    std::fs::write(lib.join("lib.txt"), text).unwrap();
+    commit_all(&lib, "lib");
+    let sub = n.proj.join("vendor/lib");
+    git(&sub, &["fetch", "-q", "origin"]);
+    git(&sub, &["checkout", "-q", "--detach", "origin/main"]);
+}
+
+/// `potluck status`'s record of workspace `w`.
+fn ws_record(n: &Node, w: &str) -> Value {
+    let s = n.cli_ok(&["status"]);
+    s["workspaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["id"] == w)
+        .cloned()
+        .unwrap_or_else(|| panic!("no workspace {w}: {s}"))
+}
+
+/// `--advance` checks the workspace out at a descendant commit: build output (untracked and
+/// ignored files) is kept, a job's changes to tracked files go, the submodule moves with it. The
+/// record, reminders and pins follow. Without `--advance` the refusal says it would do; a commit
+/// that doesn't descend is refused with it.
+#[test]
+fn an_advance_keeps_build_output_and_resets_tracked_files() {
+    let n = Node::new();
+    std::fs::write(n.proj.join(".gitignore"), "/target/\n").unwrap();
+    let a = commit_all(&n.proj, "ignore target");
+    let j1 = n.dispatch(&[
+        "--timeout",
+        "1m",
+        "--",
+        "sh",
+        "-c",
+        "mkdir target && echo object > target/app.o && echo built > build.log && echo edited > README && echo edited > vendor/lib/lib.txt",
+    ]);
+    let (code, j, out) = n.wait(&j1);
+    assert_eq!(code, 0, "{j} {out}");
+    let w = j["workspace"].as_str().unwrap().to_string();
+
+    // The next commit: README changed, a file added, the submodule moved on.
+    new_lib_commit(&n, "lib v2\n");
+    std::fs::write(n.proj.join("README"), "hello v2\n").unwrap();
+    std::fs::write(n.proj.join("new.txt"), "new\n").unwrap();
+    let b = commit_all(&n.proj, "v2");
+
+    let o = n.cli(&[
+        "dispatch",
+        "--timeout",
+        "1m",
+        "--workspace",
+        &w,
+        "--",
+        "true",
+    ]);
+    assert_eq!(o.code, 2, "{}", o.json);
+    assert_eq!(
+        o.json["error"].as_str().unwrap(),
+        format!(
+            "workspace {w} is at commit {}, but this dispatch is at {}, which descends from it: dispatch with --advance to check {} out in {w}, keeping its untracked and ignored files, or without --workspace to run {} in a new workspace",
+            &a[..12],
+            &b[..12],
+            &b[..12],
+            &b[..12]
+        )
+    );
+
+    let j2 = n.dispatch(&[
+        "--timeout",
+        "1m",
+        "--workspace",
+        &w,
+        "--advance",
+        "--",
+        "sh",
+        "-c",
+        "cat target/app.o build.log README new.txt vendor/lib/lib.txt; git status --porcelain --ignore-submodules=none",
+    ]);
+    let (code, j, out) = n.wait(&j2);
+    assert_eq!(
+        (code, j["workspace"].as_str()),
+        (0, Some(w.as_str())),
+        "{j} {out}\n{}",
+        n.daemon_log()
+    );
+    assert!(
+        out.contains("object\nbuilt\nhello v2\nnew\nlib v2\n?? build.log\n"),
+        "{out}"
+    );
+    assert!(!out.contains("edited") && !out.contains(" M "), "{out}");
+
+    // The record, and the reminder of its hold, are at the new commit; its pins too.
+    let rec = ws_record(&n, &w);
+    assert_eq!(rec["commit"], b.as_str(), "{rec}");
+    assert_eq!(rec["advanced_by"], j2.as_str(), "{rec}");
+    let s = n.cli_ok(&["status"]);
+    let rem = s["reminders"].as_array().unwrap();
+    assert!(
+        rem.iter()
+            .any(|r| r["workspace"] == w.as_str() && r["commit"] == b.as_str()),
+        "{s}"
+    );
+    let mirror = n.paths.mirror(rec["repo_id"].as_str().unwrap());
+    assert_eq!(
+        git(
+            &n.proj,
+            &[
+                "--git-dir",
+                mirror.to_str().unwrap(),
+                "rev-parse",
+                &format!("refs/potluck/pins/{w}"),
+            ]
+        ),
+        b
+    );
+    // A dispatch at the commit it is at now runs in it as before.
+    let j3 = n.dispatch(&[
+        "--timeout",
+        "1m",
+        "--workspace",
+        &w,
+        "--",
+        "cat",
+        "build.log",
+    ]);
+    let (code, j, out) = n.wait(&j3);
+    assert_eq!(code, 0, "{j} {out}");
+    assert!(out.contains("built"), "{out}");
+
+    // Back at the first commit: --advance doesn't move a workspace back.
+    git(&n.proj, &["checkout", "-q", &a]);
+    git(&n.proj, &["submodule", "update", "-q"]);
+    let o = n.cli(&[
+        "dispatch",
+        "--timeout",
+        "1m",
+        "--workspace",
+        &w,
+        "--advance",
+        "--",
+        "true",
+    ]);
+    assert_eq!(o.code, 2, "{}", o.json);
+    assert_eq!(
+        o.json["error"].as_str().unwrap(),
+        format!(
+            "workspace {w} is at commit {}, and this dispatch's commit {} doesn't descend from it: --advance moves a workspace only to a descendant of its commit; dispatch without --workspace to run {}",
+            &b[..12],
+            &a[..12],
+            &a[..12]
+        )
+    );
+}
+
+/// A job queued into a workspace at its commit, which an `--advance` queued before it then moves
+/// on, fails when it starts, naming the job that moved it and where.
+#[test]
+fn a_job_queued_at_the_old_commit_fails_after_an_advance() {
+    let n = Node::new();
+    let stop = n.dir.path().join("stop");
+    let a = git(&n.proj, &["rev-parse", "HEAD"]);
+    let j0 = n.dispatch(&[
+        "--timeout",
+        "1m",
+        "--env",
+        &format!("E2E_STOP={}", stop.display()),
+        "--",
+        "sh",
+        "-c",
+        "while [ ! -e \"$E2E_STOP\" ]; do sleep 0.1; done",
+    ]);
+    let w = n.running(&j0).workspace.unwrap();
+    std::fs::write(n.proj.join("README"), "hello v2\n").unwrap();
+    let b = commit_all(&n.proj, "v2");
+    let adv = n.dispatch(&[
+        "--timeout",
+        "1m",
+        "--workspace",
+        &w,
+        "--advance",
+        "--",
+        "cat",
+        "README",
+    ]);
+    git(&n.proj, &["checkout", "-q", &a]);
+    let old = n.dispatch(&["--timeout", "1m", "--workspace", &w, "--", "cat", "README"]);
+    // Another --advance, to a commit beside the first one's: it descends from the workspace's
+    // commit now, but not from the one the first --advance moves it to.
+    git(&n.proj, &["checkout", "-q", "-b", "side"]);
+    std::fs::write(n.proj.join("side.txt"), "side\n").unwrap();
+    let c = commit_all(&n.proj, "side");
+    let side = n.dispatch(&[
+        "--timeout",
+        "1m",
+        "--workspace",
+        &w,
+        "--advance",
+        "--",
+        "true",
+    ]);
+    std::fs::write(&stop, "").unwrap();
+    assert_eq!(n.wait(&j0).0, 0);
+    let (code, j, out) = n.wait(&adv);
+    assert_eq!(code, 0, "{j} {out}");
+    assert!(out.contains("hello v2"), "{out}");
+    let (code, j, _) = n.wait(&old);
+    assert_eq!((code, j["state"].as_str()), (1, Some("failed")), "{j}");
+    assert_eq!(
+        j["message"].as_str().unwrap(),
+        format!(
+            "workspace {w} is at commit {} now, not {}: job {adv} moved it there with --advance; dispatch without --workspace to run {}",
+            &b[..12],
+            &a[..12],
+            &a[..12]
+        )
+    );
+    let (code, j, _) = n.wait(&side);
+    assert_eq!(code, 1, "{j}");
+    assert_eq!(
+        j["message"].as_str().unwrap(),
+        format!(
+            "workspace {w} can't advance from commit {}, where job {adv} moved it with --advance, to {}: commit {} doesn't descend from {}, the workspace's commit; dispatch without --workspace to run {} in a new workspace",
+            &b[..12],
+            &c[..12],
+            &c[..12],
+            &b[..12],
+            &c[..12]
+        )
+    );
+    assert_eq!(ws_record(&n, &w)["commit"], b.as_str());
+}
+
+/// `--advance` keeps a workspace's submodules as they are: a commit that drops one, or a dispatch
+/// that leaves one out, fails when it starts, and the workspace stays where it was.
+#[test]
+fn an_advance_to_other_submodules_fails_at_start() {
+    let n = Node::new();
+    let j1 = n.dispatch(&["--timeout", "1m", "--", "true"]);
+    let (code, j, _) = n.wait(&j1);
+    assert_eq!(code, 0, "{j}");
+    let w = j["workspace"].as_str().unwrap().to_string();
+    let a = git(&n.proj, &["rev-parse", "HEAD"]);
+
+    std::fs::write(n.proj.join("README"), "hello v2\n").unwrap();
+    let b = commit_all(&n.proj, "v2");
+    let left_out = n.dispatch(&[
+        "--timeout",
+        "1m",
+        "--workspace",
+        &w,
+        "--advance",
+        "--without-submodule",
+        "vendor/lib",
+        "--",
+        "true",
+    ]);
+    let (code, j, _) = n.wait(&left_out);
+    assert_eq!(code, 1, "{j}");
+    let msg = j["message"].as_str().unwrap();
+    assert_eq!(
+        msg,
+        format!(
+            "workspace {w} can't advance from commit {} to {}: its submodules aren't the workspace's: the workspace has vendor/lib, which this dispatch doesn't (its commit has no such submodule, or it is left out); dispatch without --workspace to run {} in a new workspace",
+            &a[..12],
+            &b[..12],
+            &b[..12]
+        )
+    );
+
+    git(&n.proj, &["rm", "-q", "vendor/lib"]);
+    let c = commit_all(&n.proj, "no lib");
+    let dropped = n.dispatch(&[
+        "--timeout",
+        "1m",
+        "--workspace",
+        &w,
+        "--advance",
+        "--",
+        "true",
+    ]);
+    let (code, j, _) = n.wait(&dropped);
+    assert_eq!(code, 1, "{j}");
+    let msg = j["message"].as_str().unwrap();
+    assert!(
+        msg.starts_with(&format!(
+            "workspace {w} can't advance from commit {} to {}: its submodules aren't the workspace's: the workspace has vendor/lib,",
+            &a[..12],
+            &c[..12]
+        )),
+        "{msg}"
+    );
+    // Nothing moved: the record and the tree are at the first commit.
+    assert_eq!(ws_record(&n, &w)["commit"], a.as_str());
+    assert_eq!(
+        git(&n.paths.workspace(&w), &["rev-parse", "HEAD"]),
+        a,
+        "{}",
+        n.daemon_log()
+    );
+}
+
 #[test]
 fn ram_limit_ends_the_job() {
     let n = Node::new();

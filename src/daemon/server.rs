@@ -482,6 +482,12 @@ fn validate(spec: &JobSpec) -> Result<(), String> {
         return Err("the dispatch names no repository commit".into());
     }
     check_carried(&spec.repo)?;
+    if spec.advance && spec.workspace.is_none() {
+        return Err(
+            "--advance needs --workspace W: it checks an existing workspace out at this commit"
+                .into(),
+        );
+    }
     crate::types::check_on(&spec.on).map_err(|e| format!("--on: {e}"))?;
     // A glob that can't match inside the workspace would only be dropped when the job ends.
     for g in &spec.keep {
@@ -583,14 +589,15 @@ fn dispatch_new(sh: &Arc<Shared>, spec: &JobSpec) -> Result<Response, String> {
     if let Some(c) = &cluster {
         super::cluster::views::refresh_unknown(sh, c);
     }
+    let descent = descent(sh, spec, remote_ws.as_ref());
     let (id, spec) = {
         let mut st = sh.lock();
         let spec = owned_spec(&st, spec, remote_ws.as_ref());
         if let Some(w) = &spec.workspace {
             match &remote_ws {
-                Some(rec) => check_ws_record(rec, w, &spec)?,
+                Some(rec) => check_ws_record(rec, w, &spec, descent.as_ref())?,
                 None if remote => {}
-                None => check_workspace(&st, w, &spec)?,
+                None => check_workspace(&st, w, &spec, descent.as_ref())?,
             }
         }
         feasible_somewhere(sh, &st, &spec, now)?;
@@ -623,7 +630,7 @@ fn dispatch_new(sh: &Arc<Shared>, spec: &JobSpec) -> Result<Response, String> {
         // The workspace may have gone while the mirrors synced.
         if let Some(w) = &spec.workspace
             && !remote
-            && let Err(e) = check_workspace(&st, w, &spec)
+            && let Err(e) = check_workspace(&st, w, &spec, descent.as_ref())
         {
             drop(st);
             unpin_all(sh, &spec.repo, &id);
@@ -735,8 +742,39 @@ fn owned_spec(
     }
 }
 
-/// A dispatch into an existing workspace: it must exist and hold the dispatched commit.
-fn check_workspace(st: &super::state::State, w: &str, spec: &JobSpec) -> Result<(), String> {
+/// Whether a dispatch's commit descends from the commit `from` its workspace is at, as the
+/// source repository on this machine (the owner) has it.
+struct Descent {
+    from: String,
+    descends: Result<bool, String>,
+}
+
+/// For a dispatch into a workspace at another commit: whether the dispatch's commit descends from
+/// the workspace's (`--advance` needs it; a refusal without it says `--advance` would do), asked of
+/// the source repository here before the state lock is taken, as git may walk a long history.
+/// None for a dispatch into no workspace, one at the dispatch's commit, or one not known here yet.
+fn descent(sh: &Shared, spec: &JobSpec, remote_ws: Option<&WorkspaceRecord>) -> Option<Descent> {
+    let w = spec.workspace.as_ref()?;
+    let from = match remote_ws {
+        Some(rec) => rec.commit.clone(),
+        None => sh.lock().live_ws(w)?.commit.clone(),
+    };
+    if from == spec.repo.commit {
+        return None;
+    }
+    let descends = crate::gitinfo::is_ancestor(&spec.repo.source, &from, &spec.repo.commit)
+        .map_err(|e| format!("{e:#}"));
+    Some(Descent { from, descends })
+}
+
+/// A dispatch into an existing workspace: it must exist and hold the dispatched commit, or with
+/// `--advance` one it descends from.
+fn check_workspace(
+    st: &super::state::State,
+    w: &str,
+    spec: &JobSpec,
+    descent: Option<&Descent>,
+) -> Result<(), String> {
     let Some(ws) = st.live_ws(w) else {
         // Removed ones are remembered until their records are pruned.
         return Err(if st.workspaces.contains_key(w) {
@@ -745,11 +783,17 @@ fn check_workspace(st: &super::state::State, w: &str, spec: &JobSpec) -> Result<
             format!("no workspace {w}")
         });
     };
-    check_ws_record(ws, w, spec)
+    check_ws_record(ws, w, spec, descent)
 }
 
-/// A workspace's record (here or on another machine) against a dispatch into it.
-fn check_ws_record(ws: &WorkspaceRecord, w: &str, spec: &JobSpec) -> Result<(), String> {
+/// A workspace's record (here or on another machine) against a dispatch into it. `descent` is what
+/// the source repository said of the workspace's commit, when it was asked ([`descent`]).
+fn check_ws_record(
+    ws: &WorkspaceRecord,
+    w: &str,
+    spec: &JobSpec,
+    descent: Option<&Descent>,
+) -> Result<(), String> {
     if ws.state == WorkspaceState::Removed {
         return Err(format!("workspace {w} is gone"));
     }
@@ -759,15 +803,30 @@ fn check_ws_record(ws: &WorkspaceRecord, w: &str, spec: &JobSpec) -> Result<(), 
             ws.repo_id, spec.repo.id
         ));
     }
-    if ws.commit != spec.repo.commit {
-        return Err(format!(
-            "workspace {w} is at commit {}, but this dispatch is at {}; dispatch without --workspace to run {}",
-            short(&ws.commit),
-            short(&spec.repo.commit),
-            short(&spec.repo.commit)
-        ));
+    if ws.commit == spec.repo.commit {
+        return Ok(());
     }
-    Ok(())
+    let (at, this) = (short(&ws.commit), short(&spec.repo.commit));
+    // Asked of the commit the workspace is at now: none when a job moved it (--advance) since.
+    let descends = descent
+        .filter(|d| d.from == ws.commit)
+        .map(|d| d.descends.as_ref());
+    match (spec.advance, descends) {
+        // Moved since it was asked: the job's start checks again, on the workspace's machine.
+        (true, Some(Ok(true)) | None) => Ok(()),
+        (true, Some(Ok(false))) => Err(format!(
+            "workspace {w} is at commit {at}, and this dispatch's commit {this} doesn't descend from it: --advance moves a workspace only to a descendant of its commit; dispatch without --workspace to run {this}"
+        )),
+        (true, Some(Err(e))) => Err(format!(
+            "workspace {w} is at commit {at}, and whether this dispatch's commit {this} descends from it can't be told ({e}); dispatch without --workspace to run {this}"
+        )),
+        (false, Some(Ok(true))) => Err(format!(
+            "workspace {w} is at commit {at}, but this dispatch is at {this}, which descends from it: dispatch with --advance to check {this} out in {w}, keeping its untracked and ignored files, or without --workspace to run {this} in a new workspace"
+        )),
+        (false, _) => Err(format!(
+            "workspace {w} is at commit {at}, but this dispatch is at {this}; dispatch without --workspace to run {this}"
+        )),
+    }
 }
 
 /// Brings this machine's mirrors of the repository, its submodules and its carried repositories

@@ -182,6 +182,7 @@ fn record(cmd: &[&str]) -> JobRecord {
                 carried: Vec::new(),
             },
             workspace: None,
+            advance: false,
             cmd: cmd.iter().map(|s| s.to_string()).collect(),
             env: BTreeMap::new(),
             unset_env: Default::default(),

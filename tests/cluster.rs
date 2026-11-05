@@ -343,6 +343,22 @@ impl WorkspaceProvider for FakeWs {
         anyhow::ensure!(at == repo.commit, "HEAD is {at}, not {}", repo.commit);
         Ok(())
     }
+    fn advance(
+        &self,
+        id: &WorkspaceId,
+        root: &Path,
+        from: &str,
+        repo: &RepoRef,
+    ) -> anyhow::Result<()> {
+        let at = std::fs::read_to_string(root.join("COMMIT"))?;
+        anyhow::ensure!(at == from, "HEAD is {at}, not {from}");
+        anyhow::ensure!(
+            self.has_commit(&repo.id, &repo.commit),
+            "no commit to check out"
+        );
+        std::fs::write(root.join("COMMIT"), &repo.commit)?;
+        self.pin(&repo.id, &repo.commit, id)
+    }
     fn remove(&self, record: &WorkspaceRecord) -> anyhow::Result<()> {
         let _ = std::fs::remove_dir_all(&record.path);
         self.pins.lock().unwrap().retain(|(_, n)| n != &record.id);
@@ -1397,6 +1413,112 @@ fn workspaces_elsewhere_cancel_and_a_removed_machine() {
     assert_eq!(o.code, 2, "{}", o.json);
     let nodes = b.cli_ok(&["nodes"]);
     assert_eq!(nodes["nodes"].as_array().unwrap().len(), 1, "{nodes}");
+}
+
+/// `--advance` into a workspace on another member: the owner asks its own repository whether the
+/// commit descends from the one the workspace's machine says it is at, and the workspace's machine
+/// checks it out when the job starts. Its record there, and the owner's reminders, follow.
+#[test]
+fn an_advance_into_a_workspace_elsewhere() {
+    let w = World::new();
+    let a = w.node("a").start();
+    let b = w.node("b").start();
+    pair(&a, &b);
+    let first = a.dispatch(&["--on", "node=b", "--", "sh", "-c", "echo made > made.txt"]);
+    let j = a.done(&first);
+    assert_eq!(j.state, JobState::Succeeded, "{j:#?}");
+    let ws = j.workspace.clone().unwrap();
+    let old = git(&w.repo, &["rev-parse", "HEAD"]);
+
+    std::fs::write(w.repo.join("README"), "hello v2\n").unwrap();
+    git(&w.repo, &["commit", "-qam", "v2"]);
+    let new = git(&w.repo, &["rev-parse", "HEAD"]);
+    let id = potluck::types::repo_id(&w.repo.join(".git"));
+    w.source.lock().unwrap().insert((id, new.clone()));
+
+    let o = a.cli(&[
+        "dispatch",
+        "--timeout",
+        "1m",
+        "--workspace",
+        &ws,
+        "--",
+        "true",
+    ]);
+    assert_eq!(o.code, 2, "{}", o.json);
+    let msg = o.json["error"].as_str().unwrap();
+    assert!(
+        msg.contains(&format!("workspace {ws} is at commit {}", &old[..12]))
+            && msg.contains("dispatch with --advance"),
+        "{msg}"
+    );
+
+    let adv = a.dispatch(&[
+        "--workspace",
+        &ws,
+        "--advance",
+        "--",
+        "sh",
+        "-c",
+        "cat made.txt COMMIT",
+    ]);
+    let j = a.done(&adv);
+    assert_eq!(
+        (j.state, j.node.as_deref(), j.workspace.as_deref()),
+        (JobState::Succeeded, Some("b"), Some(ws.as_str())),
+        "{j:#?}\n{}",
+        b.daemon_log()
+    );
+    assert_eq!(output_of(&a, &adv), format!("made\n{new}"));
+    let rec = b.cli_ok(&["status"])["workspaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["id"] == ws.as_str())
+        .cloned()
+        .unwrap();
+    assert_eq!(
+        (rec["commit"].as_str(), rec["advanced_by"].as_str()),
+        (Some(new.as_str()), Some(adv.as_str())),
+        "{rec}"
+    );
+    assert!(
+        b.ws.pins
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(r, n)| same_repo(&potluck::types::repo_id(&w.repo.join(".git")), r) && n == &ws)
+    );
+    wait_until("a's reminder shows the new commit", || {
+        a.cli_ok(&["status"])["reminders"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["workspace"] == ws.as_str() && r["commit"] == new.as_str())
+    });
+
+    // Back at the old commit: the owner's repository says it doesn't descend.
+    git(&w.repo, &["checkout", "-q", &old]);
+    let o = a.cli(&[
+        "dispatch",
+        "--timeout",
+        "1m",
+        "--workspace",
+        &ws,
+        "--advance",
+        "--",
+        "true",
+    ]);
+    assert_eq!(o.code, 2, "{}", o.json);
+    let msg = o.json["error"].as_str().unwrap();
+    assert!(
+        msg.contains(&format!(
+            "workspace {ws} is at commit {}, and this dispatch's commit {} doesn't descend from it",
+            &new[..12],
+            &old[..12]
+        )),
+        "{msg}"
+    );
 }
 
 /// Whether `node`'s status says it is out of the cluster.

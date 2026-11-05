@@ -1,7 +1,7 @@
 //! Seeding, verifying, removing and measuring workspaces, and the base checkouts they are cloned
 //! from. See the module docs in `mod.rs`.
 
-use super::git::{mirror_bytes, mirror_text, tree_bytes, tree_git, tree_text};
+use super::git::{mirror_bytes, mirror_git, mirror_text, tree_bytes, tree_git, tree_text};
 use super::lock::Lock;
 use super::mirror::{check_sha, mark_suspect, remove_all};
 use super::{Workspaces, case, check_id};
@@ -9,7 +9,7 @@ use crate::cow;
 use crate::gitinfo::{self, canonical, short};
 use crate::types::{RepoRef, WorkspaceId, WorkspaceRecord};
 use anyhow::{Context, bail};
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 
@@ -323,6 +323,117 @@ impl Workspaces {
         }
     }
 
+    /// Checks workspace `id` at `root`, at commit `from` (its record's), out at `repo`'s commits
+    /// (`dispatch --advance`). `repo`'s commit must be `from` or descend from it (in the mirror),
+    /// and its submodules must be the ones the workspace has checked out; otherwise nothing is
+    /// changed. Then the top and each submodule, parents first, are checked out detached at their
+    /// commits with `git checkout --force`: tracked files become the commit's, changes to them are
+    /// discarded, and untracked files in the way of the commit's files are removed; other
+    /// untracked and ignored files (build output) stay. Files whose converting attributes differ
+    /// under the two commits are written again (`switch_tree`). Last, the workspace's pins
+    /// (`refs/potluck/pins/<id>`) move to the new commits, so the old ones are no longer pinned.
+    /// Every mirror must already have its commit.
+    pub fn advance(
+        &self,
+        id: &WorkspaceId,
+        root: &Path,
+        from: &str,
+        repo: &RepoRef,
+    ) -> anyhow::Result<()> {
+        check_id("workspace", id)?;
+        check_sha(from)?;
+        let parts = parts(repo, root)?;
+        for p in &parts {
+            check_id("repository", p.repo_id)?;
+            check_sha(p.commit)?;
+            if !self.has_commit(p.repo_id, p.commit) {
+                bail!(
+                    "the mirror of {} doesn't have commit {} ({})",
+                    p.repo_id,
+                    short(p.commit),
+                    p.label()
+                );
+            }
+        }
+        if from != repo.commit {
+            let _lock = Lock::shared(&self.mirror_lock(&repo.id))?;
+            let mirror = self.paths.mirror(&repo.id);
+            if !gitinfo::is_ancestor_with(mirror_git(&mirror), from, &repo.commit)? {
+                bail!(
+                    "commit {} doesn't descend from {}, the workspace's commit",
+                    short(&repo.commit),
+                    short(from)
+                );
+            }
+        }
+        let have = self.checked_out_submodules(&repo.id, from, root)?;
+        let want: BTreeSet<String> = repo.submodules.iter().map(|s| s.path.clone()).collect();
+        if have != want {
+            let list =
+                |s: Vec<&String>| s.iter().map(|p| p.as_str()).collect::<Vec<_>>().join(", ");
+            let mut why = Vec::new();
+            let added: Vec<&String> = want.difference(&have).collect();
+            if !added.is_empty() {
+                why.push(format!(
+                    "this dispatch has {}, which the workspace doesn't",
+                    list(added)
+                ));
+            }
+            let dropped: Vec<&String> = have.difference(&want).collect();
+            if !dropped.is_empty() {
+                why.push(format!(
+                    "the workspace has {}, which this dispatch doesn't (its commit has no such submodule, or it is left out)",
+                    list(dropped)
+                ));
+            }
+            bail!("its submodules aren't the workspace's: {}", why.join("; "));
+        }
+        for p in &parts {
+            // Before git runs there: without one, git would find the repository above it.
+            if p.dir.join(".git").symlink_metadata().is_err() {
+                bail!("{} ({}) is not a checkout", p.label(), p.dir.display());
+            }
+            let _lock = Lock::shared(&self.mirror_lock(p.repo_id))?;
+            force_checkout(&p.dir, p.commit)
+                .with_context(|| format!("checking {} out at {}", p.label(), short(p.commit)))?;
+        }
+        for p in &parts {
+            self.pin(p.repo_id, p.commit, id)?;
+        }
+        Ok(())
+    }
+
+    /// The submodules checked out in the workspace at `root`, by path from the top: each gitlink
+    /// of commit `from`'s tree (in the mirror of `top_id`) whose directory there is a checkout of
+    /// its own, then those of each submodule checked out, at the commit its parent's tree names. A
+    /// submodule its first dispatch left out, and what is nested in it, has no checkout.
+    fn checked_out_submodules(
+        &self,
+        top_id: &str,
+        from: &str,
+        root: &Path,
+    ) -> anyhow::Result<BTreeSet<String>> {
+        let mut out = BTreeSet::new();
+        let mut stack = vec![(top_id.to_string(), from.to_string(), String::new())];
+        while let Some((rid, sha, prefix)) = stack.pop() {
+            check_id("repository", &rid)?;
+            let mirror = self.paths.mirror(&rid);
+            let raw = mirror_bytes(&mirror, gitinfo::gitlinks_args(&sha)).with_context(|| {
+                format!("can't read the submodules of {} in {rid}", short(&sha))
+            })?;
+            for (path, sub_sha) in gitinfo::parse_gitlinks(&raw, &mirror)? {
+                let full = format!("{prefix}{path}");
+                if root.join(&full).join(".git").symlink_metadata().is_err() {
+                    continue;
+                }
+                let sub_id = gitinfo::submodule_repo_id(top_id, &full);
+                stack.push((sub_id, sub_sha, format!("{full}/")));
+                out.insert(full);
+            }
+        }
+        Ok(out)
+    }
+
     /// Checks that HEAD and every submodule's HEAD at `root` are `repo`'s commits.
     pub fn verify(&self, root: &Path, repo: &RepoRef) -> anyhow::Result<()> {
         check_head(root, &repo.commit, "the workspace")?;
@@ -613,13 +724,35 @@ fn should_advance(
 }
 
 /// Moves the checkout at `dir` from commit `from` to `to` with a two-tree `read-tree -m -u`, which
-/// writes only the files whose blobs differ. When the commits' `.gitattributes` differ, the files
-/// whose converting attributes differ under them are written again: a blob the commits share would
-/// otherwise keep what `from`'s attributes made of it (an `eol=crlf`, `ident` or filter added or
-/// dropped), unlike a fresh checkout of `to`, and git would still call it clean. A file whose
-/// attributes are the same under both is written the same way by either: it stays as it is (and
-/// keeps sharing its blocks with the base it was cloned from).
+/// writes only the files whose blobs differ, and fails on local changes in its way
+/// ([`switch_tree`]).
 fn move_tree(dir: &Path, from: &str, to: &str) -> anyhow::Result<()> {
+    switch_tree(dir, from, to, &["read-tree", "-m", "-u", from, to])
+}
+
+/// Checks the worktree at `dir` out at `to`, detached, with `git checkout --force`: tracked files
+/// become `to`'s (changes to them are discarded, files `to` lacks are removed) and untracked files
+/// in the way of its files are removed; other untracked and ignored files stay. Only the files
+/// that differ from the index are written ([`switch_tree`], from the commit HEAD was at).
+fn force_checkout(dir: &Path, to: &str) -> anyhow::Result<()> {
+    let from = tree_text(dir, ["rev-parse", "--verify", "--quiet", "HEAD^{commit}"])
+        .with_context(|| format!("{} has no HEAD commit", dir.display()))?;
+    switch_tree(
+        dir,
+        &from,
+        to,
+        &["checkout", "--force", "--detach", "--quiet", to],
+    )
+}
+
+/// Writes commit `to`'s files at `dir`, whose files are commit `from`'s, by running git with
+/// `switch` (which writes only the files whose blobs differ). When the commits' `.gitattributes`
+/// differ, the files whose converting attributes differ under them are written again: a blob the
+/// commits share would otherwise keep what `from`'s attributes made of it (an `eol=crlf`, `ident`
+/// or filter added or dropped), unlike a fresh checkout of `to`, and git would still call it
+/// clean. A file whose attributes are the same under both is written the same way by either: it
+/// stays as it is (and keeps sharing its blocks with the base it was cloned from).
+fn switch_tree(dir: &Path, from: &str, to: &str, switch: &[&str]) -> anyhow::Result<()> {
     let same = tree_git(dir)
         .args(["diff", "--quiet", "--no-ext-diff", from, to, "--"])
         .arg(":(glob)**/.gitattributes")
@@ -635,7 +768,7 @@ fn move_tree(dir: &Path, from: &str, to: &str) -> anyhow::Result<()> {
         let attrs = super::filters::attributes(dir, files.iter().map(String::as_str))?;
         Some((files, attrs))
     };
-    tree_text(dir, ["read-tree", "-m", "-u", from, to])?;
+    tree_text(dir, switch)?;
     let Some((files, before)) = before else {
         return Ok(());
     };

@@ -142,6 +142,7 @@ mod tests {
             held_until: 0,
             pending: 0,
             size_bytes: Some(size_gb * GB),
+            advanced_by: None,
         }
     }
 

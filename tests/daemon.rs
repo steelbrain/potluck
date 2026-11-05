@@ -816,6 +816,7 @@ fn spec(cmd: &str) -> JobSpec {
             carried: vec![],
         },
         workspace: None,
+        advance: false,
         cmd: vec!["sh".into(), "-c".into(), cmd.into()],
         env: BTreeMap::new(),
         unset_env: Default::default(),
@@ -966,6 +967,7 @@ fn a_workspace_from_before_ids_were_salted_keeps_working() {
             held_until: now + 3_600_000,
             pending: 0,
             size_bytes: Some(4096),
+            advanced_by: None,
         })
         .unwrap();
     let f = f.start();
@@ -1025,6 +1027,7 @@ fn a_carried_repository_is_synced_pinned_and_named_to_the_job() {
             held_until: now + 3_600_000,
             pending: 0,
             size_bytes: Some(4096),
+            advanced_by: None,
         })
         .unwrap();
     let f = f.start();
@@ -1178,6 +1181,10 @@ fn dispatch_refuses_what_cannot_run() {
     let mut s = spec("true");
     s.timeout_ms = 0;
     assert!(call(s).contains("run limit"));
+    // --advance moves an existing workspace: a request without one is refused.
+    let mut s = spec("true");
+    s.advance = true;
+    assert!(call(s).contains("--advance needs --workspace W"));
     // What no process can be given (a committed potluck.toml can say it; a command line can't).
     let mut s = spec("true");
     s.cmd.push("a\0b".into());

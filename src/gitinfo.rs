@@ -686,6 +686,45 @@ pub fn carry_all(args: &[String], cwd: &Path, repo: &RepoRef) -> anyhow::Result<
     Ok(all.into_iter().map(|(_, c)| c).collect())
 }
 
+/// Whether `ancestor` is `commit` or an ancestor of it, in the repository whose (common) git dir is
+/// `git_dir` (`git merge-base --is-ancestor`). The git dir is named with `GIT_DIR`, so a bare one
+/// is read whatever `safe.bareRepository` says. `Err` when git can't tell: a commit it doesn't
+/// have, or a git dir that isn't one.
+pub(crate) fn is_ancestor(git_dir: &Path, ancestor: &str, commit: &str) -> anyhow::Result<bool> {
+    let mut cmd = git(git_dir);
+    cmd.env("GIT_DIR", git_dir);
+    is_ancestor_with(cmd, ancestor, commit)
+}
+
+/// [`is_ancestor`] with `cmd`, a git command for the repository to ask (a mirror's, say).
+pub(crate) fn is_ancestor_with(
+    mut cmd: Command,
+    ancestor: &str,
+    commit: &str,
+) -> anyhow::Result<bool> {
+    for c in [ancestor, commit] {
+        if c.is_empty() || !c.bytes().all(|b| b.is_ascii_hexdigit()) {
+            bail!("{c:?} is not a commit id");
+        }
+    }
+    cmd.args(["merge-base", "--is-ancestor", ancestor, commit])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let out = cmd
+        .output()
+        .with_context(|| format!("can't run {}", describe(&cmd)))?;
+    match out.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => bail!(
+            "{} failed ({}): {}",
+            describe(&cmd),
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
+    }
+}
+
 /// The first 12 characters of a commit id, for messages. Ids from peers or raw requests aren't
 /// checked yet where they are shown, so this never slices inside a character.
 pub(crate) fn short(sha: &str) -> &str {
@@ -698,6 +737,38 @@ mod tests {
 
     /// A commit from a peer's queue or a raw dispatch isn't checked before it is shown: one with a
     /// character across byte 12 is shown whole, not a panic.
+    /// Ancestry in a repository named by its git dir: a commit is its own ancestor, a child isn't
+    /// its parent's, and a commit git doesn't have can't be told.
+    #[test]
+    fn ancestry() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(dir.path())
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid"])
+                .args(["-c", "commit.gpgsign=false"])
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{args:?}");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        run(&["init", "-q"]);
+        run(&["commit", "-q", "--allow-empty", "-m", "one"]);
+        let one = run(&["rev-parse", "HEAD"]);
+        run(&["commit", "-q", "--allow-empty", "-m", "two"]);
+        let two = run(&["rev-parse", "HEAD"]);
+        let git_dir = dir.path().join(".git");
+        assert!(is_ancestor(&git_dir, &one, &two).unwrap());
+        assert!(is_ancestor(&git_dir, &two, &two).unwrap());
+        assert!(!is_ancestor(&git_dir, &two, &one).unwrap());
+        assert!(is_ancestor(&git_dir, &"0".repeat(40), &two).is_err());
+        assert!(is_ancestor(&git_dir, "--all", &two).is_err());
+    }
+
     #[test]
     fn short_commits() {
         assert_eq!(short("0123456789abcdef"), "0123456789ab");

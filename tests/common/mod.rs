@@ -165,6 +165,7 @@ pub fn spec(cmd: &[&str]) -> JobSpec {
             carried: vec![],
         },
         workspace: None,
+        advance: false,
         cmd: cmd.iter().map(|s| s.to_string()).collect(),
         env: BTreeMap::new(),
         unset_env: Default::default(),

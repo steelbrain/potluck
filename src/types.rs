@@ -369,6 +369,11 @@ pub struct JobSpec {
     pub repo: RepoRef,
     /// Run inside this existing workspace, on its machine only.
     pub workspace: Option<WorkspaceId>,
+    /// `--advance` (only with `workspace`): the workspace may be at an ancestor of the commit, and
+    /// is checked out at it when the job starts, its untracked and ignored files kept. False in
+    /// records from before it.
+    #[serde(default)]
+    pub advance: bool,
     /// argv, run in the workspace's root. Not run through a shell.
     pub cmd: Vec<String>,
     /// From the committed potluck.toml and `--env`, already merged by the client.
@@ -634,6 +639,10 @@ pub struct WorkspaceRecord {
     pub pending: u32,
     /// Disk use, refreshed by the daemon now and then.
     pub size_bytes: Option<u64>,
+    /// The job that last moved it to another commit (`dispatch --advance`), if one did: a job
+    /// queued into it at its commit before then fails at start, saying so.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advanced_by: Option<JobId>,
 }
 
 /// A held workspace, as every response reminds its owner.
@@ -1054,6 +1063,40 @@ mod tests {
         assert_eq!(effective_priority(3, u32::MAX), 4);
         assert_eq!(effective_priority(1, 2), 3);
         assert_eq!(effective_priority(5, u32::MAX), 5);
+    }
+
+    /// Records written before `--advance` (0.1.0, in the store or a restart's handover) load: the
+    /// spec doesn't advance and the workspace was moved by no job; and a workspace no job moved
+    /// is written as before.
+    #[test]
+    fn records_from_before_advance_load() {
+        let spec: JobSpec = serde_json::from_str(
+            r#"{"key":null,"labels":{},"priority":3,
+                "request":{"ram_mib":4096,"cpu":1,"gpus":[],"exclusive":false},"on":{},
+                "repo":{"id":"app-0011aabb","source":"/src/app/.git",
+                        "commit":"0123456789abcdef0123456789abcdef01234567","branch":null,
+                        "submodules":[]},
+                "workspace":"studio-w5","cmd":["true"],"env":{},"timeout_ms":60000,
+                "hold_ms":null,"keep":[],"rerun_if_lost":false,"kill_on_stall":false,
+                "recipe":null,"submitted_from":"studio"}"#,
+        )
+        .unwrap();
+        assert!(!spec.advance);
+        let old = r#"{"id":"studio-w5","node":"studio","repo_id":"app-0011aabb",
+            "commit":"0123456789abcdef0123456789abcdef01234567","branch":null,"path":"/w",
+            "state":"held","created_at":1,"last_used_at":1,"held_until":2,"pending":0,
+            "size_bytes":null}"#;
+        let ws: WorkspaceRecord = serde_json::from_str(old).unwrap();
+        assert_eq!(ws.advanced_by, None);
+        let again = serde_json::to_value(&ws).unwrap();
+        assert!(again.get("advanced_by").is_none(), "{again}");
+        let moved = WorkspaceRecord {
+            advanced_by: Some("studio-8".into()),
+            ..ws
+        };
+        let back: WorkspaceRecord =
+            serde_json::from_str(&serde_json::to_string(&moved).unwrap()).unwrap();
+        assert_eq!(back, moved);
     }
 
     #[test]

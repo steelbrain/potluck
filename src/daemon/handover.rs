@@ -1690,6 +1690,7 @@ mod tests {
                     carried: Vec::new(),
                 },
                 workspace: None,
+                advance: false,
                 cmd: vec!["true".into()],
                 env: BTreeMap::new(),
                 unset_env: Default::default(),
@@ -1815,6 +1816,7 @@ mod tests {
                     held_until: 0,
                     pending: 0,
                     size_bytes: None,
+                    advanced_by: None,
                 },
             );
             let mut j = job(id, JobState::Starting);

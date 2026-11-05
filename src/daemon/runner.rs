@@ -8,6 +8,7 @@ use super::{Logger, Options, Shared, panic_text};
 use crate::cli::fmt_mib;
 use crate::config::{NodeConfig, Paths};
 use crate::exec::{Executor, Launch, Limits, Sample};
+use crate::gitinfo::short;
 use crate::store::Store;
 use crate::types::{
     EXIT_CANCELLED, EXIT_LOST, EXIT_OVER_MEMORY, EXIT_TIMEOUT, ExitStatus, Facts, Grant, Handle,
@@ -1329,6 +1330,7 @@ fn claim(
                 held_until: 0,
                 pending: 0,
                 size_bytes: None,
+                advanced_by: None,
             },
         );
     } else if let Some(ws) = st.workspaces.get_mut(&ws_id) {
@@ -1548,6 +1550,11 @@ fn prepare_and_start(sh: &Arc<Shared>, id: &str) -> Result<(), NotStarted> {
         wsp.create(&ws.id, &job.spec.repo)
             .map_err(|e| failed(format!("could not seed workspace {}: {e:#}", ws.id)))?
     } else {
+        if job.spec.advance {
+            advance(sh, &job, &ws)?;
+        } else if ws.commit != job.spec.repo.commit {
+            return Err(failed(moved_on(&job, &ws)));
+        }
         wsp.verify(&ws.path, &job.spec.repo)
             .map_err(|e| failed(format!("workspace {} failed verification: {e:#}", ws.id)))?;
         ws.path.clone()
@@ -1680,6 +1687,62 @@ fn prepare_and_start(sh: &Arc<Shared>, id: &str) -> Result<(), NotStarted> {
     sh.notify();
     sh.kick();
     Ok(())
+}
+
+/// `--advance`: before the job starts in workspace `ws`, checks it out at the job's commits
+/// ([`WorkspaceProvider::advance`](super::WorkspaceProvider::advance)), which must descend from the
+/// commit it is at now; then the workspace's record is at the job's commit, which its holds and
+/// reminders show, and names the job as the one that moved it.
+fn advance(sh: &Arc<Shared>, job: &JobRecord, ws: &WorkspaceRecord) -> Result<(), NotStarted> {
+    let (from, to) = (&ws.commit, &job.spec.repo.commit);
+    sh.parts
+        .workspaces
+        .advance(&ws.id, &ws.path, from, &job.spec.repo)
+        .map_err(|e| {
+            let by = ws
+                .advanced_by
+                .as_ref()
+                .map(|by| format!(", where job {by} moved it with --advance,"))
+                .unwrap_or_default();
+            NotStarted::Failed(format!(
+                "workspace {} can't advance from commit {}{by} to {}: {e:#}; dispatch without --workspace to run {} in a new workspace",
+                ws.id,
+                short(from),
+                short(to),
+                short(to)
+            ))
+        })?;
+    if from != to {
+        let mut st = sh.lock();
+        if let Some(w) = st.workspaces.get_mut(&ws.id) {
+            w.commit = to.clone();
+            w.advanced_by = Some(job.id.clone());
+        }
+        st.save_ws(&ws.id);
+        st.log.log(format!(
+            "{}: workspace {} advanced from {} to {}",
+            job.id,
+            ws.id,
+            short(from),
+            short(to)
+        ));
+    }
+    Ok(())
+}
+
+/// Why a job dispatched into workspace `ws` (without `--advance`) at the commit it was at can't
+/// start there: a job with `--advance` moved it to another commit meanwhile.
+fn moved_on(job: &JobRecord, ws: &WorkspaceRecord) -> String {
+    let (at, this) = (short(&ws.commit), short(&job.spec.repo.commit));
+    let by = ws
+        .advanced_by
+        .as_ref()
+        .map(|by| format!(": job {by} moved it there with --advance"))
+        .unwrap_or_default();
+    format!(
+        "workspace {} is at commit {at} now, not {this}{by}; dispatch without --workspace to run {this}",
+        ws.id
+    )
 }
 
 /// Ends an invocation whose ending is decided: copies its keep files, lets the executor clean up
@@ -2495,6 +2558,7 @@ mod tests {
                 carried: vec![],
             },
             workspace: None,
+            advance: false,
             cmd: vec!["true".into()],
             env: BTreeMap::new(),
             unset_env: Default::default(),

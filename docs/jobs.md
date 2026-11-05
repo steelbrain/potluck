@@ -27,7 +27,7 @@ don't count. A job dispatched into an existing workspace (`--workspace W`) gets 
 a submodule that W's first dispatch shipped is there even if this one leaves it out, and a
 dispatch that ships one W was made without fails (`workspace W failed verification: submodule
 PATH (...) is not a checkout`). Leave out the same submodules in every dispatch into one
-workspace.
+workspace; with `--advance`, a dispatch whose submodules aren't W's fails when it starts.
 `dispatch` names what it left out on stderr (with `--json`, `without_submodules`). A pattern that
 matches no submodule of the commit is refused, so a typo can't ship what it meant to leave out;
 one that names a submodule inside another left out counts as matched.
@@ -179,6 +179,12 @@ $ potluck dispatch --timeout 10m --on linux=7.2 -- cargo test
 potluck: no machine could ever run this job (studio: needs linux=7.2 (this machine: macOS 27.0.1))
 ```
 
+`--workspace W` runs the job in the existing workspace W, on W's machine, at W's commit. With
+`--advance` the job's commit may also descend from W's: when the job starts, W is checked out at
+it, its tracked files are reset to the commit, and its untracked and ignored files (build output)
+are kept. A job that can't advance W, because its submodules aren't W's or another `--advance`
+moved W elsewhere first, fails at start; see [Workspaces](workspaces.md).
+
 ## Order
 
 Jobs start by priority, `--priority 1` to `5` (5 highest, default 3), then by submit time. A job
@@ -308,9 +314,9 @@ with the job, as do processes the command leaves running when it exits. Its envi
 with the request's env on top and without the variables it unsets (`--unset-env`, a recipe's
 `unset_env`), except potluck's own variables, which stay the job's. A request that
 doesn't fit fails at once with exit code 2, and so does one with `--keep`, `--hold`, `--key`,
-`--label`, `--no-rerun`, `--kill-on-stall`, `--without-submodule` or `--carry`, which only mean
-something for a job of its own; a recipe's `keep`, `hold` and `without_submodules` are left out,
-and `dispatch` says so. It never waits for the job's own resources, so a job can't deadlock on
+`--label`, `--no-rerun`, `--kill-on-stall`, `--without-submodule`, `--carry` or `--advance`, which
+only mean something for a job of its own; a recipe's `keep`, `hold` and `without_submodules` are
+left out, and `dispatch` says so. It never waits for the job's own resources, so a job can't deadlock on
 itself; for the same reason `potluck wait` and `potluck logs -f` of the job's own id fail at once
 inside it, with exit code 2. The job runs the
 `potluck` its `PATH` finds, and that `PATH` comes from the login environment, so potluck's directory

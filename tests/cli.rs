@@ -621,6 +621,7 @@ fn dispatch_flags_override_and_json() {
             "b",
             "--workspace",
             "msi-w7",
+            "--advance",
             "--hold",
             "1m",
             "--kill-on-stall",
@@ -655,6 +656,7 @@ fn dispatch_flags_override_and_json() {
     assert_eq!(spec.timeout_ms, 15 * 60_000, "the recipe's timeout");
     assert_eq!(spec.hold_ms, Some(5 * 60_000), "holds are at least 5m");
     assert_eq!(spec.workspace.as_deref(), Some("msi-w7"));
+    assert!(spec.advance);
     assert!(
         !spec.rerun_if_lost,
         "a pinned workspace is never rerun elsewhere"
@@ -988,6 +990,17 @@ fn usage_errors_exit_2_and_json_errors_are_one_document() {
             .as_str()
             .unwrap()
             .contains("--bogus")
+    );
+    // --advance moves an existing workspace: without --workspace it is refused before anything
+    // is asked of a daemon.
+    let r =
+        run(potluck(home.path()).args(["dispatch", "--timeout", "1m", "--advance", "--", "true"]));
+    assert_eq!(r.code, 2);
+    assert!(
+        r.stderr.contains("required arguments were not provided")
+            && r.stderr.contains("--workspace"),
+        "{}",
+        r.stderr
     );
     let r = run(potluck(home.path()).args(["status"]));
     assert_eq!(r.code, 2);
@@ -2423,6 +2436,10 @@ fn nested_dispatch_refuses_options_it_cannot_honour() {
             &["--carry", "../dep"][..],
             "with the mirrors job studio-9's dispatch carried commits into",
         ),
+        (
+            &["--advance", "--workspace", "msi-w3"][..],
+            "which stays at the commit job studio-9 runs",
+        ),
     ] {
         let mut args = vec!["dispatch", "--timeout", "1m"];
         args.extend_from_slice(extra);
@@ -2621,6 +2638,7 @@ fn status_daemon() -> FakeDaemon {
                     held_until: now + 30 * 60_000 + 999,
                     pending: 0,
                     size_bytes: Some(3 << 30),
+                    advanced_by: None,
                 };
                 conn.send(Response::Status {
                     status: Box::new(StatusView {
@@ -2666,6 +2684,7 @@ fn status_daemon() -> FakeDaemon {
                     held_until: 0,
                     pending: 0,
                     size_bytes: None,
+                    advanced_by: None,
                 };
                 ws_rec.held_until = now + duration_ms;
                 conn.send(Response::Workspace { workspace: Box::new(ws_rec) })
