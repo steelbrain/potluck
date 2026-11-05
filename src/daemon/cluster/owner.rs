@@ -165,6 +165,13 @@ pub(super) fn claim(
     }
 }
 
+/// Whether member `peer` may take this machine's queued job `j`: it sees the job in this machine's
+/// reports, and fetches the repositories the job names (before it claims the job, its mirrors
+/// sync). Any member, for now.
+pub(super) fn may_take(_j: &JobRecord, _peer: &str) -> bool {
+    true
+}
+
 /// A runner passed over these queued jobs: one pass each.
 pub(super) fn passed(sh: &Shared, c: &Cluster, jobs: &[JobId]) {
     let mut st = sh.lock();

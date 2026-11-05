@@ -7,7 +7,8 @@
 //!
 //! Control messages:
 //! - `report`: a member's [`MachineReport`]: its facts, load, own queue, workspaces and the jobs it
-//!   can't take yet for want of commits. Pulled about once a second from every live member, and
+//!   can't take yet for want of commits, as much of them as the asker may know (each member gets
+//!   its own, [`super::views::for_member`]). Pulled about once a second from every live member, and
 //!   pushed (`push`) by a member whose queue or load changed. A pull names the digest of the
 //!   report the asker holds (`have`); one that says the same is answered `unchanged`, with the
 //!   numbers of the report built now, not resent (a member's workspaces alone can run to

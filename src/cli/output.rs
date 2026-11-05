@@ -400,7 +400,8 @@ pub fn status_human(st: &StatusView, now: Millis) -> String {
                     fmt_mib(j.spec.request.ram_mib)
                 ),
                 or_dash(Some(gpus)),
-                shell_line(&j.spec.cmd, 50),
+                // Another machine's job: only its owner and its runner are told its command.
+                or_dash(Some(shell_line(&j.spec.cmd, 50))),
             ]
         })
         .collect();
@@ -444,7 +445,7 @@ pub fn status_human(st: &StatusView, now: Millis) -> String {
                 fmt_ms(now.saturating_sub(j.submitted_at)),
                 needs.join(", "),
                 or_dash(Some(on)),
-                shell_line(&j.spec.cmd, 50),
+                or_dash(Some(shell_line(&j.spec.cmd, 50))),
             ]
         })
         .collect();

@@ -5043,3 +5043,159 @@ fn a_reconcile_answer_stops_only_the_answering_owners_jobs() {
     a.done(&theirs);
     b.done(&own);
 }
+
+/// `report` of `of`, as `asker` gets it.
+fn report_to(asker: &Node, of: &str) -> Value {
+    let mesh = client_mesh(asker);
+    let r = mesh.call(of, serde_json::json!({"op": "report"})).unwrap();
+    mesh.stop();
+    assert_eq!(r["kind"], "report", "{r}");
+    r["report"].clone()
+}
+
+/// The entry of job `id` in a report's `list` (`running`, `queue`).
+fn entry_of(report: &Value, list: &str, id: &str) -> Value {
+    report[list]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|j| j["id"] == id)
+        .cloned()
+        .unwrap_or_else(|| panic!("{id} is not in {list}: {report}"))
+}
+
+/// What a member's report tells each other member: no lease tokens; of a job running there, its
+/// command, env, unset env, kept-file globs, labels and source paths only to its owner; of a
+/// queued job, no command, env, unset env or source paths (the grant brings them to the machine
+/// that claims it); no workspace paths. `status` on a third machine shows such jobs without them.
+#[test]
+fn reports_tell_each_member_only_what_it_needs() {
+    use serde_json::json;
+    let w = World::new();
+    let a = w.node("a").start();
+    let b = w.node("b").start();
+    let c = w.node("c").start();
+    pair(&a, &b);
+    pair(&a, &c);
+    wait_until("b and c see each other", || {
+        b.node_alive("c") && c.node_alive("b")
+    });
+    let spec = [
+        "--env",
+        "SECRET=s3cret",
+        "--unset-env",
+        "HTTPS_PROXY",
+        "--label",
+        "team=x",
+        "--keep",
+        "out.txt",
+        "--on",
+        "node=b",
+    ];
+    let mut args = spec.to_vec();
+    args.extend(["--exclusive", "--", "sleep", "60"]);
+    let running = a.dispatch(&args);
+    a.running_on(&running, "b");
+    // b runs the exclusive one, so this one waits in a's queue.
+    let mut args = spec.to_vec();
+    args.extend(["--", "sleep", "60"]);
+    let queued = a.dispatch(&args);
+
+    let to_c = report_to(&c, "b");
+    let j = entry_of(&to_c, "running", &running);
+    assert_eq!(
+        (
+            &j["spec"]["cmd"],
+            &j["spec"]["env"],
+            &j["spec"]["unset_env"],
+            &j["spec"]["keep"],
+            &j["spec"]["labels"],
+            &j["spec"]["repo"]["source"],
+            &j["lease"]["token"],
+        ),
+        (
+            &json!([]),
+            &json!({}),
+            &json!([]),
+            &json!([]),
+            &json!({}),
+            &json!(""),
+            &json!("")
+        ),
+        "{j}"
+    );
+    // What c plans with and shows.
+    assert_eq!(j["lease"]["grant"]["exclusive"], true, "{j}");
+    assert!(j["lease"]["deadline"].as_u64().unwrap() > now_ms(), "{j}");
+    assert_eq!(j["spec"]["timeout_ms"], 60_000, "{j}");
+    let workspaces = to_c["workspaces"].as_array().unwrap();
+    assert!(!workspaces.is_empty(), "{to_c}");
+    assert!(workspaces.iter().all(|w| w["path"] == ""), "{to_c}");
+
+    // a owns it: the whole spec, but no token.
+    let j = entry_of(&report_to(&a, "b"), "running", &running);
+    assert_eq!(j["spec"]["cmd"], json!(["sleep", "60"]), "{j}");
+    assert_eq!(j["spec"]["env"]["SECRET"], "s3cret", "{j}");
+    assert_eq!(j["lease"]["token"], "", "{j}");
+
+    // a's queue, to b and to c alike.
+    for asker in [&b, &c] {
+        let q = entry_of(&report_to(asker, "a"), "queue", &queued);
+        assert_eq!(
+            (
+                &q["spec"]["cmd"],
+                &q["spec"]["env"],
+                &q["spec"]["unset_env"],
+                &q["spec"]["repo"]["source"],
+            ),
+            (&json!([]), &json!({}), &json!([]), &json!("")),
+            "{}: {q}",
+            asker.name
+        );
+        assert_eq!(q["spec"]["labels"]["team"], "x", "{q}");
+        assert_eq!(q["spec"]["keep"], json!(["out.txt"]), "{q}");
+        assert_eq!(q["spec"]["on"]["node"], "b", "{q}");
+        assert_eq!(
+            q["spec"]["repo"]["commit"].as_str().unwrap().len(),
+            40,
+            "{q}"
+        );
+    }
+
+    // c's status shows both, without their commands.
+    wait_until("c's status lists both", || {
+        let st = c.cli_ok(&["status"]);
+        let has = |list: &str, id: &str| {
+            st[list]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|j| j["id"] == id && j["spec"]["cmd"] == json!([]))
+        };
+        has("running", &running) && has("queued", &queued)
+    });
+    let out = Command::new(BIN)
+        .arg("status")
+        .current_dir(&c.repo)
+        .env("POTLUCK_HOME", &c.paths.home)
+        .env("POTLUCK_CONFIG", &c.paths.config)
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    for id in [&running, &queued] {
+        let line = text
+            .lines()
+            .find(|l| l.starts_with(&format!("{id} ")))
+            .unwrap_or_else(|| panic!("{id}: {text}"));
+        assert!(line.ends_with("  -"), "{line}");
+    }
+
+    // Granted, b runs the queued one with its whole spec.
+    a.cli_ok(&["cancel", &running]);
+    a.running_on(&queued, "b");
+    let launch = b.exec.launch_of(&queued).unwrap();
+    assert_eq!(launch.env.get("SECRET").map(String::as_str), Some("s3cret"));
+    assert_eq!(b.get(&queued).spec.cmd, ["sleep", "60"]);
+    a.cli_ok(&["cancel", &queued]);
+    a.done(&queued);
+}

@@ -156,7 +156,11 @@ syncing shows in `why` as a `sync` blocker.
 ## Queue and claims
 
 Each machine keeps the queue of the jobs dispatched on it. Members exchange queues about once a
-second and whenever one changes, so every member sees every queue. Each machine plans for itself
+second and whenever one changes, so every member sees every queue. What members tell each other
+of a job leaves out its command, env and the paths of its repositories (and, while it runs,
+its labels and `--keep` globs), except to the job's dispatching machine; the machine that claims
+a job gets all of it with the grant. So `status` on a machine that neither dispatched nor runs a
+job shows it without its command (`-`), and other members' workspaces without their paths. Each machine plans for itself
 and claims a job from its dispatching machine only when it can start it now. The dispatching
 machine grants each job once; a machine whose claim is refused plans again. A machine with no
 workspace of the job's repository leaves the job for 3 seconds when a member with one could start

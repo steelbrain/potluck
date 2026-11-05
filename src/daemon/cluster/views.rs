@@ -9,9 +9,10 @@ use crate::daemon::state::{MachineSnap, State};
 use crate::mesh::Member;
 use crate::proto::{NodeView, Response, StatusView};
 use crate::sched::{MachineView, Queued, Running};
-use crate::types::{Facts, JobId, JobRecord, JobState, Millis, NodeName, WorkspaceRecord};
+use crate::types::{Facts, JobId, JobRecord, JobState, Millis, NodeName, RepoRef, WorkspaceRecord};
 use crate::why::Snapshot;
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -20,7 +21,7 @@ use std::time::Duration;
 const RECENT: usize = 20;
 const PULL_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// This machine's report.
+/// This machine's report, whole: what goes to a member is [`for_member`] of it.
 pub(super) fn own_report(sh: &Shared, c: &Cluster) -> MachineReport {
     let st = sh.lock();
     let cs = c.cs();
@@ -74,6 +75,51 @@ fn build_report(st: &State, cs: &CState) -> MachineReport {
         // Numbered by own_report.
         started_at: 0,
         seq: 0,
+    }
+}
+
+/// What this machine's `report` tells member `to`: what it plans with and `status`, `why` and
+/// `nodes` show, and no more. No lease tokens. Of a job running here that `to` doesn't own, no
+/// command, environment, kept-file globs, labels or source paths; of a queued job, no command,
+/// environment or source paths (the machine that claims it gets the whole spec with its grant);
+/// only the queued jobs `to` may take ([`super::owner::may_take`]); and no workspace paths.
+pub(super) fn for_member(mut report: MachineReport, to: &str) -> MachineReport {
+    for j in &mut report.running {
+        if let Some(l) = &mut j.lease {
+            l.token.clear();
+        }
+        if owner_of(&j.id) != to {
+            let spec = &mut j.spec;
+            spec.cmd.clear();
+            spec.env.clear();
+            spec.unset_env.clear();
+            spec.keep.clear();
+            spec.labels.clear();
+            no_sources(&mut spec.repo);
+        }
+    }
+    report.queue.retain(|j| super::owner::may_take(j, to));
+    for j in &mut report.queue {
+        let spec = &mut j.spec;
+        spec.cmd.clear();
+        spec.env.clear();
+        spec.unset_env.clear();
+        no_sources(&mut spec.repo);
+    }
+    for w in &mut report.workspaces {
+        w.path = PathBuf::new();
+    }
+    report
+}
+
+/// A dispatch's repositories without where they are on the dispatching machine.
+fn no_sources(repo: &mut RepoRef) {
+    repo.source = PathBuf::new();
+    for s in &mut repo.submodules {
+        s.source = PathBuf::new();
+    }
+    for c in &mut repo.carried {
+        c.source = PathBuf::new();
     }
 }
 
@@ -211,7 +257,7 @@ pub(super) fn pulls_and_pushes(sh: &Arc<Shared>, c: &Arc<Cluster>, now: u64) {
     if !pushes.is_empty() {
         let report = own_report(sh, c);
         for n in pushes {
-            let report = report.clone();
+            let report = for_member(report.clone(), &n);
             sh.spawn_worker(&format!("push-{n}"), move |sh| {
                 let Some(c) = sh.cluster() else {
                     return;
@@ -720,7 +766,11 @@ pub(crate) fn workspace_changed(sh: &Shared, c: &Cluster, node: &str, ws: &Works
         if let Some(r) = cs.reports.get_mut(node)
             && let Some(w) = r.report.workspaces.iter_mut().find(|w| w.id == ws.id)
         {
-            *w = ws.clone();
+            // Without its path, as in `node`'s reports.
+            *w = WorkspaceRecord {
+                path: PathBuf::new(),
+                ..ws.clone()
+            };
         }
     }
     let full = PeerRequest::Report { have: None };

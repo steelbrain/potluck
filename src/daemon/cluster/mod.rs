@@ -1000,7 +1000,7 @@ fn handle_call(
 ) -> Result<PeerResponse, String> {
     Ok(match req {
         PeerRequest::Report { have } => {
-            let mut report = views::own_report(sh, c);
+            let mut report = views::for_member(views::own_report(sh, c), from);
             match have {
                 Some(h) if report.digest() == h => PeerResponse::Unchanged {
                     started_at: report.started_at,

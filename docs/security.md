@@ -7,10 +7,13 @@
   certificate authorities or host names involved. Control messages, git objects, logs and file
   copies all travel over these connections, encrypted and authenticated.
 - Each member's reports carry its queued jobs and the jobs running on it to every other member,
-  their env (`--env` and the committed `potluck.toml`'s) included, and `potluck env NODE` brings
-  NODE's whole login environment to the member that asks. A secret in either reaches other
-  members, over the connections above only. A member can read it anyway, through a job it runs
-  on that machine.
+  without their command, env (`--env`, the committed `potluck.toml`'s, `--unset-env`) or the
+  paths of their repositories on the dispatching machine, and a running job also without its
+  labels and kept-file globs; the job's dispatching machine gets all of a job running elsewhere.
+  Reports carry no lease tokens and no workspace paths. A job's whole spec, env included, goes to
+  the machine that claims it, with its grant, and `potluck env NODE` brings NODE's whole login
+  environment to the member that asks. A secret in either reaches that machine, over the
+  connections above only. A member can read it anyway, through a job it runs on that machine.
 - The pairing request and reply are neither secret nor encrypted. Pairing relies on you carrying
   them between your own shells: a key you `admit` becomes a member, and the reply you give
   `pair --finish` decides which cluster the new machine joins.
