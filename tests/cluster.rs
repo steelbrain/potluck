@@ -766,8 +766,14 @@ impl Node {
 
     /// The CLI run in repository `dir`.
     fn cli_in(&self, dir: &Path, args: &[&str]) -> Out {
-        let out = Command::new(BIN)
-            .arg("--json")
+        self.cli_keyed(dir, None, args)
+    }
+
+    /// The CLI run in repository `dir`, its user key the file `user_key` ($POTLUCK_USER_KEY), or
+    /// with None user.key beside this node's node.toml.
+    fn cli_keyed(&self, dir: &Path, user_key: Option<&Path>, args: &[&str]) -> Out {
+        let mut cmd = Command::new(BIN);
+        cmd.arg("--json")
             .args(args)
             .current_dir(dir)
             .env("POTLUCK_HOME", &self.paths.home)
@@ -777,9 +783,11 @@ impl Node {
             .env_remove("POTLUCK_WORKSPACE")
             // Each node's user key is user.key beside its node.toml.
             .env_remove("POTLUCK_USER_KEY")
-            .stdin(Stdio::null())
-            .output()
-            .unwrap();
+            .stdin(Stdio::null());
+        if let Some(k) = user_key {
+            cmd.env("POTLUCK_USER_KEY", k);
+        }
+        let out = cmd.output().unwrap();
         let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
         let json = stdout
             .lines()
@@ -829,6 +837,21 @@ impl Node {
         all.extend_from_slice(args);
         let v = self.cli_ok(&all);
         v["job"].as_str().unwrap().to_string()
+    }
+
+    /// [`Node::dispatch`] from this node's command line holding the user key `user`'s command
+    /// line made (user.key beside its node.toml).
+    fn dispatch_signed_by(&self, user: &Node, args: &[&str]) -> String {
+        let mut all = vec!["dispatch", "--timeout", "60s"];
+        all.extend_from_slice(args);
+        let key = user.dir.join("user.key");
+        let o = self.cli_keyed(&self.repo, Some(&key), &all);
+        assert_eq!(
+            o.code, 0,
+            "{}: potluck {all:?} with {}'s user key: {}\n{}",
+            self.name, user.name, o.stdout, o.stderr
+        );
+        o.json["job"].as_str().unwrap().to_string()
     }
 
     fn client(&self) -> Client {
@@ -881,6 +904,16 @@ impl Node {
     /// Where the mesh listens, if it does.
     fn listening(&self) -> Option<std::net::SocketAddr> {
         self.daemon.as_ref().unwrap().cluster_addr()
+    }
+
+    /// Job `job` as this machine's store holds it (the daemon writes each change there at once):
+    /// a runner's own record of another machine's job, which `get` would ask of the job's owner.
+    fn stored(&self, job: &str) -> JobRecord {
+        let db = rusqlite::Connection::open(self.paths.db()).unwrap();
+        let json: String = db
+            .query_row("SELECT json FROM jobs WHERE id = ?1", [job], |r| r.get(0))
+            .unwrap_or_else(|e| panic!("{}: no record of {job} in its store: {e}", self.name));
+        serde_json::from_str(&json).unwrap()
     }
 
     /// A value the daemon keeps in its store's `kv` table, read as it stands now.
@@ -5435,7 +5468,7 @@ fn after_user_init_jobs_are_signed_and_checked_where_they_run() {
     assert_eq!(auth.key, user.public());
     assert_eq!(potluck::jobauth::open(&auth).unwrap().submitted_from, "a");
     a.running_on(&job, "b");
-    assert_eq!(b.get(&job).spec.auth.unwrap().key, user.public());
+    assert_eq!(b.stored(&job).spec.auth.unwrap().key, user.public());
     wait_until("a has b's line", || output_of(&a, &job).contains("on b"));
 
     // b is lost: c, admitted since with the user's key, runs the same signed job.
@@ -5449,7 +5482,7 @@ fn after_user_init_jobs_are_signed_and_checked_where_they_run() {
         "{j:#?}"
     );
     assert_eq!(j.spec, signed);
-    assert_eq!(c.get(&job).spec.auth, Some(auth.clone()));
+    assert_eq!(c.stored(&job).spec.auth, Some(auth.clone()));
     assert!(output_of(&a, &job).contains("requeued: b was lost"));
 
     // c's command line has no user key.
@@ -5805,7 +5838,7 @@ fn a_forged_or_unsigned_job_from_another_owner_is_never_run() {
         ),
         "{log}"
     );
-    assert_eq!(b.get("c-905").spec.cmd, ["true"]);
+    assert_eq!(b.stored("c-905").spec.cmd, ["true"]);
     mesh.stop();
 }
 
@@ -5878,15 +5911,19 @@ fn after_user_init_a_relayed_request_needs_a_users_signature() {
     init_users(&a, &[&a, &b, &c]);
     let user = user_key_of(&a);
 
-    // b's jobs and workspace, from the user's command line on a.
-    let made = b.dispatch(&[
-        "--on",
-        "node=b",
-        "--",
-        "sh",
-        "-c",
-        "echo made > made.txt; echo out",
-    ]);
+    // b's jobs and workspace (dispatched on b with the user's key), from the user's command line
+    // on a.
+    let made = b.dispatch_signed_by(
+        &a,
+        &[
+            "--on",
+            "node=b",
+            "--",
+            "sh",
+            "-c",
+            "echo made > made.txt; echo out",
+        ],
+    );
     let ws = b.done(&made).workspace.unwrap();
     assert_eq!(a.cli_ok(&["wait", &made])["state"], "succeeded");
     assert_eq!(a.get(&made).state, JobState::Succeeded);
@@ -5902,7 +5939,7 @@ fn after_user_init_a_relayed_request_needs_a_users_signature() {
             > now_ms()
     );
     assert_eq!(a.cli_ok(&["env", "b"])["node"], "b");
-    let long = b.dispatch(&["--on", "node=b", "--", "sleep", "30"]);
+    let long = b.dispatch_signed_by(&a, &["--on", "node=b", "--", "sleep", "30"]);
     b.running_on(&long, "b");
     a.cli_ok(&["cancel", &long]);
     assert_eq!(b.done(&long).state, JobState::Cancelled);
