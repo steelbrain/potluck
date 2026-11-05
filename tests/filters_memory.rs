@@ -2,6 +2,8 @@
 //! a piece at a time: a big file costs no more memory than a small one. A test binary of its own,
 //! for its allocator, which counts what the process holds at most.
 
+mod common;
+
 use potluck::gitinfo;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::path::{Path, PathBuf};

@@ -1,6 +1,8 @@
 //! `potluck _supervise` as its own process, for what needs a whole process: its signal handling.
 //! Its stdout is a log file, as the executors arrange.
 
+mod common;
+
 use potluck::types::ExitStatus;
 use std::os::unix::process::CommandExt;
 use std::path::Path;

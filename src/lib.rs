@@ -30,5 +30,21 @@ pub mod update;
 pub mod why;
 pub mod workspace;
 
+/// The developer's `$POTLUCK_USER_KEY` is no unit test's: it is cleared before main, so nothing
+/// a test runs reads, signs with or makes that key (tests/common does the same for every test
+/// binary).
+#[cfg(test)]
+#[used]
+#[cfg_attr(target_os = "macos", unsafe(link_section = "__DATA,__mod_init_func"))]
+#[cfg_attr(target_os = "linux", unsafe(link_section = ".init_array"))]
+static NO_USER_KEY: extern "C" fn() = {
+    extern "C" fn clear() {
+        // SAFETY: this runs before main, while the test process has one thread, so nothing else
+        // reads or writes the environment meanwhile.
+        unsafe { std::env::remove_var("POTLUCK_USER_KEY") };
+    }
+    clear
+};
+
 /// This build's version; members talk only to members on the same version.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

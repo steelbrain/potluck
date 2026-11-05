@@ -3,6 +3,8 @@
 //! Temp dirs live under Cargo's target tmp dir (`CARGO_TARGET_TMPDIR`), which must be on a
 //! copy-on-write filesystem: the system temp dir often isn't (tmpfs on many Linux machines).
 
+mod common;
+
 use potluck::config::Paths;
 use potluck::types::{RepoRef, WorkspaceRecord, WorkspaceState};
 use potluck::workspace::Workspaces;

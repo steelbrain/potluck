@@ -16,6 +16,23 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
+/// The developer's `$POTLUCK_USER_KEY` is no test's. Every test binary has this module, and this
+/// clears the variable before main, so nothing a test runs reads, signs with or makes that key:
+/// not the command line, in-process or as the binary, nor a daemon or a job it starts (they get
+/// the test's environment). A command line then finds its user key at user.key beside its
+/// node.toml, in the test's temporary directory, unless the test names another file.
+#[used]
+#[cfg_attr(target_os = "macos", unsafe(link_section = "__DATA,__mod_init_func"))]
+#[cfg_attr(target_os = "linux", unsafe(link_section = ".init_array"))]
+static NO_USER_KEY: extern "C" fn() = {
+    extern "C" fn clear() {
+        // SAFETY: this runs before main, while the test process has one thread, so nothing else
+        // reads or writes the environment meanwhile.
+        unsafe { std::env::remove_var("POTLUCK_USER_KEY") };
+    }
+    clear
+};
+
 /// One client connection, for the handler to answer on.
 pub struct Conn<'a> {
     stream: &'a mut UnixStream,

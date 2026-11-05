@@ -380,8 +380,6 @@ impl Node {
             .env("E2E_CALLER", "leaked")
             .env_remove("POTLUCK_JOB")
             .env_remove("POTLUCK_LEASE")
-            // The user key, once a test makes one, is user.key beside node.toml.
-            .env_remove("POTLUCK_USER_KEY")
             .stdin(Stdio::null())
             .output()
             .unwrap();

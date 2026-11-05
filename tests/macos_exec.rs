@@ -3,6 +3,8 @@
 //! checks that nothing is left, zombies included.
 #![cfg(target_os = "macos")]
 
+mod common;
+
 use potluck::exec::macos::{ProcessExecutor, exists, start_time};
 use potluck::exec::{Executor, Launch, Limits, Sample};
 use potluck::types::*;

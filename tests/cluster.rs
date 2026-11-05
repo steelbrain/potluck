@@ -781,8 +781,6 @@ impl Node {
             .env_remove("POTLUCK_JOB")
             .env_remove("POTLUCK_LEASE")
             .env_remove("POTLUCK_WORKSPACE")
-            // Each node's user key is user.key beside its node.toml.
-            .env_remove("POTLUCK_USER_KEY")
             .stdin(Stdio::null());
         if let Some(k) = user_key {
             cmd.env("POTLUCK_USER_KEY", k);
@@ -812,8 +810,6 @@ impl Node {
             .env_remove("POTLUCK_JOB")
             .env_remove("POTLUCK_LEASE")
             .env_remove("POTLUCK_WORKSPACE")
-            // Each node's user key is user.key beside its node.toml.
-            .env_remove("POTLUCK_USER_KEY")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -2165,7 +2161,6 @@ fn user_add_takes_a_key_that_starts_with_a_hyphen() {
         .current_dir(&a.repo)
         .env("POTLUCK_HOME", &a.paths.home)
         .env("POTLUCK_CONFIG", &a.paths.config)
-        .env_remove("POTLUCK_USER_KEY")
         .output()
         .unwrap();
     let out: Value = serde_json::from_slice(&o.stdout).unwrap();
@@ -5607,7 +5602,6 @@ fn user_init_signs_the_jobs_queued_before_it() {
         .current_dir(&a.repo)
         .env("POTLUCK_HOME", &a.paths.home)
         .env("POTLUCK_CONFIG", &a.paths.config)
-        .env_remove("POTLUCK_USER_KEY")
         .output()
         .unwrap();
     let (stdout, stderr) = (
@@ -5722,7 +5716,6 @@ fn a_job_runs_only_in_its_pools() {
         .arg("nodes")
         .env("POTLUCK_HOME", &d.paths.home)
         .env("POTLUCK_CONFIG", &d.paths.config)
-        .env_remove("POTLUCK_USER_KEY")
         .output()
         .unwrap();
     let text = String::from_utf8_lossy(&human.stdout);

@@ -6,6 +6,8 @@
 
 #![cfg(target_os = "linux")]
 
+mod common;
+
 use potluck::exec::linux::SystemdExecutor;
 use potluck::exec::{Executor, Launch, Limits, Sample};
 use potluck::types::{

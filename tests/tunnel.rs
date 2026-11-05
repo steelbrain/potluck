@@ -6,6 +6,8 @@
 //! fetches with the runner's POTLUCK_HOME and POTLUCK_CONFIG. The source advertises the address of
 //! a counting proxy in front of it, so a test can see how many bytes a fetch moved.
 
+mod common;
+
 use potluck::config::Paths;
 use potluck::mesh::{Handler, Mesh, MeshConfig, Peer, Stream};
 use potluck::tunnel;

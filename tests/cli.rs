@@ -16,22 +16,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-/// The developer's `$POTLUCK_USER_KEY` is no test's: it is cleared before main, so the command
-/// line these tests run, in this process and as the binary, finds no user key but user.key beside
-/// the fake daemon's node.toml (as tests/e2e.rs leaves it out of its command lines' environment).
-/// A command line with a user key signs its dispatches, asking the daemon its name first.
-#[used]
-#[cfg_attr(target_os = "macos", unsafe(link_section = "__DATA,__mod_init_func"))]
-#[cfg_attr(target_os = "linux", unsafe(link_section = ".init_array"))]
-static NO_USER_KEY: extern "C" fn() = {
-    extern "C" fn clear() {
-        // SAFETY: this runs before main, while the test process has one thread, so nothing else
-        // reads or writes the environment meanwhile.
-        unsafe { std::env::remove_var("POTLUCK_USER_KEY") };
-    }
-    clear
-};
-
 fn git(dir: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
         .arg("-C")
@@ -180,6 +164,25 @@ fn dispatched_spec(fake: &FakeDaemon) -> potluck::types::JobSpec {
             _ => None,
         })
         .expect("a dispatch request")
+}
+
+/// The developer's `$POTLUCK_USER_KEY` is no test's: every test binary has tests/common, which
+/// clears it before main, as it is here.
+#[test]
+fn every_test_binary_leaves_the_developers_user_key_alone() {
+    assert_eq!(std::env::var_os("POTLUCK_USER_KEY"), None);
+    let tests = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+    for entry in std::fs::read_dir(&tests).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_some_and(|e| e == "rs") {
+            let text = std::fs::read_to_string(&path).unwrap();
+            assert!(
+                text.lines().any(|l| l == "mod common;"),
+                "{} has no `mod common;`",
+                path.display()
+            );
+        }
+    }
 }
 
 /// The daemon answers a dispatch once the mirrors are synced (a first clone, or waiting for a

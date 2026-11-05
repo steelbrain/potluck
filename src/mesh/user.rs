@@ -157,14 +157,14 @@ mod tests {
         );
     }
 
+    /// The developer's `$POTLUCK_USER_KEY` is cleared before the tests start (src/lib.rs).
     #[test]
     fn the_key_lives_beside_node_toml_unless_the_variable_says() {
         let paths = Paths {
             home: PathBuf::from("/s/home"),
             config: PathBuf::from("/c/potluck/node.toml"),
         };
-        if std::env::var_os("POTLUCK_USER_KEY").is_none() {
-            assert_eq!(key_path(&paths), PathBuf::from("/c/potluck/user.key"));
-        }
+        assert_eq!(std::env::var_os("POTLUCK_USER_KEY"), None);
+        assert_eq!(key_path(&paths), PathBuf::from("/c/potluck/user.key"));
     }
 }
