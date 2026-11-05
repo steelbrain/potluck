@@ -167,7 +167,9 @@ priority.
   job, whatever its state, instead of queuing another. A key stays taken as long as its job's
   record is kept (`retention_days`, 14).
 - `--keep GLOB`, repeatable: files matching the glob, relative to the workspace, are copied to the
-  dispatching machine when the job ends, into `jobs/<job>/keep/` in its state directory. A glob that
+  dispatching machine when the job ends, into `jobs/<job>/keep/` in its state directory (not into
+  the directory you dispatched from). A trailing `**` keeps everything below: `results/**` keeps
+  every file under `results/`, and `**` the whole workspace. A glob that
   is absolute, holds `..` or doesn't parse is refused at dispatch. Symlinks and file names follow
   the rules of `potluck cp` (see [Workspaces](workspaces.md)). The output log is always kept there
   too, as `jobs/<job>/output.log`. Both are deleted after `retention_days`.

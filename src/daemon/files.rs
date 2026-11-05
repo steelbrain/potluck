@@ -295,13 +295,21 @@ pub(crate) fn keep(root: &Path, globs: &[String], dest: &Path, log: &Logger, job
             log.log(format!("{job}: keep: {e}"));
             continue;
         }
-        let matches = match glob_matches(&root, g) {
+        let mut matches = match glob_matches(&root, g) {
             Ok(m) => m,
             Err(e) => {
                 log.log(format!("{job}: keep: bad pattern {g:?}: {e}"));
                 continue;
             }
         };
+        // A trailing `**` keeps everything below: as `glob::glob` has it, `**` at the end matches
+        // only the directories below, so `results/**` kept none of the files in results/ itself.
+        // The directory it starts from is kept whole (one copy of each file, as above).
+        if let Some(parent) = g.strip_suffix("/**").or((g.as_str() == "**").then_some(""))
+            && let Ok(more) = glob_matches(&root, parent)
+        {
+            matches.extend(more);
+        }
         let mut any = false;
         for rel in matches {
             any |= copy_into(
@@ -763,6 +771,36 @@ mod tests {
                     .collect();
             assert_eq!(ours, theirs, "{g}");
         }
+    }
+
+    /// A trailing `**` keeps what is directly in the directory too, not only the directories below.
+    #[test]
+    fn keep_with_a_trailing_double_star_keeps_everything_below() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().join("ws");
+        std::fs::create_dir_all(root.join("results/sub")).unwrap();
+        for f in [
+            "results/a.log",
+            "results/fails.txt",
+            "results/sub/b.log",
+            "other.txt",
+        ] {
+            std::fs::write(root.join(f), b"x").unwrap();
+        }
+        let dest = d.path().join("job/keep");
+        let Kept { kept, failed } = keep_in_time(&root, &["results/**"], &dest);
+        assert!(failed.is_empty(), "{failed:?}");
+        assert_eq!(
+            kept,
+            [
+                "keep/results/a.log",
+                "keep/results/fails.txt",
+                "keep/results/sub/b.log"
+            ]
+        );
+        let all = d.path().join("all/keep");
+        let Kept { kept, .. } = keep_in_time(&root, &["**"], &all);
+        assert_eq!(kept.len(), 4, "{kept:?}");
     }
 
     /// A file matched more than once (by nested or overlapping globs, or by a second `keep` after
