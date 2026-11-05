@@ -310,5 +310,6 @@ if [ "$service" = none ]; then
         fi
     fi
     say "  potluck service install    (runs the daemon as a service)"
+    say "  potluck user init          (on the first machine: makes this command line's key the first user, which dispatch, admit and remove need)"
     say "  potluck pair               (on a machine joining a cluster: prints a line for \`potluck admit\` on a member)"
 fi

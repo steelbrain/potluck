@@ -80,6 +80,9 @@ a clone, the service and the daemon's log.
 On one machine, in a git repository with everything committed:
 
 ```console
+$ potluck user init
+me is the cluster's first user; signed in its member: studio
+potluck: made a user key at /Users/me/.config/potluck/user.key
 $ potluck dispatch --timeout 10m -- cargo test
 job studio-1
 workspace studio-w1
@@ -97,11 +100,13 @@ potluck: job studio-1 succeeded, exit code 0
 potluck: workspace studio-w1 on studio is held for this branch for 4m59s more (commit f988fe3f3570); `potluck release studio-w1` ends it
 ```
 
-`dispatch` queues the job at the commit HEAD points to and prints its id, and its workspace once
-it has started. `wait` streams the output from the start and exits with the job's exit code.
-`potluck logs studio-1` prints the output so far, and `--follow` follows it. The last line above
-is a reminder, which every potluck command run on this branch prints on stderr while one of its
-workspaces is held (see [Workspaces](docs/workspaces.md)).
+`user init`, run once, makes a user key for this command line and makes it the first user of a
+cluster with this machine in it: a user's key signs every dispatch, and `dispatch` refuses until
+the cluster has a user. `dispatch` queues the job at the commit HEAD points to and prints its id,
+and its workspace once it has started. `wait` streams the output from the start and exits with
+the job's exit code. `potluck logs studio-1` prints the output so far, and `--follow` follows it.
+The last line above is a reminder, which every potluck command run on this branch prints on stderr
+while one of its workspaces is held (see [Workspaces](docs/workspaces.md)).
 
 A queued job says what it waits for:
 
@@ -157,8 +162,8 @@ potluck wait "$job"
 A machine joins once, with the daemon running on it and on a member:
 
 1. On the new machine, `potluck pair` prints a request line.
-2. On any member, `potluck admit '<request>'` prints a reply line. A machine that isn't in a
-   cluster founds one with its first `admit`.
+2. On a member, `potluck admit '<request>'` signs the admission with the command line's user key
+   and prints a reply line. The first machine is a member once `potluck user init` has run there.
 3. On the new machine, `potluck pair --finish '<reply>'` joins the cluster.
 
 From then on a job dispatched on any member runs on whichever member can run it, and its output
@@ -200,7 +205,7 @@ between members and what happens when one is lost.
 | `pair`, `pair --finish REPLY` | Ask to join a cluster, and finish joining. |
 | `admit [--pool POOL] REQUEST` | Admit a machine, into POOL, and print the reply. |
 | `remove NODE` | Remove a machine from the cluster. |
-| `user init` | Make this command line's user key the cluster's first user. |
+| `user init` | Make this command line's user key the cluster's first user, founding a cluster of this machine if it is in none. |
 | `user add NAME KEY`, `user remove NAME`, `user list`, `user key` | Add, remove or list users; print this command line's key. |
 | `self-update [--here]` | Update this machine to the latest release, through the daemon or (`--here`) from this process; the other members follow. |
 | `restart` | Restart the daemon in place on the binary at its path, keeping running jobs and open connections. |

@@ -6,8 +6,8 @@
   `keys/node.key` in the state directory (mode 0600), which authenticates its connections. A user
   key is held by the command line, never by the daemon: `user.key` beside `node.toml`, or
   `$POTLUCK_USER_KEY` (mode 0600).
-- In a cluster with users (after `potluck user init`, see [Users](cluster.md#users)), only what a
-  user key signs has authority:
+- Only what a user key signs has authority (`potluck user init` makes a cluster's first user, see
+  [Users](cluster.md#users)):
   - admitting and removing machines and users;
   - each job, for the machine it was dispatched on: its command, env, commits, limits and pools;
   - each request one machine forwards to another (`wait`, `logs`, `why`, `cancel`, `resize`,
@@ -15,8 +15,11 @@
   
   Machines carry out signed work: they queue, claim and run signed jobs, send their output and
   kept files back, and pass records on. A machine key signs nothing that counts.
-- Without users, membership is full trust: any member can admit or remove machines, run commands
-  on any other member as the user who runs potluck there, and read its workspaces.
+- A cluster paired with potluck 0.1.1 has no users until `user init` runs there, and until then
+  the records its members' machine keys signed still count. Its members on this version dispatch,
+  admit and remove nothing, and run no other machine's job, until it has a user. Between members
+  still on 0.1.1, membership is full trust, as it was in 0.1.1: any of them can admit or remove
+  machines, run commands on another as the user who runs potluck there, and read its workspaces.
 - A machine that holds a user key is as trusted as the user. Any process running as that user
   there, jobs included, can read the key file and sign with it. Keep user keys on the machines you
   dispatch from.
@@ -88,10 +91,9 @@ tailnet addresses. For a machine whose root you don't trust, keep that ACL.
   that its removal doesn't list, and the records of machines whose only admission was one of
   those, are turned away; a member that took them before it heard of the removal drops them when
   its daemon next starts.
-- Without users, when removals cross (A removes B while B removes A), the removal by the member
-  admitted earlier counts, so the founder's removal wins any such race. This settles races between
-  members acting in good faith; it is no defence against a hostile member, which can run
-  `potluck remove` on any other member through a job there. With users, a removal is final.
+- A user's removal is final. Before a cluster has users, members on 0.1.1 sign removals with their
+  machine keys; when such removals cross (A removes B while B removes A), the removal by the
+  member admitted earlier counts.
 - At most 64 connections, and 8 from one address, may be unauthenticated at once.
 
 ## On each machine

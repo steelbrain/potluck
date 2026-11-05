@@ -36,11 +36,13 @@ command prints one JSON document on stdout, errors included
 document with an `"error"` field and exit code 2. Output that can't be written (a full disk) is an
 error said on stderr, with exit code 2, also when it is a JSON error document; a pipe closed
 early (`potluck logs J | head`) is not an error.
-potluck's own errors, refused dispatches and resizes included, exit with 2. `wait --max-wait DUR`
-exits with 3 if the job hasn't ended by then; the job keeps running, and `"ended": false` in the
-JSON tells this apart from a job that exited with 3. `potluck restart` exits with 4 when no daemon
-here can restart in place: none answers, or it runs a potluck from before `restart` (install.sh
-then restarts the service). `restart` never exits with a job's code, so its 4 is always its own.
+potluck's own errors, refused dispatches and resizes included, exit with 2, and so do `dispatch`,
+`admit` and `remove` until the cluster has a user (`potluck user init` makes the first).
+`wait --max-wait DUR` exits with 3 if the job hasn't ended by then; the job keeps running, and
+`"ended": false` in the JSON tells this apart from a job that exited with 3. `potluck restart`
+exits with 4 when no daemon here can restart in place: none answers, or it runs a potluck from
+before `restart` (install.sh then restarts the service). `restart` never exits with a job's code,
+so its 4 is always its own.
 
 `potluck env --json` prints the machine's name and its login environment, with the values as they
 are (the text output writes control characters in a name or value as escapes, such as `\n`, so

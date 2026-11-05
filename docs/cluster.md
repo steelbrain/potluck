@@ -8,7 +8,7 @@ new machine:
 ```console
 mini$ potluck pair
 potluck-pair-request.eyJ2IjoxLCJuYW1lIjoibWluaSIsImtleSI6ImNZMnc0S2NWemNNR0xrRkVEOG1xdXJiamwzai0xcjhMOVQw...
-potluck: paste this line into `potluck admit` on a member of the cluster (a machine in no cluster founds one with it), then the reply into `potluck pair --finish` here
+potluck: paste this line into `potluck admit` on a member of the cluster, where a user's key is (on a machine in no cluster, `potluck user init` founds one first), then the reply into `potluck pair --finish` here
 ```
 
 On any member, `admit` takes the request and prints a reply:
@@ -29,21 +29,20 @@ joined the cluster: mini, studio
 Each text is one line, shortened here. The request holds the new machine's name, public key,
 address, potluck version and a nonce; `admit` refuses a request from another version. The reply
 holds the signed admission of that key, the membership records that make the members members,
-and the members' addresses; the new machine takes the rest of the records from the members. In a
-cluster with [users](#users), `admit` signs the admission with the command line's user key and
-refuses without one, and `--pool POOL` puts the machine in pool POOL (default `default`); without
-users, the member's machine key signs it.
+and the members' addresses; the new machine takes the rest of the records from the members.
+`admit` signs the admission with the command line's user key, which must be a [user](#users)'s,
+and refuses without one; `--pool POOL` puts the machine in pool POOL (default `default`). A machine
+that isn't in a cluster founds one with `potluck user init`, which makes the first user, and can
+admit machines from then on.
 A machine's name is the one its daemon first ran under (see
 [Installing](install.md#the-machines-name)). Names must be unique, and are letters, digits, `.`, `_`
-and `-`, not starting with `-`. A machine that isn't in a cluster founds one with its first `admit`.
-A daemon listens on its port only while its machine is in a cluster with other members: from its
-first `admit` or from `pair --finish`, until it is removed or its admission is voided, or 30 seconds
-after the removal of every other member.
+and `-`, not starting with `-`. A daemon listens on its port only while its machine is in a cluster
+with other members: from its first `admit` or from `pair --finish`, until it is removed or its
+admission is voided, or 30 seconds after the removal of every other member.
 
-The admitting member announces the admission, and every member accepts a key that a member
-signed (in a cluster with users, a user), so joining one member joins the cluster. Members compare
-their records on every heartbeat and exchange them when they differ, so a member that was offline
-catches up when it returns. A
+The admitting member announces the admission, and every member accepts a key that a user signed,
+so joining one member joins the cluster. Members compare their records on every heartbeat and
+exchange them when they differ, so a member that was offline catches up when it returns. A
 member back from being away (its daemon restarted, or it heard from no member for 30 seconds)
 takes jobs from another member, or hands jobs to one, only once it has compared records with every
 other member, waiting up to 30 seconds for those it doesn't hear from; so it learns of a removal
@@ -54,24 +53,8 @@ that machine could start (a `catch_up` blocker).
 way, and the machine's key is refused everywhere after. The removed machine runs only its own jobs
 from then on and says so in `status`; `potluck pair` there makes a new key to join again.
 
-In a cluster with users, the command line's user key signs the removal, and `remove` refuses
-without one. Such a removal is final: the machine removed signs nothing that counts, so it can't
-undo it. The next two paragraphs are about a cluster without users.
-
-Wherever you run it, the removal is signed by the oldest member that is up and was admitted before
-NODE, the founder first, and such a removal is for good. When removals cross, the one signed by the
-member admitted earlier counts (see [Security](security.md)), so a removal signed by a member
-admitted after NODE holds only until NODE removes that member in turn. When no member admitted
-before NODE is up, or none that is up can sign it (it can't save its records, say), the machine
-you ran it on signs the removal and says that NODE can undo it, and why those members didn't sign
-it (with `--json`, `"final": false` and a `warning`); run it again once such a member can sign it
-to make it final.
-
-No member was admitted before the founder, so a removal of the founder is never final: the
-founder's key can undo it. If the founder's machine is lost for good, its removal holds. If its key
-may be used again (the machine stolen, or its disk copied), start a new cluster: on each machine,
-stop the daemon, delete `keys/` in the state directory and start the daemon again, which gives the
-machine a new key and a cluster of its own; then pair the machines with one of them.
+The command line's user key signs the removal, and `remove` refuses without one. A removal is
+final: the machine removed signs nothing that counts, so it can't undo it.
 A removal doesn't count when its signer was itself removed by a member that hadn't heard of it; a
 machine that heard of such a removal first keeps asking the members it knew, and is a member again,
 taking work, once it hears of the other.
@@ -87,13 +70,13 @@ daemon next starts.
 
 ## Users
 
-Without users, every member's machine key signs admissions and removals, so any member can admit a
-machine or remove one. `potluck user init` makes a user key for this command line, if there is
-none, and makes it the cluster's first user:
+A user's key signs each dispatch, admission and removal, and until a cluster has a user, `dispatch`,
+`admit` and `remove` refuse. `potluck user init` makes a user key for this command line, if there
+is none, and makes it the cluster's first user:
 
 ```console
 studio$ potluck user init --name anees
-anees is the cluster's first user; signed in its members: mini, studio; signed 12 jobs studio dispatched before it that haven't ended
+anees is the cluster's first user; signed in its member: studio
 potluck: made a user key at /Users/anees/.config/potluck/user.key
 ```
 
@@ -102,9 +85,7 @@ line's `node.toml`, with mode 0600. Only the command line reads it; the daemon n
 first user's admission is signed by the user key and co-signed by this machine's machine key, and
 the user key signs every member in again, in one batch with it, so no member drops out. On a
 machine in no cluster, `user init` founds one with that machine as its only member. Once the
-cluster has users, `user init` with a user's key makes no records and signs the jobs of the
-machine it runs on that a first run left unsigned (its signing cut short: the daemon restarted,
-the connection dropped); with any other key it refuses.
+cluster has users, `user init` refuses and names them; `potluck user add NAME KEY` adds another.
 
 From then on:
 
@@ -128,11 +109,6 @@ From then on:
   fails the check isn't run: the machine hands it back, logs a `WARNING` line saying why, and
   doesn't claim it again while it stays queued. A job queued again after its machine is lost is the
   same signed job, and is checked again where it runs next.
-- `user init` signs, with the user key, the jobs the machine it runs on dispatched before it that
-  haven't ended (queued, or starting or running on any member), each as that machine holds it, so
-  they run on any member as before; it says how many (with `--json`, `signed_jobs` lists them).
-  Jobs other machines dispatched before it stay unsigned: they still run, but only on the machine
-  they were dispatched on.
 - Only a user's signed record adds or removes a user. `potluck user key` prints this command line's
   public key, making the key first if there is none. A user adds that key with `potluck user add
   NAME KEY` and removes it with `potluck user remove NAME`; `user remove` refuses to remove the
@@ -151,6 +127,22 @@ When first users compete (`user init` on two members at once), the one co-signed
 admitted earliest counts, the founder first. A member admitted before the one you run `user init`
 on can therefore make a first user that counts instead of yours, with its machine key, at any time;
 `user init` names such members. Run it on the founder to rule that out.
+
+A cluster paired with potluck 0.1.1 has no users until `user init` runs on one of its members, and
+until then the admissions and removals its members signed with their machine keys keep them
+members. A member still on 0.1.1 can admit and remove machines that way, and runs the jobs that
+0.1.1 members dispatch, until it updates. The jobs queued before the cluster had users stay
+unsigned, and `user init` doesn't sign them: each stays queued on the machine it was dispatched on
+and runs only there, and no other machine claims it. One that machine can't run (its `--on` names
+another) stays queued until you cancel it, and holds back no other job:
+
+```console
+studio$ potluck why studio-7
+job studio-7 is queued
+[...]
+studio can't run it: needs node=mini (this machine: node=studio)
+it was queued before the cluster had users, and no user signed it: only studio, where it was dispatched, may run it (`potluck cancel studio-7` ends it)
+```
 
 ## Sources
 
@@ -193,9 +185,9 @@ Each machine keeps the queue of the jobs dispatched on it. Members exchange queu
 second and whenever one changes, so every member sees every queued job for its pool. A job runs
 only on machines in one of its pools (`dispatch --pool`, default `default`; a machine's pool is its
 admission's, see [Users](#users)): the dispatching machine tells a member of a queued job, serves
-it the job's repositories and grants it the job only when the member is in one of those pools, and
-in a cluster with users only when the job is signed. It also refuses a claim when the claiming
-machine's facts, as that machine last reported them, don't meet the job's `--on`. What members tell
+it the job's repositories and grants it the job only when the member is in one of those pools and
+a user signed the job. It also refuses a claim when the claiming machine's facts, as that machine
+last reported them, don't meet the job's `--on`. What members tell
 each other of a job leaves out its command, env, the paths of its repositories and the spec its
 signature covers (and, while it runs, its labels and `--keep` globs), except to the job's
 dispatching machine; the machine that claims a job gets all of it with the grant. So `status` on a machine that neither dispatched nor runs a job shows it

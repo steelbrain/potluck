@@ -87,9 +87,10 @@ potluck at another path is left as it is, and install.sh fails, naming both bina
 the service. When the service runs a potluck at another path, it leaves the service alone and
 prints the `potluck service install` command that points it at the new one. The script never
 uses sudo and never prompts. When no service is installed yet, it prints the next steps: the
-`loginctl enable-linger` command on Linux if lingering is off, `potluck service install` and
-`potluck pair`. `potluck self-update` replaces the binary and restarts the daemon in the same way
-(see [Versions and updates](updates.md)), but doesn't print the next steps.
+`loginctl enable-linger` command on Linux if lingering is off, `potluck service install`,
+`potluck user init` (on the first machine) and `potluck pair` (on the others).
+`potluck self-update` replaces the binary and restarts the daemon in the same way (see
+[Versions and updates](updates.md)), but doesn't print the next steps.
 `POTLUCK_RELEASES_URL` makes either download from a directory holding one release's binaries and
 `SHA256SUMS` instead of GitHub.
 

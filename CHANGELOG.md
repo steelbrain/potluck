@@ -9,17 +9,12 @@
   only a user's signed admission or removal admits or removes a machine: `admit` and `remove` sign
   with the user key, a member's daemon signs neither, and records machine keys sign count for
   nothing. `admit --pool POOL` puts a machine in a pool. `user add`, `user remove`, `user list`
-  and `user key` manage the users. A cluster without users works as before. See
-  [A cluster](docs/cluster.md#users).
+  and `user key` manage the users. See [A cluster](docs/cluster.md#users).
 - `dispatch --pool POOL`, repeatable, and a recipe's `pools`: the job runs only on machines admitted
   into one of those pools, `default` when none is given. See [Jobs](docs/jobs.md#where-it-runs).
-- Signed jobs. In a cluster with users, the command line signs every dispatch with its user key and
-  refuses to dispatch without one; a machine runs another machine's job only when a user it knows
-  signed it for that machine and the job it was granted is the one signed. Jobs other machines
-  queued before `user init` run only on the machine they were dispatched on. See
-  [A cluster](docs/cluster.md#users).
-- `potluck user init` also signs the jobs its machine queued before it that haven't ended. Run
-  again with a user's key, it makes no records and signs those a first run left unsigned.
+- Signed jobs. The command line signs every dispatch with its user key and refuses to dispatch
+  without one; a machine runs another machine's job only when a user it knows signed it for that
+  machine and the job it was granted is the one signed. See [A cluster](docs/cluster.md#users).
 - A member fetching a repository from the dispatching machine gets only the commits of the queued
   jobs it may take and of the jobs it runs, with what they reach, and the branches and tags whose
   tips those commits reach; other branches, tags and commits don't come along, and naming one while
@@ -34,6 +29,16 @@
   the job with its new request. See [Jobs](docs/jobs.md#resources).
 - `potluck why` of a job that has ended says the most memory it used beside what it reserved:
   `peak memory 1.2 GiB of the 16 GiB it reserved`.
+
+### Changed
+
+- `dispatch`, `admit` and `remove` need a user: until `potluck user init` has made the cluster's
+  first user, they refuse and say so (exit 2), on a new machine and in a cluster paired with 0.1.1
+  alike. A member's daemon signs no admission or removal with its machine key and takes no
+  unsigned dispatch.
+- A machine runs another machine's job only when a user signed it. In a cluster paired with 0.1.1,
+  the jobs queued before `user init` stay unsigned: each stays queued on the machine it was
+  dispatched on and runs only there, and `potluck why` says so.
 
 ### Fixed
 

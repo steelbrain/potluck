@@ -78,9 +78,16 @@ $ potluck dispatch --timeout 10m --ram 100 -- cargo test
 potluck: no machine could ever run this job (studio: needs 100 GiB RAM, its capacity is 57.6 GiB)
 ```
 
-In a cluster with [users](cluster.md#users), the command line signs each dispatch with its user
-key (`$POTLUCK_USER_KEY`, else `user.key` beside `node.toml`), for the machine it dispatches on.
-Without a user key there, `dispatch` fails before anything is sent:
+The command line signs each dispatch with its user key (`$POTLUCK_USER_KEY`, else `user.key`
+beside `node.toml`), for the machine it dispatches on; the key must be a [user](cluster.md#users)'s.
+Until the cluster has a user, `dispatch` fails before anything is sent:
+
+```console
+studio$ potluck dispatch --timeout 10m -- cargo test
+potluck: a dispatch is signed by a user of a cluster, and this machine is in none yet: `potluck user init` founds one, with this command line's key as its first user
+```
+
+So does a dispatch without a user key:
 
 ```console
 mini$ potluck dispatch --timeout 10m -- cargo test
@@ -89,8 +96,7 @@ potluck: this cluster has users, so a dispatch is signed with a user's key, and 
 
 The daemon refuses a dispatch signed with a key that is no user's, signed for another machine,
 signed more than 10 minutes from its clock, or sent before (each signature's nonce is kept a
-day). Without users, a dispatch is signed when the command line has a user key, and taken unsigned
-when it has none.
+day), and every dispatch while the cluster has no users.
 
 ## Run limit
 
