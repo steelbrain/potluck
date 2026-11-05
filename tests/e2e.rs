@@ -1144,7 +1144,7 @@ fn ram_limit_ends_the_job() {
     ]);
     let (code, j, _) = n.wait(&job);
     assert_eq!(code, 137, "{j}\n{}", n.daemon_log());
-    assert_eq!(j["state"], "over_memory");
+    assert_eq!(j["state"], "over_memory", "{j}\n{}", n.daemon_log());
     let msg = j["message"].as_str().unwrap();
     assert!(
         msg.starts_with("over memory: used ") && msg.ends_with(" MiB of its 256 MiB"),

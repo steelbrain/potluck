@@ -291,14 +291,19 @@ impl Executor for SystemdExecutor {
             }
         }
         let oom_kill = props.get("Result").map(String::as_str) == Some("oom-kill");
-        let own = reached_own_limit(&props);
+        let kept = keeps_memory_peak();
+        let own = reached_own_limit(&props, kept);
         let number = |key: &str| props.get(key).and_then(|v| v.parse::<u64>().ok());
         Ok(Sample {
             pids: Vec::new(),
             cpu_ms: number("CPUUsageNSec").map_or(0, |ns| ns / 1_000_000),
             mem_bytes: 0,
-            // systemd 256 and later keep it after the cgroup is gone.
-            peak_mem_bytes: number("MemoryPeak").unwrap_or(0),
+            // systemd 256 and later keep it after the cgroup is gone ([`keeps_memory_peak`]).
+            peak_mem_bytes: if kept {
+                number("MemoryPeak").unwrap_or(0)
+            } else {
+                0
+            },
             over_memory: oom_kill && own,
             oom_killed: oom_kill && !own,
             over_tasks: None,
@@ -506,15 +511,19 @@ fn open_files() -> Option<OsString> {
 }
 
 /// Whether a unit whose cgroup is gone reached its own MemoryMax, from what systemd keeps: a
-/// MemoryPeak at its MemoryMax, and no kill by systemd-oomd. Without a MemoryPeak (systemd
-/// before 256) it can't tell and says yes; with MemoryMax=infinity there was no limit to reach.
-fn reached_own_limit(props: &BTreeMap<String, String>) -> bool {
+/// MemoryPeak at its MemoryMax, and no kill by systemd-oomd. Without a MemoryPeak it can't tell
+/// and says yes, and so without `kept` ([`keeps_memory_peak`]): systemd before 256 shows a
+/// MemoryPeak then, but a stale one. With MemoryMax=infinity there was no limit to reach.
+fn reached_own_limit(props: &BTreeMap<String, String>, kept: bool) -> bool {
     let number = |key: &str| props.get(key).and_then(|v| v.parse::<u64>().ok());
     if number("ManagedOOMKills").is_some_and(|n| n > 0) {
         return false;
     }
     if props.get("MemoryMax").map(String::as_str) == Some("infinity") {
         return false;
+    }
+    if !kept {
+        return true;
     }
     match (number("MemoryPeak"), number("MemoryMax")) {
         (Some(peak), Some(max)) => peak.saturating_add(LIMIT_SLACK_BYTES) >= max,
@@ -664,6 +673,14 @@ fn env_binary() -> anyhow::Result<&'static str> {
         .into_iter()
         .find(|p| Path::new(p).is_file())
         .ok_or_else(|| anyhow::anyhow!("no env binary in /usr/bin or /bin"))
+}
+
+/// Whether systemd keeps a unit's MemoryPeak once its cgroup is gone: 256 and later do. systemd 255
+/// still shows one then, but it is whatever systemd last read while the unit ran: on 255.4, 1.5 MiB
+/// for a unit the OOM killer ended at its 64 MiB MemoryMax, so a job over its own limit looked
+/// killed for the machine's shortage. An unknown version keeps none.
+fn keeps_memory_peak() -> bool {
+    systemd_version().is_some_and(|v| v >= 256)
 }
 
 /// The systemd version, from `systemd-run --version` (`systemd 262 (262.1-1-arch)`).
@@ -907,40 +924,70 @@ mod tests {
         };
         let mib = |n: u64| (n << 20).to_string();
         // As systemd 262 showed them after a unit went over its 64 MiB.
-        assert!(reached_own_limit(&props(&[
-            ("MemoryPeak", &mib(64)),
-            ("MemoryMax", &mib(64)),
-            ("ManagedOOMKills", "0"),
-        ])));
-        assert!(reached_own_limit(&props(&[
-            (
-                "MemoryPeak",
-                &(mib(64).parse::<u64>().unwrap() - 8192).to_string()
-            ),
-            ("MemoryMax", &mib(64)),
-        ])));
+        assert!(reached_own_limit(
+            &props(&[
+                ("MemoryPeak", &mib(64)),
+                ("MemoryMax", &mib(64)),
+                ("ManagedOOMKills", "0"),
+            ]),
+            true
+        ));
+        assert!(reached_own_limit(
+            &props(&[
+                (
+                    "MemoryPeak",
+                    &(mib(64).parse::<u64>().unwrap() - 8192).to_string()
+                ),
+                ("MemoryMax", &mib(64)),
+            ]),
+            true
+        ));
         // A slice above it ran short at 100 MiB; its own limit was 1 GiB.
-        assert!(!reached_own_limit(&props(&[
-            ("MemoryPeak", "105590784"),
-            ("MemoryMax", &mib(1024)),
-            ("ManagedOOMKills", "0"),
-        ])));
+        assert!(!reached_own_limit(
+            &props(&[
+                ("MemoryPeak", "105590784"),
+                ("MemoryMax", &mib(1024)),
+                ("ManagedOOMKills", "0"),
+            ]),
+            true
+        ));
         // systemd-oomd killed it.
-        assert!(!reached_own_limit(&props(&[
-            ("MemoryPeak", &mib(64)),
-            ("MemoryMax", &mib(64)),
-            ("ManagedOOMKills", "1"),
-        ])));
-        assert!(!reached_own_limit(&props(&[
-            ("MemoryPeak", &mib(64)),
-            ("MemoryMax", "infinity"),
-        ])));
+        assert!(!reached_own_limit(
+            &props(&[
+                ("MemoryPeak", &mib(64)),
+                ("MemoryMax", &mib(64)),
+                ("ManagedOOMKills", "1"),
+            ]),
+            true
+        ));
+        assert!(!reached_own_limit(
+            &props(&[("MemoryPeak", &mib(64)), ("MemoryMax", "infinity"),]),
+            true
+        ));
         // An older systemd keeps no peak: it can't tell.
-        assert!(reached_own_limit(&props(&[
-            ("MemoryPeak", "[not set]"),
+        assert!(reached_own_limit(
+            &props(&[("MemoryPeak", "[not set]"), ("MemoryMax", &mib(64)),]),
+            true
+        ));
+        assert!(reached_own_limit(&props(&[("MemoryMax", &mib(64))]), true));
+        // systemd 255 shows the peak it last read while the unit ran, here long before the OOM
+        // killer ended it at its 64 MiB: before 256 the peak doesn't count.
+        let stale = props(&[
+            ("MemoryPeak", "1556480"),
             ("MemoryMax", &mib(64)),
-        ])));
-        assert!(reached_own_limit(&props(&[("MemoryMax", &mib(64))])));
+            ("ManagedOOMKills", "0"),
+        ]);
+        assert!(reached_own_limit(&stale, false));
+        assert!(!reached_own_limit(&stale, true));
+        // Still not when systemd-oomd killed it, or with no limit.
+        assert!(!reached_own_limit(
+            &props(&[("MemoryMax", &mib(64)), ("ManagedOOMKills", "1")]),
+            false
+        ));
+        assert!(!reached_own_limit(
+            &props(&[("MemoryMax", "infinity")]),
+            false
+        ));
     }
 
     #[test]

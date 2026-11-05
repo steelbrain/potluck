@@ -106,7 +106,10 @@ A job gets everything it asks for at once, or waits, so jobs can't deadlock on e
   "over memory: used X of its Y" (`used 300 MiB of its 256 MiB`, `used 4.2 GiB of its 4 GiB`). On
   Linux, a job whose process the kernel's OOM killer or systemd-oomd ends while the machine runs
   short of memory, with the job under its own limit, fails as "killed because the machine ran
-  short of memory, under its own limit: used X of its Y".
+  short of memory, under its own limit: used X of its Y". With systemd older than 256 (Ubuntu
+  24.04 has 255), a kernel OOM kill that potluck learns of only after the job's unit has ended
+  counts as over memory: that systemd keeps no memory peak for an ended unit to tell the two
+  apart by.
 - `--cpu N`: a weight in cores (default 1) that never keeps a job from starting. On Linux it sets
   the unit's `CPUWeight` to 100 per core; on macOS it has no effect.
 - `--gpu SEL`, repeatable: one GPU each, held only by this job until it ends. A selector is `any`,
