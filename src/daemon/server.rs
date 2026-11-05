@@ -452,6 +452,14 @@ fn validate(spec: &JobSpec) -> Result<(), String> {
             ));
         }
     }
+    for k in &spec.unset_env {
+        if let Some(why) = crate::types::unset_env_refused(k) {
+            return Err(format!("--unset-env: {why}"));
+        }
+        if spec.env.contains_key(k) {
+            return Err(format!("env and unset_env both name {k}: give one of them"));
+        }
+    }
     if spec.request.ram_mib == 0 {
         return Err("ram must be more than 0".into());
     }

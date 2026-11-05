@@ -166,6 +166,7 @@ pub fn spec(cmd: &[&str]) -> JobSpec {
         workspace: None,
         cmd: cmd.iter().map(|s| s.to_string()).collect(),
         env: BTreeMap::new(),
+        unset_env: Default::default(),
         timeout_ms: 600_000,
         hold_ms: None,
         keep: vec![],

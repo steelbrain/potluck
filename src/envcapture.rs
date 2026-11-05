@@ -1,9 +1,10 @@
 //! The runner user's login environment. The daemon runs as a service with a bare environment, so it
 //! captures `$SHELL -l -c 'env -0'` (falling back to /bin/sh) when it starts. A job's environment is
 //! that, then the env of each `[[gpu]]` entry for a GPU it holds, then the spec's env (committed
-//! potluck.toml and `--env`), then potluck's own variables, which nothing overrides (POTLUCK_JOB,
-//! POTLUCK_LEASE, POTLUCK_WORKSPACE, POTLUCK_NODE, POTLUCK_GPUS, TMPDIR beside the workspace's tree
-//! and removed with it, POTLUCK_HOME and POTLUCK_CONFIG). Nothing comes from the caller's shell.
+//! potluck.toml and `--env`), less what the spec unsets (`--unset-env`), then potluck's own
+//! variables, which nothing overrides (POTLUCK_JOB, POTLUCK_LEASE, POTLUCK_WORKSPACE,
+//! POTLUCK_NODE, POTLUCK_GPUS, TMPDIR beside the workspace's tree and removed with it,
+//! POTLUCK_HOME and POTLUCK_CONFIG). Nothing comes from the caller's shell.
 //!
 //! - The shell is `$SHELL`, else the user's shell from the password database, else /bin/sh. If it
 //!   fails (a shell that refuses `-l -c`, a profile that exits early), /bin/sh is tried.

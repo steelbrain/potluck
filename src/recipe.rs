@@ -18,6 +18,7 @@
 //! keep = ["target/nextest/default/junit.xml"]
 //! without_submodules = ["vendor/qemu/roms/*"]
 //! env = { SOME_VAR = "1" }
+//! unset_env = ["HTTPS_PROXY"]
 //! ```
 //!
 //! `on` is a table, or a list in `--on`'s syntax, where `macos` and `linux` can stand alone (any
@@ -27,10 +28,10 @@ use crate::cli::DispatchArgs;
 use crate::gitinfo::short;
 use crate::types::{
     DEFAULT_PRIORITY, MAX_HOLD_MS, MIN_HOLD_MS, OS_KEYS, Request, check_on, fmt_ms,
-    is_os_shorthand, parse_duration_ms, parse_ram_mib,
+    is_os_shorthand, parse_duration_ms, parse_ram_mib, unset_env_refused,
 };
 use serde::Deserialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::Path;
 
@@ -86,6 +87,9 @@ pub struct Recipe {
     pub without_submodules: Vec<String>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// Variables removed from the job's environment, as `--unset-env` takes them.
+    #[serde(default)]
+    pub unset_env: Vec<String>,
 }
 
 /// A recipe's `on`: a table of facts, or a list of `--on` arguments split like
@@ -232,6 +236,8 @@ pub struct Resolved {
     pub cmd: Vec<String>,
     /// The file's top-level env, then the recipe's, then `--env`.
     pub env: BTreeMap<String, String>,
+    /// The recipe's `unset_env`, then `--unset-env`; none of them in `env`.
+    pub unset_env: BTreeSet<String>,
     pub timeout_ms: u64,
     pub priority: u8,
     pub request: Request,
@@ -243,8 +249,9 @@ pub struct Resolved {
 }
 
 /// Applies `args` over the named recipe (if any) of `file`. Options given on the command line
-/// replace the recipe's; `on` and `env` merge key by key, the command line last; `--exclusive`
-/// can only add exclusivity (a recipe's `exclusive = true` stays).
+/// replace the recipe's; `on` and `env` merge key by key, the command line last, and so do `env`
+/// and `unset_env` together (see `resolve_env`); `--exclusive` can only add exclusivity (a
+/// recipe's `exclusive = true` stays).
 pub fn resolve(file: &ProjectFile, args: &DispatchArgs) -> anyhow::Result<Resolved> {
     let empty = Recipe::default();
     let recipe = match &args.recipe {
@@ -326,12 +333,7 @@ pub fn resolve(file: &ProjectFile, args: &DispatchArgs) -> anyhow::Result<Resolv
 
     let on = resolve_on(&recipe.on, &args.on, args.recipe.as_deref())?;
 
-    let mut env = file.env.clone();
-    env.extend(recipe.env.clone());
-    for kv in &args.env {
-        let (k, v) = parse_kv(kv, "--env")?;
-        env.insert(k, v);
-    }
+    let (env, unset_env) = resolve_env(file, recipe, args)?;
 
     let hold_ms = match args.hold.as_deref().or(recipe.hold.as_deref()) {
         Some(h) => Some(
@@ -364,6 +366,7 @@ pub fn resolve(file: &ProjectFile, args: &DispatchArgs) -> anyhow::Result<Resolv
         recipe: args.recipe.clone(),
         cmd,
         env,
+        unset_env,
         timeout_ms,
         priority,
         request,
@@ -373,6 +376,57 @@ pub fn resolve(file: &ProjectFile, args: &DispatchArgs) -> anyhow::Result<Resolv
         without_submodules,
         labels,
     })
+}
+
+/// The env a dispatch sets and the variables it unsets, key by key, each layer over the one
+/// before: the file's `[env]`, then the recipe's `env` and `unset_env`, then `--env` and
+/// `--unset-env`. So `--env K=V` sets K even where the recipe unsets it, and `--unset-env K`
+/// unsets K even where the file or the recipe sets it. One layer can't both set and unset a
+/// variable, and potluck's own variables can't be unset ([`unset_env_refused`]).
+fn resolve_env(
+    file: &ProjectFile,
+    recipe: &Recipe,
+    args: &DispatchArgs,
+) -> anyhow::Result<(BTreeMap<String, String>, BTreeSet<String>)> {
+    let mut env = file.env.clone();
+    env.extend(recipe.env.clone());
+    let mut unset = BTreeSet::new();
+    let name = args.recipe.as_deref().unwrap_or_default();
+    for k in &recipe.unset_env {
+        if let Some(why) = unset_env_refused(k) {
+            anyhow::bail!("recipe {name}: unset_env: {why}");
+        }
+        if recipe.env.contains_key(k) {
+            anyhow::bail!("recipe {name}: {k} is in both env and unset_env");
+        }
+        env.remove(k);
+        unset.insert(k.clone());
+    }
+    let mut given = BTreeMap::new();
+    for kv in &args.env {
+        let (k, v) = parse_kv(kv, "--env")?;
+        given.insert(k, v);
+    }
+    let mut given_unset = BTreeSet::new();
+    for k in &args.unset_env {
+        if let Some(why) = unset_env_refused(k) {
+            anyhow::bail!("--unset-env: {why}");
+        }
+        // Not the value: it may be a secret.
+        if given.contains_key(k) {
+            anyhow::bail!("--env and --unset-env both name {k}: give one of them");
+        }
+        given_unset.insert(k.clone());
+    }
+    for (k, v) in given {
+        unset.remove(&k);
+        env.insert(k, v);
+    }
+    for k in given_unset {
+        env.remove(&k);
+        unset.insert(k);
+    }
+    Ok((env, unset))
 }
 
 /// The facts a dispatch requires: the recipe's `on`, then each `--on`, key by key. The OS keys
@@ -582,6 +636,157 @@ env = { SHARED = "recipe" }
             ("A".into(), "b=c".into())
         );
         assert!(parse_kv("=x", "--env").is_err());
+    }
+
+    fn names(set: &BTreeSet<String>) -> Vec<&str> {
+        set.iter().map(String::as_str).collect()
+    }
+
+    /// `env` and `unset_env` merge key by key, each layer over the one before: the file's
+    /// `[env]`, the recipe's, the command line's.
+    #[test]
+    fn unset_env_merges_with_env_key_by_key() {
+        let file = parse(
+            r#"
+[env]
+FROM_FILE = "file"
+KEPT = "file"
+
+[recipe.x]
+cmd = ["true"]
+timeout = "1m"
+env = { FROM_RECIPE = "recipe" }
+unset_env = ["FROM_FILE", "DEBUG_LAYER", "DEBUG_LAYER"]
+"#,
+        )
+        .unwrap();
+        let r = resolve(&file, &args(&["x"])).unwrap();
+        assert_eq!(names(&r.unset_env), ["DEBUG_LAYER", "FROM_FILE"]);
+        assert_eq!(
+            r.env.keys().collect::<Vec<_>>(),
+            ["FROM_RECIPE", "KEPT"],
+            "the recipe unsets the file's"
+        );
+
+        // --env takes a variable out of the recipe's unset_env; --unset-env takes one out of
+        // the recipe's env and the file's.
+        let r = resolve(
+            &file,
+            &args(&[
+                "x",
+                "--env",
+                "DEBUG_LAYER=0",
+                "--unset-env",
+                "FROM_RECIPE",
+                "--unset-env",
+                "KEPT",
+                "--unset-env",
+                "FROM_LOGIN",
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            names(&r.unset_env),
+            ["FROM_FILE", "FROM_LOGIN", "FROM_RECIPE", "KEPT"]
+        );
+        assert_eq!(
+            r.env.iter().collect::<Vec<_>>(),
+            [(&"DEBUG_LAYER".to_string(), &"0".to_string())]
+        );
+
+        // An empty value is a value: set, not unset.
+        let r = resolve(&file, &args(&["x", "--env", "FROM_FILE="])).unwrap();
+        assert_eq!(r.env.get("FROM_FILE").map(String::as_str), Some(""));
+        assert_eq!(names(&r.unset_env), ["DEBUG_LAYER"]);
+
+        // Without a recipe.
+        let r = resolve(
+            &ProjectFile::default(),
+            &args(&with(&["--unset-env", "A", "--env", "B=1"])),
+        )
+        .unwrap();
+        assert_eq!(names(&r.unset_env), ["A"]);
+        assert_eq!(r.env.len(), 1);
+    }
+
+    #[test]
+    fn unset_env_refuses_what_cant_be_unset() {
+        let plain = ProjectFile::default();
+        for (argv, want) in [
+            (
+                &["--unset-env", "TMPDIR"][..],
+                "--unset-env: TMPDIR is one of potluck's own variables, which every job gets \
+                 (POTLUCK_JOB, POTLUCK_LEASE, POTLUCK_WORKSPACE, POTLUCK_NODE, POTLUCK_GPUS, \
+                 POTLUCK_HOME, POTLUCK_CONFIG, TMPDIR)",
+            ),
+            (
+                &["--unset-env", "POTLUCK_JOB"],
+                "--unset-env: POTLUCK_JOB is one of potluck's own variables",
+            ),
+            (
+                &["--unset-env", "A=1"],
+                "--unset-env: \"A=1\" is not a variable name: use letters, digits and _, not \
+                 starting with a digit",
+            ),
+            (
+                &["--unset-env", ""],
+                "--unset-env: \"\" is not a variable name",
+            ),
+            (
+                &["--unset-env", "9A"],
+                "--unset-env: \"9A\" is not a variable name",
+            ),
+            (
+                &["--env", "A=secret", "--unset-env", "A"],
+                "--env and --unset-env both name A: give one of them",
+            ),
+            (
+                &["--unset-env", "A", "--env", "A="],
+                "--env and --unset-env both name A: give one of them",
+            ),
+        ] {
+            let e = err(&plain, &with(argv));
+            assert!(e.starts_with(want), "{argv:?}: {e}");
+            assert!(!e.contains("secret"), "{e}");
+        }
+
+        let file = parse(
+            r#"
+[recipe.own]
+cmd = ["true"]
+timeout = "1m"
+unset_env = ["POTLUCK_LEASE"]
+
+[recipe.bad]
+cmd = ["true"]
+timeout = "1m"
+unset_env = ["A B"]
+
+[recipe.both]
+cmd = ["true"]
+timeout = "1m"
+env = { A = "1" }
+unset_env = ["A"]
+"#,
+        )
+        .unwrap();
+        assert!(
+            err(&file, &["own"])
+                .starts_with("recipe own: unset_env: POTLUCK_LEASE is one of potluck's own"),
+            "{}",
+            err(&file, &["own"])
+        );
+        assert!(
+            err(&file, &["bad"])
+                .starts_with("recipe bad: unset_env: \"A B\" is not a variable name"),
+            "{}",
+            err(&file, &["bad"])
+        );
+        assert_eq!(
+            err(&file, &["both"]),
+            "recipe both: A is in both env and unset_env"
+        );
+        assert!(parse("[recipe.x]\ncmd = [\"a\"]\nunset_env = \"A\"\n").is_err());
     }
 
     /// `dispatch --timeout 1m EXTRA -- true`.

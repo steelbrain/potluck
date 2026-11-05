@@ -239,8 +239,9 @@ pub fn top_of(cwd: &Path) -> std::path::PathBuf {
 }
 
 /// Runs the command here: in `cwd`, with this process's environment plus the resolved env
-/// (except potluck's own variables, [`crate::daemon::JOB_VARIABLES`], which stay the job's),
-/// stdin and stderr inherited, stdout inherited too unless `stdout_to_stderr` (so `--json` keeps
+/// (except potluck's own variables, [`crate::daemon::JOB_VARIABLES`], which stay the job's) and
+/// without the variables it unsets (never potluck's own: [`crate::recipe::resolve`] refuses
+/// those), stdin and stderr inherited, stdout inherited too unless `stdout_to_stderr` (so `--json` keeps
 /// stdout for its one document). It runs in a process group of its own, which is ended at its
 /// run limit like a job: SIGTERM to every process in it, SIGKILL to what is left `grace` later
 /// (the machine's `kill_grace_s`), exit 124. Returns its exit code (128 + signal when killed).
@@ -261,6 +262,9 @@ pub fn run_in_place(
         .iter()
         .filter(|(k, _)| !crate::daemon::JOB_VARIABLES.contains(&k.as_str()));
     cmd.args(args).current_dir(cwd).envs(env).process_group(0);
+    for k in &r.unset_env {
+        cmd.env_remove(k);
+    }
     if stdout_to_stderr {
         let err = std::io::stderr().as_fd().try_clone_to_owned()?;
         cmd.stdout(Stdio::from(err));

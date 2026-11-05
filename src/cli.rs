@@ -196,6 +196,11 @@ pub struct DispatchArgs {
     /// An environment variable for the job, K=V. Repeatable.
     #[arg(long = "env", value_name = "K=V")]
     pub env: Vec<String>,
+    /// Leave variable K out of the job's environment, wherever it comes from: the machine's
+    /// login environment, its `[[gpu]]` env, or the committed potluck.toml. Repeatable.
+    /// potluck's own variables (POTLUCK_JOB, TMPDIR, ...) can't be left out.
+    #[arg(long = "unset-env", value_name = "K")]
+    pub unset_env: Vec<String>,
     /// Run inside this existing workspace (on its machine).
     #[arg(long)]
     pub workspace: Option<String>,
@@ -686,6 +691,7 @@ impl Cx<'_> {
             workspace: args.workspace.clone(),
             cmd: r.cmd,
             env: r.env,
+            unset_env: r.unset_env,
             timeout_ms: r.timeout_ms,
             hold_ms: r.hold_ms,
             keep: r.keep,

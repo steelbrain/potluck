@@ -817,6 +817,7 @@ fn spec(cmd: &str) -> JobSpec {
         workspace: None,
         cmd: vec!["sh".into(), "-c".into(), cmd.into()],
         env: BTreeMap::new(),
+        unset_env: Default::default(),
         timeout_ms: 60_000,
         hold_ms: None,
         keep: vec![],
@@ -2293,6 +2294,60 @@ fn gpu_env_yields_to_the_dispatch_and_to_potlucks_own_variables() {
     assert_eq!(env["POTLUCK_GPUS"], GPU);
     let ws = j.workspace.unwrap();
     assert_eq!(PathBuf::from(&env["TMPDIR"]), f.paths.workspace_tmp(&ws));
+}
+
+/// `unset_env` leaves a variable out of the job's environment, whether the login environment
+/// or a `[[gpu]]` entry set it; potluck's own variables can't be unset, and a spec can't both
+/// set and unset one: those are refused at dispatch.
+#[test]
+fn unset_env_leaves_variables_out_of_the_job() {
+    let mut f = Fixture::new();
+    f.config.gpu[0]
+        .env
+        .insert("GPU_KEPT".to_string(), "gpu".to_string());
+    let f = f.start();
+    let mut s = spec("true");
+    s.request.gpus = vec!["fake".into()];
+    s.env.insert("FROM_SPEC".into(), "spec".into());
+    s.unset_env = ["FROM_LOGIN", "FAKE_GPU_HELD", "SET_NOWHERE"]
+        .map(String::from)
+        .into();
+    let id = f.dispatch(s);
+    let j = f.wait(&id);
+    assert_eq!(j.state, JobState::Succeeded, "{j:#?}");
+    assert!(j.spec.unset_env.contains("FROM_LOGIN"));
+    let env = f.exec.launched(&id).env;
+    for k in ["FROM_LOGIN", "FAKE_GPU_HELD", "SET_NOWHERE"] {
+        assert!(!env.contains_key(k), "{k} set: {env:?}");
+    }
+    assert_eq!(env["GPU_KEPT"], "gpu");
+    assert_eq!(env["FROM_SPEC"], "spec");
+    assert_eq!(env["POTLUCK_JOB"], id);
+
+    let mut c = f.client();
+    let mut call = |s: JobSpec| {
+        c.call(Request::Dispatch { spec: Box::new(s) })
+            .unwrap_err()
+            .to_string()
+    };
+    for (k, want) in [
+        (
+            "TMPDIR",
+            "--unset-env: TMPDIR is one of potluck's own variables, which every job gets",
+        ),
+        (
+            "POTLUCK_LEASE",
+            "--unset-env: POTLUCK_LEASE is one of potluck's own variables",
+        ),
+        ("A=B", "--unset-env: \"A=B\" is not a variable name"),
+        ("FROM_SPEC", "env and unset_env both name FROM_SPEC"),
+    ] {
+        let mut s = spec("true");
+        s.env.insert("FROM_SPEC".into(), "spec".into());
+        s.unset_env.insert(k.into());
+        let e = call(s);
+        assert!(e.contains(want), "{k}: {e}");
+    }
 }
 
 #[test]

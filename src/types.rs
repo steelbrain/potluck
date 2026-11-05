@@ -2,7 +2,7 @@
 //! machine facts. Changing a type here changes the contract between modules: keep it deliberate.
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -328,6 +328,12 @@ pub struct JobSpec {
     pub cmd: Vec<String>,
     /// From the committed potluck.toml and `--env`, already merged by the client.
     pub env: BTreeMap<String, String>,
+    /// Variables the job's environment goes without (`--unset-env`, a recipe's `unset_env`):
+    /// removed from what the login environment, the `[[gpu]]` env and `env` set. None of
+    /// potluck's own ([`unset_env_refused`]), and none that `env` sets. Empty in records from
+    /// before it.
+    #[serde(default)]
+    pub unset_env: BTreeSet<String>,
     /// The run limit. Required.
     pub timeout_ms: u64,
     /// Requested hold after the invocation; at least [`MIN_HOLD_MS`], at most [`MAX_HOLD_MS`].
@@ -738,6 +744,29 @@ fn on_in_order(on: &BTreeMap<String, String>) -> impl Iterator<Item = (&str, &st
     os.chain(rest).map(|(k, v)| (k.as_str(), v.as_str()))
 }
 
+/// Why `name` can't be removed from a job's environment (`--unset-env`): it isn't a variable's
+/// name (letters, digits and `_`, not starting with a digit), or it is one of potluck's own
+/// variables ([`crate::daemon::JOB_VARIABLES`]), which every job gets.
+pub fn unset_env_refused(name: &str) -> Option<String> {
+    let mut chars = name.chars();
+    let valid = chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if !valid {
+        return Some(format!(
+            "{name:?} is not a variable name: use letters, digits and _, not starting with a digit"
+        ));
+    }
+    let own = crate::daemon::JOB_VARIABLES;
+    own.contains(&name).then(|| {
+        format!(
+            "{name} is one of potluck's own variables, which every job gets ({})",
+            own.join(", ")
+        )
+    })
+}
+
 /// Refuses `--on` requirements that no machine could meet together, or that give a version
 /// with nothing in it to compare: `macos` with `linux` (or with `os=linux`), `macos=26` with
 /// `os_version=27`, `linux=7.2` with `kernel=6`, `kernel=.`. The error names both requirements.
@@ -911,6 +940,64 @@ impl Facts {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Job records persist (the store, a restart's handover): one written before `unset_env`
+    /// loads with nothing unset.
+    #[test]
+    fn a_spec_from_before_unset_env_loads() {
+        let spec: JobSpec = serde_json::from_value(serde_json::json!({
+            "key": null,
+            "labels": {},
+            "priority": 3,
+            "request": { "ram_mib": 4096, "cpu": 1, "gpus": [], "exclusive": false },
+            "on": {},
+            "repo": {
+                "id": "app-0011aabb",
+                "source": "/src/app/.git",
+                "commit": "0123456789abcdef0123456789abcdef01234567",
+                "branch": "main",
+                "submodules": []
+            },
+            "workspace": null,
+            "cmd": ["true"],
+            "env": { "A": "1" },
+            "timeout_ms": 60000,
+            "hold_ms": null,
+            "keep": [],
+            "rerun_if_lost": true,
+            "kill_on_stall": false,
+            "recipe": null,
+            "submitted_from": "studio"
+        }))
+        .unwrap();
+        assert!(spec.unset_env.is_empty());
+        assert_eq!(spec.env["A"], "1");
+    }
+
+    #[test]
+    fn what_can_be_unset() {
+        for ok in ["DEBUG_LAYER", "_x", "a1", "POTLUCK_OTHER", "TMP"] {
+            assert_eq!(unset_env_refused(ok), None, "{ok}");
+        }
+        for bad in ["", "1A", "A=B", "A B", "A-B", "\u{e9}t\u{e9}"] {
+            let why = unset_env_refused(bad).unwrap();
+            assert!(
+                why.ends_with(
+                    "is not a variable name: use letters, digits and _, not starting with a digit"
+                ),
+                "{bad}: {why}"
+            );
+        }
+        for own in crate::daemon::JOB_VARIABLES {
+            let why = unset_env_refused(own).unwrap();
+            assert!(
+                why.starts_with(&format!(
+                    "{own} is one of potluck's own variables, which every job gets (POTLUCK_JOB, "
+                )),
+                "{why}"
+            );
+        }
+    }
 
     /// A count of passes from a peer or the store can be anything: no overflow (a panic in the
     /// scheduler's sort on every loop pass in a debug build, a wrong order in a release one).

@@ -405,6 +405,71 @@ fn dispatch_resolves_the_committed_recipe_under_the_flags() {
     assert_eq!(ctx.branch.as_deref(), Some("feature"));
 }
 
+/// `--unset-env` and a recipe's `unset_env` reach the daemon in the spec, merged with `env` key
+/// by key; what can't be unset is refused before anything is asked of the daemon.
+#[test]
+fn dispatch_sends_what_to_unset() {
+    let fake = dispatch_daemon();
+    let repo = repo_with(
+        "[env]\nA = \"file\"\nB = \"file\"\n\n[recipe.r]\ncmd = [\"true\"]\ntimeout = \"1m\"\nunset_env = [\"A\", \"DEBUG_LAYER\"]\n",
+    );
+    let env = env_for(&fake, repo.path());
+    let out = run_in(
+        &env,
+        &[
+            "dispatch",
+            "r",
+            "--unset-env",
+            "B",
+            "--env",
+            "A=flag",
+            "--unset-env",
+            "HOME",
+        ],
+    );
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let spec = dispatched_spec(&fake);
+    assert_eq!(
+        spec.unset_env.iter().collect::<Vec<_>>(),
+        ["B", "DEBUG_LAYER", "HOME"]
+    );
+    assert_eq!(
+        spec.env.iter().collect::<Vec<_>>(),
+        [(&"A".to_string(), &"flag".to_string())]
+    );
+
+    let fake = dispatch_daemon();
+    let env = env_for(&fake, repo.path());
+    for (args, want) in [
+        (
+            &["--unset-env", "TMPDIR"][..],
+            "potluck: --unset-env: TMPDIR is one of potluck's own variables, which every job gets",
+        ),
+        (
+            &["--unset-env", "X=1"],
+            "potluck: --unset-env: \"X=1\" is not a variable name",
+        ),
+        (
+            &["--env", "X=1", "--unset-env", "X"],
+            "potluck: --env and --unset-env both name X: give one of them",
+        ),
+    ] {
+        let mut argv = vec!["dispatch", "--timeout", "1m"];
+        argv.extend_from_slice(args);
+        argv.extend_from_slice(&["--", "true"]);
+        let out = run_in(&env, &argv);
+        assert_eq!(out.code, 2, "{args:?}");
+        assert!(out.stderr.starts_with(want), "{args:?}: {}", out.stderr);
+    }
+    assert!(
+        !fake
+            .requests()
+            .iter()
+            .any(|r| matches!(r.req, Request::Dispatch { .. })),
+        "nothing refused reached the daemon"
+    );
+}
+
 #[test]
 fn dispatch_flags_override_and_json() {
     let fake = dispatch_daemon();
@@ -1990,6 +2055,52 @@ fn nested_dispatch_keeps_the_jobs_own_variables() {
         ]));
     assert_eq!(r.code, 0, "{}", r.stderr);
     assert_eq!(r.stdout.trim(), "studio-9 secret /the-jobs-tmp from-flag");
+}
+
+/// In place, `--unset-env` leaves the variable out of the command's environment, as it would a
+/// job's; potluck's own variables stay, and can't be named.
+#[test]
+fn nested_dispatch_unsets_what_it_is_asked_to() {
+    let grant = Grant {
+        ram_mib: 8192,
+        cpu: 1,
+        gpus: vec![],
+        exclusive: false,
+    };
+    let fake = lease_daemon(true, grant);
+    let cwd = tempfile::tempdir().unwrap();
+    let r = run(inside_job(&fake, cwd.path())
+        .env("FROM_THE_JOB", "job")
+        .env("KEPT", "job")
+        .args([
+            "dispatch",
+            "--timeout",
+            "1m",
+            "--unset-env",
+            "FROM_THE_JOB",
+            "--",
+            "sh",
+            "-c",
+            "echo ${FROM_THE_JOB-unset} $KEPT $POTLUCK_JOB",
+        ]));
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(r.stdout.trim(), "unset job studio-9");
+    let r = run(inside_job(&fake, cwd.path()).args([
+        "dispatch",
+        "--timeout",
+        "1m",
+        "--unset-env",
+        "POTLUCK_JOB",
+        "--",
+        "true",
+    ]));
+    assert_eq!(r.code, 2);
+    assert!(
+        r.stderr
+            .contains("--unset-env: POTLUCK_JOB is one of potluck's own variables"),
+        "{}",
+        r.stderr
+    );
 }
 
 /// In place, what ignores the SIGTERM at the run limit gets SIGKILL after the machine's

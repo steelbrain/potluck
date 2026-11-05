@@ -183,6 +183,7 @@ fn record(cmd: &[&str]) -> JobRecord {
             workspace: None,
             cmd: cmd.iter().map(|s| s.to_string()).collect(),
             env: BTreeMap::new(),
+            unset_env: Default::default(),
             timeout_ms: 60_000,
             hold_ms: None,
             keep: Vec::new(),

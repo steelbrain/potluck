@@ -464,6 +464,7 @@ mod tests {
                 workspace: None,
                 cmd: vec!["true".into()],
                 env: BTreeMap::new(),
+                unset_env: Default::default(),
                 timeout_ms: 60_000,
                 hold_ms: None,
                 keep: vec![],

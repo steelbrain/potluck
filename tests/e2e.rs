@@ -639,6 +639,32 @@ fn dispatch_wait_logs_env_status_why_cancel() {
     assert_eq!((code, j["state"].as_str()), (130, Some("cancelled")));
 }
 
+/// `--unset-env` leaves a variable out of the job's environment, whether the login shell or the
+/// committed potluck.toml set it.
+#[test]
+fn unset_env_leaves_variables_out_of_the_job() {
+    let n = Node::new();
+    let job = n.dispatch(&[
+        "--timeout",
+        "1m",
+        "--unset-env",
+        "E2E_LOGIN",
+        "--unset-env",
+        "FROM_TOML",
+        "--",
+        "sh",
+        "-c",
+        "echo \"LOGIN=${E2E_LOGIN-unset} TOML=${FROM_TOML-unset} OVERRIDE=$E2E_OVERRIDE JOB=$POTLUCK_JOB\"",
+    ]);
+    let (code, j, streamed) = n.wait(&job);
+    assert_eq!(code, 0, "{j} {streamed}");
+    let out = n.output(&job);
+    assert!(
+        out.contains(&format!("LOGIN=unset TOML=unset OVERRIDE=toml JOB={job}")),
+        "{out}"
+    );
+}
+
 #[test]
 fn workspaces_seed_reuse_cp_hold_idle_remove_release() {
     let n = Node::with(Opts {

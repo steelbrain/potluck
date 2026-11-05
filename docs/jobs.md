@@ -231,8 +231,7 @@ A job's environment is built in this order, later entries winning:
 
 1. the user's login environment, which the daemon captures from a login shell (`$SHELL -l`) when it
    starts. A login shell doesn't read `.zshrc` or `.bashrc`, so what jobs need belongs in a login
-   profile, and the daemon sees a change after a restart. A variable whose name or value isn't
-   UTF-8 is left out, and `daemon.log` names it;
+   profile. A variable whose name or value isn't UTF-8 is left out, and `daemon.log` names it;
 2. the `env` of each `[[gpu]]` entry of the machine's config whose GPU the job holds;
 3. `[env]` of the `potluck.toml` committed at the dispatched commit, then the recipe's `env`;
 4. `--env K=V`;
@@ -241,6 +240,25 @@ A job's environment is built in this order, later entries winning:
    with it.
 
 Nothing comes from the shell that ran `dispatch`.
+
+`--unset-env K`, repeatable, leaves K out of the job's environment, whichever of the first four
+set it (a recipe's `unset_env` does the same). `--env K=` is not the same: it gives K an empty
+value. potluck's own variables, the fifth entry, can't be left out. `dispatch` refuses
+`--unset-env` for one of them, for a K that isn't a variable name (letters, digits and `_`, not
+starting with a digit), and for a K that `--env` also sets:
+
+```console
+$ potluck dispatch --timeout 10m --unset-env HTTPS_PROXY -- cargo test
+job studio-6
+$ potluck dispatch --timeout 10m --unset-env TMPDIR -- cargo test
+potluck: --unset-env: TMPDIR is one of potluck's own variables, which every job gets (POTLUCK_JOB, POTLUCK_LEASE, POTLUCK_WORKSPACE, POTLUCK_NODE, POTLUCK_GPUS, POTLUCK_HOME, POTLUCK_CONFIG, TMPDIR)
+```
+
+The daemon captures the login environment when it starts, so a change to a login profile, or to
+anything else the login shell reads, reaches jobs only after `potluck restart` on that machine
+(or a restart of the daemon's service). A restart in place captures it again in the background:
+a job that starts before that capture ends gets the environment from before the restart, and so
+do all jobs if the capture fails (`daemon.log` says why).
 
 ## Dispatching from inside a job
 
@@ -253,7 +271,8 @@ foreground, at the top of the repository (where a dispatch from outside would ru
 process in that group gets SIGTERM, then SIGKILL after `kill_grace_s`, and `dispatch` exits
 with 124. A process that left the group (with `setsid`, for example) is not stopped then; it ends
 with the job, as do processes the command leaves running when it exits. Its environment is the job's
-with the request's env on top, except potluck's own variables, which stay the job's. A request that
+with the request's env on top and without the variables it unsets (`--unset-env`, a recipe's
+`unset_env`), except potluck's own variables, which stay the job's. A request that
 doesn't fit fails at once with exit code 2, and so does one with `--keep`, `--hold`, `--key`,
 `--label`, `--no-rerun`, `--kill-on-stall` or `--without-submodule`, which only mean something for
 a job of its own; a recipe's `keep`, `hold` and `without_submodules` are left out, and `dispatch`
@@ -300,9 +319,14 @@ $ potluck dispatch gpu-tests --timeout 1h -- cargo test --features gpu -- render
 ```
 
 A recipe's fields are `cmd` (required), `timeout`, `priority`, `ram`, `cpu`, `gpu`, `exclusive`,
-`on`, `hold`, `keep`, `without_submodules` (a list of `--without-submodule` patterns) and `env`. Unknown fields are refused, so a misspelled option can't be dropped
+`on`, `hold`, `keep`, `without_submodules` (a list of `--without-submodule` patterns), `env` and
+`unset_env` (a list of variable names, as `--unset-env` takes them). Unknown fields are refused, so a misspelled option can't be dropped
 silently. `on` is a table, as above, or a list in `--on`'s form: `on = ["macos=27", "gpu=apple"]`.
 Options on the command line replace the recipe's; `on` and `env` merge key by key, the command line
 last, with `os`, `macos` and `linux` counting as one key, so `--on macos` replaces a recipe's
-`os = "linux"`. A recipe's `exclusive = true` can't be turned off from the command line. `[env]`
-applies to every job dispatched from the repository.
+`os = "linux"`. `env` and `unset_env` merge the same way, as one set of keys: the recipe's
+`unset_env` removes what `[env]` sets, `--env K=V` sets K although the recipe's `unset_env` names
+it, and `--unset-env K` removes K although `[env]` or the recipe's `env` sets it. A recipe that
+names one variable in both its `env` and its `unset_env` is refused. A recipe's
+`exclusive = true` can't be turned off from the command line. `[env]` applies to every job
+dispatched from the repository.

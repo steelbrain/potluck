@@ -24,6 +24,7 @@ fn record(id: &str, state: JobState) -> JobRecord {
             workspace: None,
             cmd: vec!["true".into()],
             env: BTreeMap::new(),
+            unset_env: Default::default(),
             timeout_ms: 15 * MINUTE_MS,
             hold_ms: None,
             keep: Vec::new(),

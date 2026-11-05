@@ -54,9 +54,10 @@
 //! workspace and drops those pins when it removes it.
 //!
 //! A job's environment: the login environment, then the `[[gpu]]` env of each GPU it holds, then
-//! the spec's env, then potluck's own, which nothing overrides: POTLUCK_JOB, POTLUCK_LEASE,
-//! POTLUCK_WORKSPACE, POTLUCK_NODE, POTLUCK_GPUS, TMPDIR (beside the workspace), POTLUCK_HOME and
-//! POTLUCK_CONFIG (so a potluck call inside the job reaches this daemon).
+//! the spec's env, less the spec's `unset_env`, then potluck's own, which nothing overrides or
+//! unsets: POTLUCK_JOB, POTLUCK_LEASE, POTLUCK_WORKSPACE, POTLUCK_NODE, POTLUCK_GPUS, TMPDIR
+//! (beside the workspace), POTLUCK_HOME and POTLUCK_CONFIG (so a potluck call inside the job
+//! reaches this daemon).
 //!
 //! The names of potluck's own variables are [`JOB_VARIABLES`].
 //!

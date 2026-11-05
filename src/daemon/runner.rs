@@ -1577,11 +1577,14 @@ fn prepare_and_start(sh: &Arc<Shared>, id: &str) -> Result<(), NotStarted> {
         (st.local().facts.clone(), sh.login_env())
     };
     // The machine's (its login environment, then the env of each `[[gpu]]` entry for a GPU the
-    // job holds), then the dispatch's (the committed potluck.toml, then `--env`), then
-    // potluck's own variables, which nothing overrides.
+    // job holds), then the dispatch's (the committed potluck.toml, then `--env`), less what the
+    // dispatch unsets, then potluck's own variables, which nothing overrides or unsets.
     let mut env = login;
     env.extend(gpu_env(&sh.config, &facts, &lease.grant.gpus));
     env.extend(job.spec.env.clone());
+    for k in &job.spec.unset_env {
+        env.remove(k);
+    }
     env.insert("POTLUCK_JOB".into(), id.to_string());
     env.insert("POTLUCK_LEASE".into(), lease.token.clone());
     env.insert("POTLUCK_WORKSPACE".into(), ws.id.clone());
@@ -2489,6 +2492,7 @@ mod tests {
             workspace: None,
             cmd: vec!["true".into()],
             env: BTreeMap::new(),
+            unset_env: Default::default(),
             timeout_ms: 60_000,
             hold_ms: None,
             keep: vec![],
