@@ -749,11 +749,22 @@ pub(super) fn tick(sh: &Arc<Shared>, c: &Arc<Cluster>, now: u64) {
             cs.reconcile_due.remove(&owner);
             cs.reconciled_at.insert(owner.clone(), now);
             let c2 = c.clone();
+            // The owner's word stops only its own jobs, those this list names: an answer naming
+            // another machine's job, or one of this machine's own, is ignored.
+            let listed: BTreeSet<JobId> = jobs.iter().map(|(id, _)| id.clone()).collect();
             work.push((
                 format!("reconcile-{owner}"),
                 Box::new(move |sh| {
                     let r = c2.call(&owner, &PeerRequest::Reconcile { jobs }, CALL_TIMEOUT);
                     if let Ok(PeerResponse::Reconciled { drop }) = r {
+                        let (drop, not_its): (Vec<JobId>, Vec<JobId>) =
+                            drop.into_iter().partition(|id| listed.contains(id));
+                        if !not_its.is_empty() {
+                            sh.log.log(format!(
+                                "cluster: {owner} answered a reconcile naming jobs that are not its own held here: {}; ignored",
+                                not_its.join(", ")
+                            ));
+                        }
                         for id in drop {
                             // Its end reached the owner after this list left: nothing runs here.
                             if c2.cs().outbox.get(&id).is_some_and(|o| o.end_done) {

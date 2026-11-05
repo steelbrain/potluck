@@ -13,7 +13,7 @@ use potluck::daemon::{
     WorkspaceProvider,
 };
 use potluck::exec::{Executor, Launch, Sample};
-use potluck::mesh::{MeshConfig, Stream};
+use potluck::mesh::{Handler, MeshConfig, Peer, Stream};
 use potluck::proto::{ClientContext, Request, Response};
 use potluck::types::{
     Facts, Gpu, Handle, JobRecord, JobState, MAX_HOLD_MS, MIN_HOLD_MS, Millis, Reminder, RepoRef,
@@ -707,18 +707,7 @@ impl Node {
             idle_ms: 600_000,
         };
         let cluster = ClusterOptions {
-            mesh: MeshConfig {
-                name: self.name.clone(),
-                keys_dir: self.paths.keys_dir(),
-                listen: format!("127.0.0.1:{}", self.port).parse().unwrap(),
-                address: Some("127.0.0.1".into()),
-                version: self.version.clone(),
-                heartbeat: Duration::from_millis(100),
-                down_after: Duration::from_millis(self.down_after_ms),
-                updating_for: Duration::from_millis(self.updating_ms),
-                connect_timeout: Duration::from_secs(2),
-                call_timeout: Duration::from_secs(10),
-            },
+            mesh: self.mesh_config(),
             tick_ms: 100,
             pull_ms: 200,
             locality_wait_ms: self.locality_ms,
@@ -732,6 +721,29 @@ impl Node {
         };
         self.daemon =
             Some(Daemon::start_cluster(&self.paths, &self.config, parts, opts, cluster).unwrap());
+    }
+
+    /// The mesh the daemon runs: this machine's key and port, the test's short times.
+    fn mesh_config(&self) -> MeshConfig {
+        MeshConfig {
+            name: self.name.clone(),
+            keys_dir: self.paths.keys_dir(),
+            listen: format!("127.0.0.1:{}", self.port).parse().unwrap(),
+            address: Some("127.0.0.1".into()),
+            version: self.version.clone(),
+            heartbeat: Duration::from_millis(100),
+            down_after: Duration::from_millis(self.down_after_ms),
+            updating_for: Duration::from_millis(self.updating_ms),
+            connect_timeout: Duration::from_secs(2),
+            call_timeout: Duration::from_secs(10),
+        }
+    }
+
+    /// Stops the daemon and runs a bare mesh in its place, with this machine's key and port: a
+    /// member that stays up and says to the others' calls what `handler` makes it say.
+    fn impostor(&mut self, handler: Arc<dyn Handler>) -> potluck::mesh::Mesh {
+        self.stop();
+        potluck::mesh::Mesh::start(self.mesh_config(), handler).unwrap()
     }
 
     /// Stops the daemon and its mesh. Invocations keep running.
@@ -910,6 +922,33 @@ fn client_mesh(node: &Node) -> potluck::mesh::Mesh {
     let mut cfg = MeshConfig::new(&node.paths, &node.config);
     cfg.version = TEST_VERSION.to_string();
     potluck::mesh::Mesh::connect_only(cfg).unwrap()
+}
+
+/// What an impostor ([`Node::impostor`]) answers: for each op a test gave, that answer to every
+/// call with it, an error to any other call; and how many calls of each op came.
+#[derive(Default)]
+struct Scripted {
+    answers: Mutex<BTreeMap<String, Value>>,
+    calls: Mutex<BTreeMap<String, u64>>,
+}
+
+impl Scripted {
+    fn answer(&self, op: &str, v: Value) {
+        self.answers.lock().unwrap().insert(op.into(), v);
+    }
+
+    fn calls(&self, op: &str) -> u64 {
+        self.calls.lock().unwrap().get(op).copied().unwrap_or(0)
+    }
+}
+
+impl Handler for Scripted {
+    fn call(&self, _from: &Peer, msg: Value) -> Result<Value, String> {
+        let op = msg["op"].as_str().unwrap_or_default().to_string();
+        *self.calls.lock().unwrap().entry(op.clone()).or_default() += 1;
+        let answer = self.answers.lock().unwrap().get(&op).cloned();
+        answer.ok_or_else(|| format!("no {op} here"))
+    }
 }
 
 /// Pairs `new` into `member`'s cluster through the CLI: `pair`, `admit`, `pair --finish`.
@@ -4953,4 +4992,53 @@ fn a_runner_whose_clock_is_behind_does_not_get_its_jobs_deleted() {
     assert_eq!(j.state, JobState::TimedOut);
     assert!(output_of(&a, &job).contains("ran"));
     drop(b);
+}
+
+// ---------------------------------------------------------------------------------------------
+// What a member's word alone does on the others
+
+/// A member's answer to a reconcile stops only its own jobs that the runner listed: c, answering
+/// b's reconciles with a's job running on b and b's own job, stops neither.
+#[test]
+fn a_reconcile_answer_stops_only_the_answering_owners_jobs() {
+    let w = World::new();
+    let a = w.node("a").start();
+    let b = w.node("b").start();
+    let mut c = w.node("c").start();
+    pair(&a, &b);
+    pair(&a, &c);
+    wait_until("b and c see each other", || {
+        b.node_alive("c") && c.node_alive("b")
+    });
+    let theirs = a.dispatch(&["--on", "node=b", "--", "sleep", "60"]);
+    let own = b.dispatch(&["--on", "node=b", "--", "sleep", "60"]);
+    a.running_on(&theirs, "b");
+    b.running_on(&own, "b");
+    let script = Arc::new(Scripted::default());
+    script.answer(
+        "reconcile",
+        serde_json::json!({"kind": "reconciled", "drop": [theirs, own]}),
+    );
+    let mesh = c.impostor(script.clone());
+    // a and b each reconcile with c about once a second.
+    wait_until("c answered a few reconciles", || {
+        script.calls("reconcile") >= 6
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    let log = b.daemon_log();
+    assert!(
+        !log.contains("is no longer this machine's job") && !log.contains(": stopping: "),
+        "{log}"
+    );
+    assert_eq!(a.get(&theirs).state, JobState::Running);
+    assert_eq!(b.get(&own).state, JobState::Running);
+    let ignored = format!(
+        "cluster: c answered a reconcile naming jobs that are not its own held here: {theirs}, {own}; ignored"
+    );
+    assert!(log.contains(&ignored), "{log}");
+    mesh.stop();
+    a.cli_ok(&["cancel", &theirs]);
+    b.cli_ok(&["cancel", &own]);
+    a.done(&theirs);
+    b.done(&own);
 }
