@@ -33,6 +33,10 @@
 
 ### Fixed
 
+- A member that fetched a repository from the dispatching machine for a job could fetch any object
+  of its mirror there, every branch and tag included. It now gets only the commits of the queued
+  jobs it may take and of the jobs it runs, with what they reach, so a mirror on any other machine
+  than the dispatching one has none of the repository's branches and tags.
 - `potluck user add NAME KEY` takes a key that starts with `-` (one in 64), not as an option.
 - A member's report counts only the workspaces on that member. Workspaces it listed on other
   machines showed in `status` and could hold a job back for the 3-second locality wait, as if the

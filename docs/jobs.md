@@ -45,8 +45,9 @@ and REV is a commit there, HEAD by default. An argument that is a directory as a
 otherwise it splits at the last `@` that has a directory before it, so `../dep@HEAD@{1}` works. As
 for the job's own repository, only committed work counts: REV must name a commit, and uncommitted
 changes in DIR are not carried. The repository travels like a submodule (see
-[Sources](cluster.md#sources)), with its branches and tags, into the running machine's mirror of it,
-the one a dispatch from that repository on the dispatching machine uses. The commit is pinned there
+[Sources](cluster.md#sources)) into the running machine's mirror of it, the one a dispatch from
+that repository on the dispatching machine uses: on another machine, that mirror has the commit
+and what it reaches, and none of the repository's branches and tags. The commit is pinned there
 until the job ends, and nothing checks it out. The job finds the mirror's path in
 `POTLUCK_MIRROR_<name>`, where `<name>` is the directory name of the repository's working tree (of a
 bare repository, its name without `.git`), with every character but ASCII letters, digits and `_`

@@ -12,7 +12,7 @@ use crate::types::{
     RepoRef, WorkspaceId,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufReader, Read, Write};
 use std::path::{Component, Path};
 use std::sync::Arc;
@@ -1259,12 +1259,14 @@ impl Drop for PartDir {
     }
 }
 
-/// A runner's mirror syncs from this machine: `git upload-pack` of this machine's own mirror of a
-/// repository a job of this machine's names ([`fetchable`]). A dispatch syncs that mirror from
-/// its source and pins its commits there until the job ends, so the mirror has every commit a
-/// queued job needs. The source recorded at the latest dispatch may not: worktrees of one project
-/// keep their submodules' git dirs apart, and a submodule commit made in one worktree is only in
-/// its own. The source is served only if the mirror is gone.
+/// A runner's mirror syncs from this machine: `git upload-pack` of a view of this machine's own
+/// mirror of a repository ([`crate::tunnel::View`]), made for this one fetch, whose only refs are
+/// the commits there of this machine's jobs that the asker may fetch ([`fetchable`]) as they
+/// stand when it asks: it can fetch those, not the mirror's branches, tags or other objects. A
+/// dispatch syncs that mirror from its source and pins its commits there until the job ends, so
+/// the mirror has every commit a queued job needs. The source recorded at the latest dispatch may not: worktrees
+/// of one project keep their submodules' git dirs apart, and a submodule commit made in one
+/// worktree is only in its own. The source is served only if the mirror is gone.
 pub(super) fn upload_pack(
     sh: &Shared,
     c: &Cluster,
@@ -1273,13 +1275,13 @@ pub(super) fn upload_pack(
     stream: crate::mesh::Stream,
 ) {
     let taker = Taker::of(&c.mesh(), from);
-    let source = {
+    let served = {
         let st = sh.lock();
-        fetchable(&st, &taker, repo_id)
-            .then(|| c.cs().sources.get(repo_id).cloned())
-            .flatten()
+        let commits = fetchable(&st, &taker, repo_id);
+        let source = c.cs().sources.get(repo_id).cloned();
+        source.filter(|_| !commits.is_empty()).map(|s| (s, commits))
     };
-    let Some(source) = source else {
+    let Some((source, commits)) = served else {
         sh.log.log(format!(
             "cluster: {from} asked for repository {repo_id}, which no job queued here, or run by {from}, names"
         ));
@@ -1295,7 +1297,31 @@ pub(super) fn upload_pack(
     };
     let mirror = sh.paths.mirror(repo_id);
     let dir = if mirror.is_dir() { mirror } else { source };
-    if let Err(e) = c.opts.tunnel.serve_upload_pack(&dir, stream) {
+    static VIEWS: AtomicU64 = AtomicU64::new(0);
+    let name = format!(
+        "{}-{}.git",
+        std::process::id(),
+        VIEWS.fetch_add(1, Ordering::Relaxed)
+    );
+    let view = match crate::tunnel::View::create(
+        sh.paths.upload_pack_views().join(name),
+        &dir,
+        &commits,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            sh.log.log(format!(
+                "cluster: serving {repo_id} ({}) to {from}: {e}",
+                dir.display()
+            ));
+            let _ = crate::tunnel::refuse_upload_pack(
+                stream,
+                &format!("{} can't serve repository {repo_id}: {e}", c.node),
+            );
+            return;
+        }
+    };
+    if let Err(e) = c.opts.tunnel.serve_upload_pack(view.path(), stream) {
         sh.log.log(format!(
             "cluster: serving {repo_id} ({}) to {from}: {e:#}",
             dir.display()
@@ -1303,20 +1329,25 @@ pub(super) fn upload_pack(
     }
 }
 
-/// Whether member `peer` may fetch repository `repo_id` from this machine: a job of this
-/// machine's names it (as its repository, a submodule's or a carried one) and is queued, for a
-/// member that may take it ([`may_take`]: a runner syncs its mirrors before it claims), or is held
-/// by `peer`. Not any repository a dispatch here ever named.
-fn fetchable(st: &State, peer: &Taker, repo_id: &str) -> bool {
-    st.jobs.values().any(|j| {
-        owner_of(&j.id) == st.node
-            && match j.state {
-                JobState::Queued => may_take(j, peer),
-                JobState::Starting | JobState::Running => j.node.as_deref() == Some(&peer.name),
-                _ => false,
-            }
-            && j.spec.repo.commits().any(|(id, _, _)| id == repo_id)
-    })
+/// The commits of repository `repo_id` that member `peer` may fetch from this machine: those that
+/// this machine's jobs name there (as its repository, a submodule's or a carried one) that are
+/// queued, for a member that may take them ([`may_take`]: a runner syncs its mirrors before it
+/// claims), or are held by `peer`. None of a job that ended or another member holds.
+fn fetchable(st: &State, peer: &Taker, repo_id: &str) -> BTreeSet<String> {
+    st.jobs
+        .values()
+        .filter(|j| {
+            owner_of(&j.id) == st.node
+                && match j.state {
+                    JobState::Queued => may_take(j, peer),
+                    JobState::Starting | JobState::Running => j.node.as_deref() == Some(&peer.name),
+                    _ => false,
+                }
+        })
+        .flat_map(|j| j.spec.repo.commits())
+        .filter(|(id, _, _)| *id == repo_id)
+        .map(|(_, _, commit)| commit.to_string())
+        .collect()
 }
 
 /// Records where each repository of a dispatch comes from, for the runners' syncs.

@@ -14,15 +14,19 @@
 //!   (git shows them) with a non-zero exit. Only fetching: git names the service it wants in
 //!   `GIT_EXT_SERVICE`, and anything but `git-upload-pack` is refused.
 //! - **The server.** The owner's daemon reads the header's repository id (its stream header
-//!   `upload-pack`, parsed as the cluster's `StreamHeader`), serves its own mirror of that
-//!   repository if a dispatch there named it, and calls [`serve_upload_pack`] through
-//!   [`crate::daemon::GitTunnel`]; an unknown id gets [`refuse_upload_pack`], which git shows
-//!   as `fatal: remote error: <message>`. `git upload-pack` runs in a process group of its own and
-//!   is killed with its children if either side goes away; it is always reaped before the call
-//!   returns.
+//!   `upload-pack`, parsed as the cluster's `StreamHeader`), makes a [`View`] of its own mirror
+//!   of that repository with the commits of its jobs that the asker may run or runs, and serves
+//!   it with [`serve_upload_pack`] through [`crate::daemon::GitTunnel`]; an unknown id gets
+//!   [`refuse_upload_pack`], which git shows as `fatal: remote error: <message>`. `git
+//!   upload-pack` runs in a process group of its own and is killed with its children if either
+//!   side goes away; it is always reaped before the call returns.
 //!
-//! Members can fetch any commit the source has, as with git's protocol v2: a job's commit may be
-//! on no branch any more by the time a runner asks for it.
+//! A fetch gets only what the served git dir's refs name: `git upload-pack` speaks protocol v0
+//! (v2 would take a want of any object) with `uploadpack.allow*SHA1InWant` off, so a want of
+//! anything but a ref's tip is refused (`allowReachableSHA1InWant` would also take any tree or
+//! blob by its id). A [`View`]'s refs are commits by id, none of them a branch or tag (a job's
+//! commit may be on no branch any more by the time a runner asks for it): a runner's sync of its
+//! branches and tags gets none, and it fetches each commit it lacks by its id.
 
 use crate::config::{NodeConfig, Paths};
 use crate::mesh::{Mesh, MeshConfig, Stream};
@@ -32,7 +36,7 @@ use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::AsFd;
 use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Stdio};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
@@ -176,8 +180,92 @@ fn err_pkt(message: &str) -> Vec<u8> {
     pkt
 }
 
+/// The prefix of a [`View`]'s refs: `refs/potluck/commits/<sha>`, none of them a branch or tag.
+const VIEW_REFS: &str = "refs/potluck/commits";
+
+/// A git dir that serves some commits of a repository and nothing else of it, for
+/// [`serve_upload_pack`]: its only refs are those commits (`refs/potluck/commits/<sha>`), and it
+/// reads the repository's objects through `objects/info/alternates`, so nothing is copied and
+/// nothing is written into the repository. A fetch from it can want those commits (and gets
+/// what they reach that it lacks), not another branch, tag or object of the repository. Removed
+/// with everything in it when dropped.
+#[derive(Debug)]
+pub struct View {
+    dir: PathBuf,
+}
+
+impl View {
+    /// Makes a view at `dir` (which must not exist) of `commits` of the repository at `git_dir`.
+    /// Only full shas count: 40 hex digits, or 64 when the first is that long (a SHA-256
+    /// repository). A commit the repository lacks gets a ref all the same; a fetch of it fails
+    /// (git says "not our ref").
+    pub fn create(
+        dir: PathBuf,
+        git_dir: &Path,
+        commits: impl IntoIterator<Item = impl AsRef<str>>,
+    ) -> io::Result<View> {
+        let objects = git_dir.join("objects").canonicalize().map_err(|e| {
+            io::Error::new(e.kind(), format!("can't read {}: {e}", git_dir.display()))
+        })?;
+        let alternate = objects
+            .to_str()
+            .filter(|s| !s.contains('\n'))
+            .ok_or_else(|| {
+                io::Error::other(format!(
+                    "can't serve {}: a path git can't read",
+                    objects.display()
+                ))
+            })?;
+        let mut commits: Vec<String> = commits
+            .into_iter()
+            .map(|c| c.as_ref().to_ascii_lowercase())
+            .filter(|c| {
+                (c.len() == 40 || c.len() == 64) && c.bytes().all(|b| b.is_ascii_hexdigit())
+            })
+            .collect();
+        let sha256 = commits.first().is_some_and(|c| c.len() == 64);
+        commits.retain(|c| (c.len() == 64) == sha256);
+        if let Some(parent) = dir.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::create_dir(&dir)?;
+        let view = View { dir };
+        let d = &view.dir;
+        std::fs::create_dir_all(d.join("objects/info"))?;
+        std::fs::create_dir_all(d.join(VIEW_REFS))?;
+        std::fs::write(d.join("HEAD"), "ref: refs/heads/main\n")?;
+        let config = if sha256 {
+            "[core]\n\trepositoryformatversion = 1\n\tbare = true\n[extensions]\n\tobjectformat = sha256\n"
+        } else {
+            "[core]\n\trepositoryformatversion = 0\n\tbare = true\n"
+        };
+        std::fs::write(d.join("config"), config)?;
+        std::fs::write(d.join("objects/info/alternates"), format!("{alternate}\n"))?;
+        // A shallow repository's boundary, so that git doesn't look for the parents it lacks.
+        if let Ok(shallow) = std::fs::read(git_dir.join("shallow")) {
+            std::fs::write(d.join("shallow"), shallow)?;
+        }
+        for c in &commits {
+            std::fs::write(d.join(VIEW_REFS).join(c), format!("{c}\n"))?;
+        }
+        Ok(view)
+    }
+
+    /// The view's git dir.
+    pub fn path(&self) -> &Path {
+        &self.dir
+    }
+}
+
+impl Drop for View {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
 /// Runs `git upload-pack` on `git_dir` with its stdin and stdout piped through `stream`, until
 /// the fetch is done or either side goes away, for the daemon's [`crate::mesh::Handler::stream`].
+/// The client can want only the tips of `git_dir`'s refs (see the module docs).
 ///
 /// The process (and anything it started) is killed if the stream breaks or stops taking bytes
 /// for five minutes, and is reaped before this returns. If `git upload-pack` fails before it
@@ -190,9 +278,14 @@ pub fn serve_upload_pack(mut stream: Stream, git_dir: &Path) -> io::Result<()> {
     reader.set_read_timeout(Some(POLL))?;
     stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
     let mut cmd = crate::gitinfo::git(git_dir);
+    // On the command line, after every config file: no config can let more through.
     cmd.args([
         "-c",
-        "uploadpack.allowAnySHA1InWant=true",
+        "uploadpack.allowAnySHA1InWant=false",
+        "-c",
+        "uploadpack.allowReachableSHA1InWant=false",
+        "-c",
+        "uploadpack.allowTipSHA1InWant=false",
         "upload-pack",
         &format!("--timeout={UPLOAD_PACK_TIMEOUT_S}"),
     ])
@@ -554,6 +647,57 @@ mod tests {
         ] {
             assert_eq!(upload_pack_repo(&bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn views() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("r.git");
+        let init = std::process::Command::new("git")
+            .args(["init", "-q", "--bare"])
+            .arg(&repo)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .status()
+            .unwrap();
+        assert!(init.success());
+        let refs = |view: &View| -> Vec<String> {
+            let mut names: Vec<String> = std::fs::read_dir(view.path().join(VIEW_REFS))
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        };
+        let read = |view: &View, f: &str| std::fs::read_to_string(view.path().join(f)).unwrap();
+        let (a, b, c) = ("a".repeat(40), "B".repeat(40), "c".repeat(64));
+        let at = tmp.path().join("views/1.git");
+        let view = View::create(at.clone(), &repo, [&a, "HEAD", &b, &c, &a[..39]]).unwrap();
+        assert_eq!(refs(&view), [a.clone(), b.to_lowercase()]);
+        assert_eq!(read(&view, &format!("{VIEW_REFS}/{a}")), format!("{a}\n"));
+        assert!(read(&view, "config").contains("repositoryformatversion = 0"));
+        let objects = repo.join("objects").canonicalize().unwrap();
+        assert_eq!(
+            read(&view, "objects/info/alternates"),
+            format!("{}\n", objects.display())
+        );
+        assert_eq!(read(&view, "HEAD"), "ref: refs/heads/main\n");
+        // Never made over another.
+        assert!(View::create(at.clone(), &repo, [&a]).is_err());
+        drop(view);
+        assert!(!at.exists());
+
+        let view = View::create(tmp.path().join("views/2.git"), &repo, [&c, &a]).unwrap();
+        assert_eq!(refs(&view), [c]);
+        assert!(read(&view, "config").contains("objectformat = sha256"));
+
+        let gone = View::create(
+            tmp.path().join("views/3.git"),
+            &tmp.path().join("gone"),
+            [&a],
+        );
+        assert!(gone.unwrap_err().to_string().contains("can't read"));
+        assert!(!tmp.path().join("views/3.git").exists());
     }
 
     #[test]

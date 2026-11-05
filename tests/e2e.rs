@@ -2289,6 +2289,120 @@ fn a_runner_syncs_from_the_source_when_the_owners_mirror_is_gone() {
     assert_eq!(mirrors_of(&b).len(), 2);
 }
 
+/// Whether the repository `repo` has object `sha`.
+fn has_object(repo: &Path, sha: &str) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["cat-file", "-e", sha])
+        .stderr(Stdio::null())
+        .status()
+        .unwrap()
+        .success()
+}
+
+/// A runner gets from the job's owner only the commits of the jobs it may run or runs: b, running
+/// a's job A (a commit on branch x), has in its mirror that commit and what it reaches, and none
+/// of the project's branches and tags; not job B's commit (on branch y, running on a), nor a
+/// commit only a tag has. Asked for by their ids through the tunnel as b, a serves job A's
+/// commit and refuses the others.
+#[test]
+fn a_runner_gets_only_the_commits_of_its_jobs() {
+    let a = Node::new();
+    let b = Node::new();
+    pair(&a, &b);
+    let proj = &a.proj;
+    let commit = |file: &str| {
+        std::fs::write(proj.join(file), format!("{file}\n")).unwrap();
+        git(proj, &["add", file]);
+        git(proj, &["commit", "-qm", file]);
+        git(proj, &["rev-parse", "HEAD"])
+    };
+    let base = git(proj, &["rev-parse", "HEAD"]);
+    git(proj, &["checkout", "-q", "-b", "y"]);
+    let job_b_commit = commit("b.txt");
+    let on_a = format!("node={}", a.name);
+    let job_b = a.dispatch(&["--timeout", "1m", "--on", &on_a, "--", "sleep", "30"]);
+    a.running(&job_b);
+    git(proj, &["checkout", "-q", "--detach", BRANCH]);
+    let tagged = commit("t.txt");
+    git(proj, &["tag", "-a", "-m", "only a tag has it", "vt"]);
+    git(proj, &["checkout", "-q", "-b", "x", BRANCH]);
+    let job_a_commit = commit("a.txt");
+    let on_b = format!("node={}", b.name);
+    let job_a = a.dispatch(&["--timeout", "1m", "--on", &on_b, "--", "sleep", "30"]);
+    let j = a.running(&job_a);
+    let logs = || format!("{}\n{}", a.daemon_log(), b.daemon_log());
+    assert_eq!(j.node.as_deref(), Some(b.name.as_str()), "{}", logs());
+    assert_eq!(j.spec.repo.commit, job_a_commit);
+
+    let mirror = mirrors_of(&b)
+        .into_iter()
+        .find(|m| has_object(m, &job_a_commit))
+        .unwrap_or_else(|| panic!("no mirror on b has job A's commit\n{}", logs()));
+    assert!(has_object(&mirror, &base));
+    for (what, sha) in [("job B's commit", &job_b_commit), ("the tag's", &tagged)] {
+        assert!(!has_object(&mirror, sha), "b's mirror has {what}");
+    }
+    let branches_and_tags = git(
+        &mirror,
+        &[
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/heads",
+            "refs/tags",
+        ],
+    );
+    assert_eq!(branches_and_tags, "", "b's mirror");
+
+    // Through the tunnel, as b.
+    let url = potluck::tunnel::fetch_url(Path::new(BIN), &a.name, &j.spec.repo.id);
+    let into = b.dir.path().join("into.git");
+    git(
+        b.dir.path(),
+        &["init", "-q", "--bare", into.to_str().unwrap()],
+    );
+    let fetch = |args: &[&str]| {
+        Command::new("git")
+            .arg("-C")
+            .arg(&into)
+            .args(["-c", "protocol.ext.allow=always"])
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("POTLUCK_HOME", &b.paths.home)
+            .env("POTLUCK_CONFIG", &b.paths.config)
+            .output()
+            .unwrap()
+    };
+    let ls = fetch(&["ls-remote", &url]);
+    assert!(
+        ls.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ls.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&ls.stdout).trim(),
+        format!("{job_a_commit}\trefs/potluck/commits/{job_a_commit}")
+    );
+    for sha in [&job_b_commit, &tagged] {
+        let out = fetch(&["fetch", "--quiet", &url, sha]);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !out.status.success() && err.contains("not allow request for unadvertised object"),
+            "{sha}: {err}"
+        );
+        assert!(!has_object(&into, sha));
+    }
+    let out = fetch(&["fetch", "--quiet", &url, &job_a_commit]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(has_object(&into, &job_a_commit));
+}
+
 // ---------------------------------------------------------------------------------------------
 // Restart in place (`potluck restart`; src/daemon/handover.rs)
 

@@ -403,16 +403,19 @@ impl WorkspaceProvider for FakeWs {
 }
 
 /// Syncs name their source by URL; serving git isn't needed with fake mirrors. A member that asks
-/// an owner for a repository it may fetch gets `served`.
+/// an owner for a repository it may fetch gets `served` and what the git dir served names: the
+/// commits of its refs, in their order.
 struct FakeTunnel;
 
 impl Tunnel for FakeTunnel {
     fn fetch_url(&self, _potluck_bin: &Path, owner: &str, repo_id: &str) -> String {
         format!("fake://{owner}/{repo_id}")
     }
-    fn serve_upload_pack(&self, _git_dir: &Path, mut stream: Stream) -> anyhow::Result<()> {
+    fn serve_upload_pack(&self, git_dir: &Path, mut stream: Stream) -> anyhow::Result<()> {
         use std::io::Write;
-        stream.write_all(b"served\n")?;
+        let refs = git(git_dir, &["for-each-ref", "--format=%(objectname)"]);
+        let commits: Vec<&str> = refs.lines().collect();
+        stream.write_all(format!("served {}\n", commits.join(" ")).as_bytes())?;
         stream.close_write()?;
         Ok(())
     }
@@ -5517,11 +5520,13 @@ fn upload_pack(mesh: &potluck::mesh::Mesh, owner: &str, repo_id: &str) -> String
     got
 }
 
-/// A member fetches through an owner a repository one of the owner's jobs names: while the job is
-/// queued (any member may take it, and syncs its mirrors before it claims), or while that member
-/// holds it. Not one that only an ended job named, nor that of a job another member holds.
+/// A member fetches through an owner the commits of a repository that the owner's jobs name, as
+/// they stand when it asks: those of each job queued (any member may take it, and syncs its
+/// mirrors before it claims) and of each job that member holds. The git dir served has no other
+/// ref: not the commit of a job another member holds, nor the repository's other branches and
+/// tags. A repository that only an ended job named, or only jobs other members hold, is refused.
 #[test]
-fn upload_pack_serves_the_repositories_of_queued_jobs_and_of_the_askers_own() {
+fn upload_pack_serves_the_commits_of_queued_jobs_and_of_the_askers_own() {
     let w = World::new();
     let a = w.node("a").start();
     let mut b = w.node("b").start();
@@ -5533,50 +5538,91 @@ fn upload_pack_serves_the_repositories_of_queued_jobs_and_of_the_askers_own() {
     });
     let ended = a.dispatch(&["--on", "node=a", "--", "true"]);
     let ended_repo = a.done(&ended).spec.repo.id;
-    // b takes nothing: a's job for it stays queued.
+    // b takes nothing: a's jobs for it stay queued.
     let as_b = b.impostor(Arc::new(Scripted::default()));
     let other = w.another_repo("other");
-    let o = a.cli_in(
-        &other,
-        &[
-            "dispatch",
-            "--timeout",
-            "60s",
-            "--on",
-            "node=b",
-            "--",
-            "true",
-        ],
-    );
-    assert_eq!(o.code, 0, "{}\n{}", o.stdout, o.stderr);
-    let job = o.json["job"].as_str().unwrap().to_string();
+    let other_id = potluck::types::repo_id(&other.join(".git"));
+    let dispatch = || {
+        let o = a.cli_in(
+            &other,
+            &[
+                "dispatch",
+                "--timeout",
+                "60s",
+                "--on",
+                "node=b",
+                "--",
+                "true",
+            ],
+        );
+        assert_eq!(o.code, 0, "{}\n{}", o.stdout, o.stderr);
+        o.json["job"].as_str().unwrap().to_string()
+    };
+    let job = dispatch();
     let repo = a.get(&job).spec.repo.id;
+    let first = a.get(&job).spec.repo.commit;
     assert_ne!(repo, ended_repo);
+    // A commit on a branch of its own, in the source.
+    let commit = |branch: &str, file: &str| {
+        git(&other, &["checkout", "-q", "-b", branch]);
+        std::fs::write(other.join(file), format!("{file}\n")).unwrap();
+        git(&other, &["add", file]);
+        git(&other, &["commit", "-qm", file]);
+        let sha = git(&other, &["rev-parse", "HEAD"]);
+        w.source
+            .lock()
+            .unwrap()
+            .insert((other_id.clone(), sha.clone()));
+        sha
+    };
+    // A second job, at a commit on another branch; and a branch and a tag no job names.
+    let second_commit = commit("y", "y.txt");
+    let second = dispatch();
+    assert_eq!(a.get(&second).spec.repo.commit, second_commit);
+    commit("z", "z.txt");
+    git(&other, &["tag", "-a", "-m", "no job's", "vz"]);
+    let served = |commits: &[&str]| {
+        let mut commits = commits.to_vec();
+        commits.sort();
+        format!("served {}\n", commits.join(" "))
+    };
+    let both = served(&[&first, &second_commit]);
     let as_c = client_mesh(&c);
     let refused = |who: &str, id: &str| {
         format!("ERR a has no job queued, or run by {who}, that names repository {id}\n")
     };
-    assert_eq!(upload_pack(&as_b, "a", &repo), "served\n");
-    assert_eq!(upload_pack(&as_c, "a", &repo), "served\n");
+    assert_eq!(upload_pack(&as_b, "a", &repo), both);
+    assert_eq!(upload_pack(&as_c, "a", &repo), both);
     let got = upload_pack(&as_b, "a", &ended_repo);
     assert!(got.ends_with(&refused("b", &ended_repo)), "{got:?}");
-    // b claims it: then it is b's to fetch, not c's.
-    let claim = serde_json::json!({
-        "op": "claim",
-        "job": job,
-        "lease": {
-            "grant": {"ram_mib": 4096, "cpu": 1, "gpus": [], "exclusive": false},
-            "granted_at": now_ms(),
-            "deadline": now_ms() + 60_000,
-            "token": "t1",
-        },
-        "workspace": "b-w9",
-    });
-    let r = as_b.call("a", claim).unwrap();
-    assert_eq!(r["kind"], "granted", "{r}");
-    assert_eq!(upload_pack(&as_b, "a", &repo), "served\n");
+    // b claims the first job: then its commit is b's to fetch, not c's.
+    let claim = |job: &str, token: &str, ws: &str| {
+        let claim = serde_json::json!({
+            "op": "claim",
+            "job": job,
+            "lease": {
+                "grant": {"ram_mib": 4096, "cpu": 1, "gpus": [], "exclusive": false},
+                "granted_at": now_ms(),
+                "deadline": now_ms() + 60_000,
+                "token": token,
+            },
+            "workspace": ws,
+        });
+        let r = as_b.call("a", claim).unwrap();
+        assert_eq!(r["kind"], "granted", "{r}");
+    };
+    claim(&job, "t1", "b-w9");
+    assert_eq!(upload_pack(&as_b, "a", &repo), both);
+    assert_eq!(upload_pack(&as_c, "a", &repo), served(&[&second_commit]));
+    // And the second: nothing of the repository is c's.
+    claim(&second, "t2", "b-w10");
+    assert_eq!(upload_pack(&as_b, "a", &repo), both);
     let got = upload_pack(&as_c, "a", &repo);
     assert!(got.ends_with(&refused("c", &repo)), "{got:?}");
+    // Each view goes when its fetch is over.
+    wait_until("a's views are gone", || {
+        std::fs::read_dir(a.paths.home.join("upload-pack")).map_or(0, |d| d.count()) == 0
+    });
     as_c.stop();
     as_b.stop();
 }
@@ -6202,7 +6248,10 @@ fn a_job_runs_only_in_its_pools() {
         )),
         "{got:?}"
     );
-    assert_eq!(upload_pack(&as_b, "a", &repo), "served\n");
+    assert_eq!(
+        upload_pack(&as_b, "a", &repo),
+        format!("served {}\n", a.get(&waits).spec.repo.commit)
+    );
     let claim = serde_json::json!({
         "op": "claim",
         "job": waits,

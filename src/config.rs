@@ -107,6 +107,11 @@ impl Paths {
     pub fn mirror(&self, repo_id: &str) -> PathBuf {
         self.home.join("mirrors").join(format!("{repo_id}.git"))
     }
+    /// Where the views of mirrors served to other members ([`crate::tunnel::View`]) are made, one
+    /// for each fetch; emptied when the daemon starts.
+    pub fn upload_pack_views(&self) -> PathBuf {
+        self.home.join("upload-pack")
+    }
     pub fn base(&self, repo_id: &str) -> PathBuf {
         self.home.join("bases").join(repo_id)
     }

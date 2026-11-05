@@ -574,6 +574,9 @@ impl Daemon {
             }
         };
         let from_handover = inherited.is_some();
+        // Views of mirrors a daemon before this one served and never removed (it stopped while
+        // they were served): no fetch from them goes on.
+        let _ = std::fs::remove_dir_all(paths.upload_pack_views());
         let (lock, socket, mesh_listener, conns, facts, members, orphans, came, unwritten) =
             match inherited {
                 Some(i) => (
