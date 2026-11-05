@@ -1465,6 +1465,25 @@ fn resize_lowers_a_queued_jobs_request_in_place() {
     );
 }
 
+/// `why` of a finished job says the most memory it used, as the machine measured it, beside what
+/// it reserved.
+#[test]
+fn why_of_a_finished_job_gives_its_peak_memory() {
+    let f = Fixture::new().start();
+    let id = f.dispatch(spec("sleep 0.5"));
+    let j = f.wait(&id);
+    assert_eq!(j.usage.peak_mem_bytes, 1 << 20, "{j:#?}");
+    let why = match f.client().call(Request::Why { job: id.clone() }).unwrap() {
+        Response::Why { why } => why,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(why.state, "succeeded");
+    assert_eq!(
+        why.lines[1],
+        "peak memory 1.0 MiB of the 512 MiB it reserved"
+    );
+}
+
 #[test]
 fn run_limit_terms_then_kills() {
     let f = Fixture::new().start();

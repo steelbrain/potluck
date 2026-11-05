@@ -146,6 +146,13 @@ $ potluck resize studio-41 --ram 2
 job studio-41 now asks for 2 GiB of RAM, not 16 GiB; it keeps its place in the queue
 ```
 
+`potluck why` of a job that has ended says the most memory it used beside what it reserved:
+`peak memory 1.2 GiB of the 16 GiB it reserved`. On Linux that is the larger of the peak the
+kernel counted for the job's unit (`memory.peak`, from Linux 5.19) and potluck's samples, taken
+every half second; on macOS it is the largest sample of the memory footprint of the job's
+processes, so a climb between two samples can be missed. A job that ended before its first sample
+has no peak, and `why` gives none.
+
 A job may have at most 16384 processes. On Linux that is its unit's `TasksMax`, which counts
 threads too, and a fork past it fails. On macOS it counts processes, potluck's supervisor
 included, and is at most half of `kern.maxprocperuid`, the most processes one user may have

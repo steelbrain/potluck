@@ -6,7 +6,7 @@
 //! in it)"; "msi can't take it yet: its mirror of proj lacks commit 0123abcd yet: syncing from
 //! studio". For a running job: its time against its run
 //! limit, its CPU and last output, and whether it is stalled. For a finished one: how it ended,
-//! with any stuck pids.
+//! the most memory it used beside what it reserved, and any stuck pids.
 //!
 //! Times come from the lease records and the daemon's own samples, never from `ps`.
 //!
@@ -747,6 +747,18 @@ impl Why<'_, '_> {
             (None, Some(e)) => self.line(format!("ended {} without starting", ago(e))),
             (Some(s), None) => self.line(format!("started{on} {}", ago(s))),
             (None, None) => {}
+        }
+        // The most memory it used, as its machine measured it (0: none was), beside what it
+        // reserved; not when its message says what it used (ended over memory, or by the OOM
+        // killer).
+        let peak = r.usage.peak_mem_bytes;
+        let said = r.message.as_deref().is_some_and(|m| m.contains(": used "));
+        if peak > 0 && !said {
+            self.line(format!(
+                "peak memory {} of the {} it reserved",
+                fmt_bytes(peak),
+                fmt_mib(r.spec.request.ram_mib)
+            ));
         }
         let code = r.exit_code_for_client();
         let exited = |c: Option<i32>| c.map(|c| format!("exited with code {c}"));

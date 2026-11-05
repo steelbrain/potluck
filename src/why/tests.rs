@@ -683,6 +683,77 @@ fn finished() {
     );
 }
 
+/// A finished job's peak memory, as its machine measured it, beside what it reserved: not when
+/// none was measured, nor when its message already says what it used.
+#[test]
+fn finished_with_its_peak() {
+    let ended = |state: JobState, peak: u64| {
+        let mut r = record("j", state);
+        r.node = Some("msi".into());
+        r.started_at = Some(m(-20));
+        r.ended_at = Some(m(-5));
+        r.spec.request.ram_mib = 16 * 1024;
+        r.usage.peak_mem_bytes = peak;
+        r
+    };
+    let why_of = |r: JobRecord| {
+        let mut w = World::new(vec![]);
+        w.jobs.push(r);
+        w.why("j").lines
+    };
+    let mut r = ended(JobState::Succeeded, 1_288_490_189);
+    r.exit_code = Some(0);
+    assert_eq!(
+        why_of(r),
+        [
+            "ran for 15m on msi, ended 5m ago",
+            "peak memory 1.2 GiB of the 16 GiB it reserved",
+            "exited with code 0"
+        ]
+    );
+    let mut r = ended(JobState::Failed, 300 << 20);
+    r.spec.request.ram_mib = 512;
+    r.exit_code = Some(1);
+    assert_eq!(
+        why_of(r)[1],
+        "peak memory 300.0 MiB of the 512 MiB it reserved"
+    );
+    // None measured (it ended before a sample): no line.
+    let mut r = ended(JobState::Succeeded, 0);
+    r.exit_code = Some(0);
+    assert_eq!(
+        why_of(r),
+        ["ran for 15m on msi, ended 5m ago", "exited with code 0"]
+    );
+    // Its message says what it used already.
+    let mut r = ended(JobState::OverMemory, 17 << 30);
+    r.message = Some("over memory: used 17 GiB of its 16 GiB".into());
+    assert_eq!(
+        why_of(r),
+        [
+            "ran for 15m on msi, ended 5m ago",
+            "over memory: used 17 GiB of its 16 GiB",
+            "potluck wait exits with 137"
+        ]
+    );
+    let mut r = ended(JobState::Failed, 2 << 30);
+    r.signal = Some(9);
+    r.message = Some(
+        "killed because the machine ran short of memory, under its own limit: used 2 GiB of its 16 GiB"
+            .into(),
+    );
+    assert!(!why_of(r).iter().any(|l| l.starts_with("peak memory")));
+    // Over memory without a message: the peak says how far over.
+    let r = ended(JobState::OverMemory, 17 << 30);
+    assert_eq!(
+        why_of(r)[1..3],
+        [
+            "peak memory 17.0 GiB of the 16 GiB it reserved",
+            "went over its 16 GiB memory limit"
+        ]
+    );
+}
+
 /// A job that sleeps uses no CPU and writes nothing: `why` must not say it is using CPU or name
 /// an output time. The daemon starts both clocks when the job starts.
 #[test]
