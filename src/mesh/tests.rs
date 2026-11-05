@@ -619,6 +619,30 @@ fn the_first_subscriber_gets_the_events_from_before_it() {
     wait_on(&later, "self removed on the later", |e| *e == removed);
 }
 
+/// A member that reaches this machine, but that this machine can't reach (its address here is a
+/// closed port): up, and said so.
+#[test]
+fn a_member_up_but_out_of_reach_is_said() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = start("a", tmp.path());
+    let dir = tmp.path().join("b");
+    let mut cfg = config("b", &dir, "0.1.0");
+    cfg.address = Some("127.0.0.1:1".into());
+    let b = node(Mesh::start(cfg, Arc::new(Echo)).unwrap(), &dir);
+    pair(&a, &b);
+    wait_event(&a, "b up", |e| *e == Event::Up { node: "b".into() });
+    let e = wait_event(
+        &a,
+        "b out of reach",
+        |e| matches!(e, Event::Unreachable { node, .. } if node == "b"),
+    );
+    let Event::Unreachable { why, .. } = e else {
+        unreachable!()
+    };
+    assert!(why.starts_with("can't reach b: 127.0.0.1:1: "), "{why}");
+    assert!(a.member("b").unwrap().alive);
+}
+
 #[test]
 fn heartbeats_tell_down_and_up() {
     let tmp = tempfile::tempdir().unwrap();

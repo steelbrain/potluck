@@ -42,6 +42,8 @@ pub(super) const MAX_UNAUTHENTICATED_PER_IP: usize = 8;
 /// count reported with the next one.
 const REFUSED_PER_WINDOW: u32 = 10;
 const REFUSED_WINDOW: Duration = Duration::from_secs(10);
+/// [`Event::Unreachable`] is said of a member at most this often.
+const UNREACHABLE_EVERY: Duration = Duration::from_secs(600);
 /// Handshakes this machine runs at once with one member, so that it stays well under the
 /// member's cap on unauthenticated connections; further callers wait for one to finish (or for
 /// a pooled connection).
@@ -167,6 +169,8 @@ struct PeerState {
     mismatch_since: Option<Instant>,
     /// Why the last heartbeat to it failed, until one gets through: said when it goes down.
     last_error: Option<String>,
+    /// When [`Event::Unreachable`] was last said of it.
+    unreachable_said: Option<Instant>,
 }
 
 impl PeerState {
@@ -180,6 +184,7 @@ impl PeerState {
             mismatch: None,
             mismatch_since: None,
             last_error: None,
+            unreachable_said: None,
         }
     }
 }
@@ -1257,6 +1262,7 @@ impl Inner {
                     mismatch_since: s.mismatch_ago_ms.map(at),
                     // Not handed over: the next heartbeat says it again.
                     last_error: None,
+                    unreachable_said: None,
                 },
             );
         }
@@ -2416,8 +2422,26 @@ impl Inner {
         };
         let pong = self.request(t, &ping, timeout);
         // Members only: a former member pinged has no state to keep, nor gets one.
+        let mut unreachable = None;
         if let Some(p) = lock(&self.peers).get_mut(&t.key) {
             p.last_error = pong.as_ref().err().map(|e| e.to_string());
+            // Up, so it reaches this machine, but this machine can't reach it: nothing else
+            // shows that (on macOS, Local Network privacy can block the daemon's own
+            // connections and nothing else).
+            if let Some(why) = &p.last_error
+                && p.up == Some(true)
+                && p.unreachable_said
+                    .is_none_or(|at| at.elapsed() >= UNREACHABLE_EVERY)
+            {
+                p.unreachable_said = Some(Instant::now());
+                unreachable = Some(why.clone());
+            }
+        }
+        if let Some(why) = unreachable {
+            self.emit(Event::Unreachable {
+                node: t.name.clone(),
+                why,
+            });
         }
         let Ok(Reply::Pong { digest: theirs }) = pong else {
             return;

@@ -1140,6 +1140,18 @@ fn on_event(sh: &Arc<Shared>, c: &Arc<Cluster>, ev: Event) {
                 ));
             }
         }
+        Event::Unreachable { node, why } => {
+            // EHOSTUNREACH from a member that reaches this machine: on macOS, most likely Local
+            // Network privacy blocking the daemon (a LaunchAgent), not the network.
+            let hint = if cfg!(target_os = "macos") && why.contains("(os error 65)") {
+                "; on macOS that is likely Local Network privacy: allow potluck in System Settings > Privacy & Security > Local Network"
+            } else {
+                ""
+            };
+            sh.log.log(format!(
+                "cluster: {node} reaches this machine, but this machine can't reach it: {why}{hint}"
+            ));
+        }
         Event::Refused { address, reason } => {
             sh.log.log(format!(
                 "cluster: refused a connection from {address}: {reason}"

@@ -36,6 +36,17 @@
   The firewall knows an ad-hoc-signed binary by its code hash (`codesign -d -r- ~/.local/bin/potluck`
   prints `designated => cdhash H"..."`), and every new binary has a new one: run both commands
   again after install.sh, `potluck self-update` or a rebuild replaces the binary.
+- In a cluster, on macOS: Local Network access for the daemon. The service is a LaunchAgent, and
+  macOS's Local Network privacy can block an agent's connections to machines on the local network
+  until it is allowed in System Settings > Privacy & Security > Local Network (Apple's
+  [TN3179](https://developer.apple.com/documentation/technotes/tn3179-understanding-local-network-privacy)).
+  It blocked them on macOS 26.7.1. The members still list the Mac as up, because their connections
+  to it get through, but it can't reach them: its `daemon.log` says
+  `cluster: NODE reaches this machine, but this machine can't reach it: can't reach NODE: ADDRESS: No route to host (os error 65)`,
+  and the kernel log has lines for potluck ending in `reason: NECP`
+  (`log show --last 10m --predicate 'eventMessage CONTAINS "potluck"' | grep NECP`). A shell,
+  local or over ssh, isn't subject to it, so `nc` from one doesn't show the block. macOS tracks the
+  permission by the binary's code signature, so a new binary may need allowing again.
 
 ## install.sh
 

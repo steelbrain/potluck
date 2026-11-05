@@ -209,6 +209,9 @@ pub enum Event {
         ours: String,
         theirs: String,
     },
+    /// A heartbeat to a member that is up (it reaches this machine) failed: this machine can't
+    /// reach it. Said at most every 10 minutes of each member while that lasts.
+    Unreachable { node: NodeName, why: String },
     /// An incoming connection was refused: an unknown key, a failed handshake, a bad hello, or
     /// too many connections not authenticated yet. At most 10 per 10 seconds; the next one
     /// after a pause says how many were not reported.
