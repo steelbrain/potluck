@@ -20,6 +20,10 @@
   [A cluster](docs/cluster.md#users).
 - `potluck user init` also signs the jobs its machine queued before it that haven't ended. Run
   again with a user's key, it makes no records and signs those a first run left unsigned.
+- In a cluster with users, a member fetching a repository from the dispatching machine gets only
+  the commits of the queued jobs it may take and of the jobs it runs, with what they reach, and the
+  branches and tags whose tips those commits reach; other branches, tags and commits don't come
+  along.
 - `potluck nodes` shows each machine's pool, in its POOL column and as `pool` with `--json`.
 - In a cluster with users, a request another member answers (`wait`, `logs`, `why` or `cancel` of
   a job dispatched elsewhere, `cp`, `hold` or `release` of a workspace elsewhere, `env NODE`) is
@@ -33,10 +37,6 @@
 
 ### Fixed
 
-- In a cluster with users, a member that fetched a repository from the dispatching machine for a
-  job could fetch any object of its mirror there, every branch and tag included. It now gets only
-  the commits of the queued jobs it may take and of the jobs it runs, with what they reach, and
-  the branches and tags whose tips those commits reach; other branches and tags don't come along.
 - `potluck user add NAME KEY` takes a key that starts with `-` (one in 64), not as an option.
 - A member's report counts only the workspaces on that member. Workspaces it listed on other
   machines showed in `status` and could hold a job back for the 3-second locality wait, as if the
