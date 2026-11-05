@@ -1105,6 +1105,15 @@ fn wait(sh: &Shared, id: &str, timeout_ms: Option<u64>) -> Result<Response, Stri
     }
 }
 
+/// The most output a `Logs` answer carries when `max` is asked for.
+pub(crate) fn log_chunk(max: u64) -> u64 {
+    if max == 0 {
+        DEFAULT_LOG_CHUNK
+    } else {
+        max.min(MAX_LOG_CHUNK)
+    }
+}
+
 /// Up to `max` bytes of the job's output from `offset`; with `wait_ms`, waits that long for some.
 /// `at` is where this machine's log starts in the log `offset` is in: 0, or, when this machine
 /// runs another's job and answers for an owner it can't reach, past the output of earlier runs
@@ -1120,11 +1129,7 @@ pub(crate) fn logs<W: Write>(
     wait_ms: u64,
     w: &mut W,
 ) -> std::io::Result<()> {
-    let max = if max == 0 {
-        DEFAULT_LOG_CHUNK
-    } else {
-        max.min(MAX_LOG_CHUNK)
-    };
+    let max = log_chunk(max);
     let path = sh.paths.job_dir(id).join(files::LOG);
     let deadline = Instant::now() + Duration::from_millis(wait_ms);
     let from = offset.saturating_sub(at);

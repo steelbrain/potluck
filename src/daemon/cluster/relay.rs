@@ -20,7 +20,7 @@ use crate::daemon::server::{self, describe, handle_relayed, reminders};
 use crate::mesh::{Peer, PublicKey};
 use crate::proto::{
     ClientContext, ClientRequest, NEEDS_USER_KEY, Request, RequestAuth, Response, ServerResponse,
-    read_msg,
+    TooLong, read_msg_within,
 };
 use crate::types::Millis;
 use std::collections::BTreeMap;
@@ -31,9 +31,33 @@ use std::time::{Duration, Instant};
 /// A relayed answer longer than this between frames is given up on (long polls ask for less).
 const RELAY_IDLE: Duration = Duration::from_secs(90);
 
+/// The longest message of a relayed answer this machine reads, its newline not counted: as long
+/// as a control message between members may be ([`crate::mesh::MAX_FRAME`]). The longest an
+/// honest member answers with are a job's record (`get`, `wait`, `cancel`, `resize`), which
+/// crossed the mesh in a control message already if the job ran on another member, and a login
+/// environment (`env NODE`), no more than one process can be given (a few MiB). A `why`, a
+/// workspace's record (`hold`, `release`), and the head of a `logs` answer's output or of each
+/// file of a `cp` are kilobytes. The output and the files follow their heads as raw bytes, copied
+/// through as they come: a `logs` answer's no more than the request asked for and the answering
+/// daemon gives ([`most_output`]; the command line holds one answer's output with `--json`), a
+/// file of a `cp` as long as the file is (the command line writes it to disk as it comes).
+const MAX_ANSWER: u64 = crate::mesh::MAX_FRAME;
+
+/// The most output a `Bytes` frame of an answer to `req` carries: what a `logs` request asks
+/// for, as the answering daemon caps it; none for any other request.
+fn most_output(req: &Request) -> u64 {
+    match req {
+        Request::Logs { max, .. } => server::log_chunk(*max),
+        _ => 0,
+    }
+}
+
 enum RelayError {
     /// Nothing was answered: the caller may answer otherwise.
     NotStarted(String),
+    /// The member's answer had a message longer than [`MAX_ANSWER`]: it was dropped, and the
+    /// connection closed. Why, for the command line.
+    TooLong(String),
     /// The answer broke off midway: the connection can only be closed.
     Broken(std::io::Error),
 }
@@ -80,6 +104,7 @@ pub(crate) fn intercept<W: Write>(
                     let e = match relay(sh, &c, owner, &now, w) {
                         Ok(()) => return Ok(true),
                         Err(RelayError::Broken(e)) => return Err(e),
+                        Err(RelayError::TooLong(why)) => return answer(w, Err(why)),
                         Err(RelayError::NotStarted(e)) => e,
                     };
                     // The machine running the job answers from its own record and log, the log
@@ -147,6 +172,7 @@ pub(crate) fn intercept<W: Write>(
             match relay(sh, &c, node, req, w) {
                 Ok(()) => Ok(true),
                 Err(RelayError::Broken(e)) => Err(e),
+                Err(RelayError::TooLong(why)) => answer(w, Err(why)),
                 Err(RelayError::NotStarted(e)) => answer(
                     w,
                     Err(format!(
@@ -190,6 +216,7 @@ pub(crate) fn intercept<W: Write>(
             match relay(sh, &c, node, req, w) {
                 Ok(()) => Ok(true),
                 Err(RelayError::Broken(e)) => Err(e),
+                Err(RelayError::TooLong(why)) => answer(w, Err(why)),
                 Err(RelayError::NotStarted(e)) => {
                     answer(w, Err(format!("can't reach {node}: {e}")))
                 }
@@ -411,13 +438,18 @@ fn relay<W: Write>(
     let mut r = BufReader::new(stream);
     let mut any = false;
     loop {
-        let frame = match read_msg::<_, ServerResponse>(&mut r) {
+        let frame = match read_msg_within::<_, ServerResponse>(&mut r, MAX_ANSWER) {
             Ok(Some(f)) => f,
             Ok(None) if any => break,
             Ok(None) => {
                 return Err(RelayError::NotStarted(format!(
                     "{node} closed the connection without answering"
                 )));
+            }
+            Err(e) if TooLong::is(&e) => {
+                drop(r);
+                let why = format!("it sent {e}, longer than any answer a member gives");
+                return Err(RelayError::TooLong(dropped(sh, node, req, &why)));
             }
             Err(e) if !any => return Err(RelayError::NotStarted(e.to_string())),
             Err(e) => return Err(RelayError::Broken(e)),
@@ -428,6 +460,15 @@ fn relay<W: Write>(
         }
         let rem = rem.get_or_insert_with(|| reminders(sh, &req.ctx));
         let len = match &frame.resp {
+            Response::Bytes { len, .. } if *len > most_output(&req.req) => {
+                drop(r);
+                let why = format!(
+                    "it sent {} of output, and an answer to it carries at most {}",
+                    crate::cli::fmt_bytes(*len),
+                    crate::cli::fmt_bytes(most_output(&req.req))
+                );
+                return Err(RelayError::TooLong(dropped(sh, node, req, &why)));
+            }
             Response::Bytes { len, .. } | Response::CopyEntry { len, .. } => *len,
             _ => 0,
         };
@@ -440,6 +481,19 @@ fn relay<W: Write>(
         }
     }
     w.flush().map_err(RelayError::Broken)
+}
+
+/// `node`'s answer to `req` is dropped, its connection closed, for `why` (it was too long): what
+/// the command line is told, also logged as a warning.
+fn dropped(sh: &Shared, node: &str, req: &ClientRequest, why: &str) -> String {
+    let what = format!(
+        "{node}'s answer to this request ({}) was dropped: {why}",
+        describe(&req.req)
+    );
+    sh.log.log(format!(
+        "cluster: WARNING: {what}; the connection to {node} was closed"
+    ));
+    what
 }
 
 /// A removal asked of `elder` ([`intercept`]): its answer, one frame; an error when none came.
@@ -460,9 +514,14 @@ fn ask(
         .open_stream(elder, header)
         .map_err(|e| e.to_string())?;
     let _ = stream.set_read_timeout(Some(RELAY_IDLE));
-    match read_msg::<_, ServerResponse>(&mut BufReader::new(stream)) {
+    let answered = read_msg_within::<_, ServerResponse>(&mut BufReader::new(stream), MAX_ANSWER);
+    match answered {
         Ok(Some(frame)) => Ok(frame.resp),
         Ok(None) => Err(format!("{elder} closed the connection without answering")),
+        Err(e) if TooLong::is(&e) => {
+            let why = format!("it sent {e}, longer than any answer a member gives");
+            Err(dropped(sh, elder, req, &why))
+        }
         Err(e) => Err(e.to_string()),
     }
 }
@@ -747,6 +806,9 @@ fn to_owner<W: Write>(
             Ok(())
         }
         Err(RelayError::Broken(e)) => Err(e),
+        Err(RelayError::TooLong(message)) => {
+            reply(w, &reminders(sh, &req.ctx), Response::Error { message })
+        }
         Err(RelayError::NotStarted(e)) => {
             let rem = reminders(sh, &req.ctx);
             let message = format!(

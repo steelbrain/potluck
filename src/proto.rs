@@ -416,14 +416,55 @@ pub fn write_msg<W: std::io::Write, T: Serialize>(w: &mut W, msg: &T) -> std::io
 pub fn read_msg<R: std::io::BufRead, T: serde::de::DeserializeOwned>(
     r: &mut R,
 ) -> std::io::Result<Option<T>> {
-    let mut line = String::new();
-    if r.read_line(&mut line)? == 0 {
+    read_msg_within(r, u64::MAX)
+}
+
+/// [`read_msg`] of a message at most `max` bytes long, its newline not counted. A longer one
+/// fails with [`TooLong`] once `max` bytes and one more are read; nothing past them is.
+pub fn read_msg_within<R: std::io::BufRead, T: serde::de::DeserializeOwned>(
+    r: &mut R,
+    max: u64,
+) -> std::io::Result<Option<T>> {
+    use std::io::{BufRead, Read};
+    let mut line = Vec::new();
+    if r.take(max.saturating_add(1)).read_until(b'\n', &mut line)? == 0 {
         return Ok(None);
     }
-    serde_json::from_str(&line)
+    if line.last() != Some(&b'\n') && line.len() as u64 > max {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            TooLong { max },
+        ));
+    }
+    serde_json::from_slice(&line)
         .map(Some)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
+
+/// What [`read_msg_within`] fails with when a message is longer than it takes.
+#[derive(Debug)]
+pub struct TooLong {
+    /// The most it takes, in bytes.
+    pub max: u64,
+}
+
+impl TooLong {
+    /// Whether `e` is one.
+    pub fn is(e: &std::io::Error) -> bool {
+        e.get_ref().is_some_and(|e| e.is::<TooLong>())
+    }
+}
+
+impl std::fmt::Display for TooLong {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.max {
+            m if m >= 1 << 20 && m % (1 << 20) == 0 => write!(f, "a message over {} MiB", m >> 20),
+            m => write!(f, "a message over {m} bytes"),
+        }
+    }
+}
+
+impl std::error::Error for TooLong {}
 
 #[cfg(test)]
 mod tests {
@@ -499,5 +540,39 @@ mod tests {
         let req: ClientRequest = serde_json::from_str(old).unwrap();
         assert!(req.auth.is_none());
         assert_eq!(serde_json::to_string(&req).unwrap(), old);
+    }
+
+    /// A message as long as [`read_msg_within`] takes is read, whether its newline or the end of
+    /// the stream ends it. One a byte longer fails as too long once the limit and one byte more
+    /// are read, and no more is; so does an endless one, at once.
+    #[test]
+    fn a_message_is_read_up_to_its_limit_and_no_further() {
+        use std::io::{BufReader, Cursor};
+        // A JSON string `len` bytes long, quotes included.
+        let msg = |len: usize| format!("\"{}\"", "x".repeat(len - 2));
+        let read = |r: &mut Cursor<String>| read_msg_within::<_, String>(r, 64);
+        let at = msg(64);
+        let mut r = Cursor::new(format!("{at}\n{at}"));
+        assert_eq!(read(&mut r).unwrap().unwrap().len(), 62);
+        assert_eq!(read(&mut r).unwrap().unwrap().len(), 62);
+        assert!(read(&mut r).unwrap().is_none());
+
+        let mut r = Cursor::new(format!("{}\n{at}\n", msg(65)));
+        let e = read(&mut r).unwrap_err();
+        assert!(TooLong::is(&e), "{e}");
+        assert_eq!(e.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(e.to_string(), "a message over 64 bytes");
+        assert_eq!(r.position(), 65);
+        // Without a limit it is read.
+        let mut r = Cursor::new(format!("{}\n", msg(65)));
+        assert_eq!(read_msg::<_, String>(&mut r).unwrap().unwrap().len(), 63);
+        // Another error is not one.
+        let mut r = Cursor::new("{\n".to_string());
+        assert!(!TooLong::is(&read(&mut r).unwrap_err()));
+
+        let mut endless = BufReader::new(std::io::repeat(b'x'));
+        let e = read_msg_within::<_, String>(&mut endless, 1 << 20).unwrap_err();
+        assert!(TooLong::is(&e), "{e}");
+        assert_eq!(e.to_string(), "a message over 1 MiB");
     }
 }

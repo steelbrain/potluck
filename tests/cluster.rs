@@ -6895,6 +6895,224 @@ fn a_relayed_request_leaves_the_callers_lease_token_behind() {
     assert_eq!(got[1].ctx.branch.as_deref(), Some(BRANCH));
 }
 
+/// Writes `head` on `stream`, then `n` bytes of `x` a MiB at a time, then `end`. How many of the
+/// `x`s were written before the other side closed the connection (None: all, and `end`).
+fn flood(stream: &mut Stream, head: &[u8], n: u64, end: &[u8]) -> Option<u64> {
+    use std::io::Write;
+    let chunk = vec![b'x'; 1 << 20];
+    let mut sent = 0;
+    let mut cut = stream.write_all(head).is_err();
+    while !cut && sent < n {
+        match stream.write_all(&chunk) {
+            Ok(()) => sent += chunk.len() as u64,
+            Err(_) => cut = true,
+        }
+    }
+    if !cut {
+        let _ = stream.write_all(end);
+    }
+    cut.then_some(sent)
+}
+
+/// Writes on `stream` a message longer than any a member reads of one ([`flood`]): the head of
+/// an error, then `x` up to twice that limit.
+fn overlong(stream: &mut Stream) -> Option<u64> {
+    let head = br#"{"reminders":[],"resp":{"kind":"error","message":""#;
+    flood(stream, head, 2 * potluck::mesh::MAX_FRAME, b"\"}}\n")
+}
+
+/// What the two sides' socket buffers may hold on the way, at most: Linux grows a receive buffer
+/// up to `net.ipv4.tcp_rmem`'s last number (32 MiB on some), and a send buffer up to 4 MiB.
+const IN_FLIGHT: u64 = 48 << 20;
+
+/// What [`overlong`] wrote was cut at the reader's limit: at least the limit was taken, and no
+/// more than the buffers hold on the way ([`IN_FLIGHT`]) past it, never all of it.
+fn cut_at_the_limit(took: Option<u64>) {
+    let max = potluck::mesh::MAX_FRAME;
+    let took = took.expect("all of a message over the limit was read");
+    assert!(took >= max && took < max + IN_FLIGHT, "{took}");
+}
+
+/// An impostor ([`Node::impostor`]) answering relayed requests: a `why` with a message longer than
+/// any answer ([`overlong`]), a `cp` with a file and then that message, the `logs` of job b-3
+/// with 128 MiB of output, anything else with a short error. It records how much of each long
+/// message or output the other side took ([`flood`]).
+#[derive(Default)]
+struct Overlong {
+    took: Mutex<Vec<Option<u64>>>,
+}
+
+impl Overlong {
+    fn send(&self, stream: &mut Stream) {
+        let took = overlong(stream);
+        self.took.lock().unwrap().push(took);
+    }
+
+    fn took(&self, n: usize) -> Vec<Option<u64>> {
+        wait_until(&format!("{n} long answers were sent"), || {
+            self.took.lock().unwrap().len() >= n
+        });
+        self.took.lock().unwrap().clone()
+    }
+}
+
+impl Handler for Overlong {
+    fn call(&self, _from: &Peer, msg: Value) -> Result<Value, String> {
+        Err(format!("no {} here", msg["op"]))
+    }
+
+    fn stream(&self, _from: &Peer, header: Value, mut stream: Stream) {
+        use std::io::Write;
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(60)));
+        let frame = |s: &mut Stream, resp: Response| {
+            let f = potluck::proto::ServerResponse {
+                reminders: vec![],
+                resp,
+            };
+            let _ = potluck::proto::write_msg(s, &f);
+        };
+        let req = &header["req"]["req"];
+        match req["op"].as_str() {
+            Some("why") => self.send(&mut stream),
+            Some("logs") if req["job"] == "b-3" => {
+                let len = 128 << 20;
+                let f = potluck::proto::ServerResponse {
+                    reminders: vec![],
+                    resp: Response::Bytes {
+                        offset: 0,
+                        len,
+                        done: true,
+                    },
+                };
+                let mut head = serde_json::to_vec(&f).unwrap();
+                head.push(b'\n');
+                let took = flood(&mut stream, &head, len, b"");
+                self.took.lock().unwrap().push(took);
+            }
+            Some("copy") => {
+                let entry = Response::CopyEntry {
+                    path: String::new(),
+                    mode: 0o644,
+                    dir: false,
+                    len: 5,
+                };
+                frame(&mut stream, entry);
+                let _ = stream.write_all(b"made\n");
+                self.send(&mut stream);
+            }
+            _ => frame(
+                &mut stream,
+                Response::Error {
+                    message: "recorded".into(),
+                },
+            ),
+        }
+        let _ = stream.close_write();
+    }
+}
+
+/// A member that answers a relayed request with a message longer than any answer (64 MiB, as long
+/// as a control message between members may be): the machine relaying it reads no more of it than
+/// that, closes the connection and drops the answer, first or after a file of a `cp`. So too with
+/// more output than a `logs` asked for, before any of it is read. The command line gets an error
+/// naming the member, the daemon's log a warning, and the daemon goes on serving: its next
+/// relayed request to that member is answered.
+#[test]
+fn a_relayed_answer_too_long_is_dropped_at_its_limit() {
+    let w = World::new();
+    let a = w.node("a").start();
+    let mut b = w.node("b").start();
+    pair(&a, &b);
+    init_users(&a, &[&a, &b]);
+    let overlong = Arc::new(Overlong::default());
+    let mesh = b.impostor(overlong.clone());
+
+    let o = a.cli(&["why", "b-1"]);
+    cut_at_the_limit(overlong.took(1)[0]);
+    assert_eq!(o.code, 2, "{}\n{}", o.stdout, o.stderr);
+    let dropped = "b's answer to this request (why b-1) was dropped: it sent a message over 64 MiB, \
+                   longer than any answer a member gives";
+    assert_eq!(error_of(&o), dropped);
+    let dest = w.dir.path().join("copied");
+    let o = a.cli(&["cp", "b-w1:made.txt", dest.to_str().unwrap()]);
+    cut_at_the_limit(overlong.took(2)[1]);
+    assert_eq!(o.code, 2, "{}\n{}", o.stdout, o.stderr);
+    assert!(
+        error_of(&o).starts_with("b's answer to this request (copy b-w1) was dropped"),
+        "{}",
+        error_of(&o)
+    );
+    assert_eq!(std::fs::read_to_string(&dest).unwrap(), "made\n");
+    let o = a.cli(&["logs", "b-3"]);
+    let took = overlong.took(3)[2];
+    assert!(took.is_some_and(|n| n < IN_FLIGHT), "{took:?}");
+    assert_eq!(
+        error_of(&o),
+        "b's answer to this request (logs b-3) was dropped: it sent 128.0 MiB of output, and an \
+         answer to it carries at most 1.0 MiB",
+        "{}\n{}",
+        o.stdout,
+        o.stderr
+    );
+    let log = a.daemon_log();
+    assert!(
+        log.contains(&format!(
+            "cluster: WARNING: {dropped}; the connection to b was closed\n"
+        )),
+        "{log}"
+    );
+
+    a.cli_ok(&["status"]);
+    let o = a.cli(&["logs", "b-2"]);
+    assert_eq!(error_of(&o), "recorded", "{}\n{}", o.stdout, o.stderr);
+    mesh.stop();
+}
+
+/// A runner that sends the kept files of a job it was granted with a message longer than any of a
+/// copy (64 MiB, as long as a control message between members may be): the job's owner reads no
+/// more of it than that, closes the connection and keeps none of the files, with a warning in its
+/// log, and goes on serving.
+#[test]
+fn kept_files_with_a_message_too_long_are_dropped_at_its_limit() {
+    use std::io::BufRead;
+    let w = World::new();
+    let a = w.node("a").start();
+    let mut b = w.node("b").start();
+    pair(&a, &b);
+    init_users(&a, &[&a, &b]);
+    let mesh = b.impostor(Arc::new(Scripted::default()));
+    let job = a.dispatch(&["--on", "node=b", "--keep", "out/**", "--", "true"]);
+    let claim = serde_json::json!({
+        "op": "claim",
+        "job": job,
+        "lease": {
+            "grant": {"ram_mib": 4096, "cpu": 1, "gpus": [], "exclusive": false},
+            "granted_at": now_ms(),
+            "deadline": now_ms() + 60_000,
+            "token": "t1",
+        },
+        "workspace": "b-w1",
+    });
+    let r = mesh.call("a", claim).unwrap();
+    assert_eq!(r["kind"], "granted", "{r}");
+    let header = serde_json::json!({"kind": "keep", "job": job, "token": "t1"});
+    let mut stream = mesh.open_stream("a", header).unwrap();
+    let mut ok = String::new();
+    std::io::BufReader::new(stream.try_clone().unwrap())
+        .read_line(&mut ok)
+        .unwrap();
+    assert_eq!(ok, "{\"ok\":true}\n");
+    cut_at_the_limit(overlong(&mut stream));
+    let warned = format!(
+        "cluster: WARNING: {job}: the files b sent for its keep/ were dropped: it sent a message \
+         over 64 MiB, longer than any message of a copy; the connection was closed\n"
+    );
+    wait_until("a warned", || a.daemon_log().contains(&warned));
+    assert!(!a.paths.job_dir(&job).join("keep").exists());
+    a.cli_ok(&["status"]);
+    mesh.stop();
+}
+
 /// A cancel that a member relays to the machine running a job for another owner goes to that
 /// owner, which cancels it as it does any of its jobs running elsewhere: not around it. So in a
 /// cluster without users, and with users once a user signed it.

@@ -59,7 +59,7 @@ pub(crate) mod tests;
 
 pub use identity::{PublicKey, Signature};
 pub(crate) use node::release;
-pub use node::{Mesh, Stream};
+pub use node::{MAX_FRAME, Mesh, Stream};
 pub use trust::{Admission, Record, RecordId, Removal, UserAdmission, UserRemoval};
 
 use crate::config::{NodeConfig, Paths};

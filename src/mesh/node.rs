@@ -52,7 +52,8 @@ const UNREACHABLE_EVERY: Duration = Duration::from_secs(600);
 /// member's cap on unauthenticated connections; further callers wait for one to finish (or for
 /// a pooled connection).
 const MAX_DIALS_PER_PEER: usize = 4;
-const MAX_FRAME: u64 = 64 << 20;
+/// The longest line a control connection takes, its newline included: a request or its reply.
+pub const MAX_FRAME: u64 = 64 << 20;
 /// Events kept for the first subscriber, from before it subscribed; past this, the oldest go.
 const EARLY_EVENTS: usize = 256;
 /// The accept loop waits this long at most for a connection before it looks whether the mesh

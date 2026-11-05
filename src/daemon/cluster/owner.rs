@@ -6,7 +6,7 @@ use super::remote::read_line;
 use super::{CState, Cluster, KV_CANCELS, KV_ENDINGS, KV_LOG_BASE, capable, save};
 use crate::daemon::state::State;
 use crate::daemon::{Shared, files, runner};
-use crate::proto::{Response, ServerResponse, read_msg};
+use crate::proto::{Response, ServerResponse, TooLong, read_msg_within};
 use crate::tunnel::Wants;
 use crate::types::{
     EXIT_CANCELLED, EXIT_LOST, EXIT_TIMEOUT, JobId, JobRecord, JobState, Lease, Millis, NodeName,
@@ -1195,9 +1195,17 @@ fn receive_files(
         let _ = reply_line(w, serde_json::json!({"error": e}));
     };
     loop {
-        let frame = match read_msg::<_, ServerResponse>(&mut r) {
+        // A file's head is a path and a mode: held to what a control message may be.
+        let frame = match read_msg_within::<_, ServerResponse>(&mut r, crate::mesh::MAX_FRAME) {
             Ok(Some(f)) => f.resp,
             Ok(None) => return fail(&mut w, "the copy ended early".into()),
+            Err(e) if TooLong::is(&e) => {
+                sh.log.log(format!(
+                    "cluster: WARNING: {id}: the files {from} sent for its {sub}/ were dropped: \
+                     it sent {e}, longer than any message of a copy; the connection was closed"
+                ));
+                return fail(&mut w, e.to_string());
+            }
             Err(e) => return fail(&mut w, e.to_string()),
         };
         match frame {

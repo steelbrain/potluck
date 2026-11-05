@@ -38,6 +38,13 @@
 ### Fixed
 
 - `potluck user add NAME KEY` takes a key that starts with `-` (one in 64), not as an option.
+- A machine reads at most 64 MiB of each message of a member's answer to a request it relayed
+  there (`wait`, `logs`, `why`, `cancel`, `cp`, `hold`, `release`, `env NODE`), and no more of a
+  `logs` answer's output than it asked for; the machine that dispatched a job reads at most 64 MiB
+  of each message the runner sends its kept files or crash reports with. A member could send a
+  message without end and fill the machine's memory, or the command line's. A longer answer is
+  dropped and its connection closed: the command line's error names the member, and the daemon's
+  log has a warning.
 - A member's report counts only the workspaces on that member. Workspaces it listed on other
   machines showed in `status` and could hold a job back for the 3-second locality wait, as if the
   member had a workspace of the job's repository.
