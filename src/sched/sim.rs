@@ -203,40 +203,28 @@ fn priority_five_starts_first() {
     }
 }
 
-/// (c) A short job backfills ahead of a GPU job blocked on the GPU, and the GPU job starts when
-/// it would have without it.
+/// (c) Nothing starts behind a job blocked on the GPU, even jobs that would fit and end long
+/// before it: they start once it has, as RAM frees.
 #[test]
-fn backfill_does_not_delay() {
-    let machine = || Machine::new("msi", 32, vec![nv()]);
-    let running = || vec![(run("r", 8, &[NV], 60), 60), (run("r2", 16, &[], 120), 120)];
-    let gpu_job = || (job("gpu").gpu("nvidia").ram(16).mins(120).at(0), 30);
-    let long = || (job("long").ram(8).mins(120).at(2), 120);
-    let short = (job("short").ram(8).mins(30).at(1), 30);
-
-    let mut with_short = Sim::new(machine(), running(), vec![gpu_job(), short, long()]);
-    with_short.run_until(600);
-    let mut without = Sim::new(machine(), running(), vec![gpu_job(), long()]);
-    without.run_until(600);
-
-    assert_eq!(with_short.start_of("short"), m(1));
-    assert_eq!(with_short.start_of("gpu"), m(60));
-    assert_eq!(without.start_of("gpu"), m(60));
-    // The reservation the short job was admitted against held.
-    assert!(
-        with_short
-            .reservations
-            .iter()
-            .any(|(t, r)| *t == m(1) && r.job == "gpu" && r.at == m(60))
-    );
-    // The long job would have delayed it, so it waited (at 90 the GPU job ends early and frees
-    // its 16 GiB).
-    assert_eq!(with_short.start_of("long"), m(90));
+fn nothing_jumps_a_blocked_job() {
+    let running = vec![(run("r", 8, &[NV], 60), 60), (run("r2", 16, &[], 120), 120)];
+    let jobs = vec![
+        (job("gpu").gpu("nvidia").ram(16).mins(120).at(0), 30),
+        (job("short").ram(8).mins(30).at(1), 30),
+        (job("long").ram(8).mins(120).at(2), 120),
+    ];
+    let mut sim = Sim::new(Machine::new("msi", 32, vec![nv()]), running, jobs);
+    sim.run_until(600);
+    assert_eq!(sim.start_of("gpu"), m(60));
+    // The GPU job's 16 GiB come back when it ends at 90.
+    assert_eq!(sim.start_of("short"), m(90));
+    assert_eq!(sim.start_of("long"), m(90));
 }
 
-/// (d) An exclusive job waiting for its machine to empty is not delayed by long jobs arriving
-/// meanwhile; short ones that end before it is expected to empty still run.
+/// (d) An exclusive job waits only for what already runs: jobs arriving meanwhile, short or long,
+/// wait for it, and it starts when it would have alone.
 #[test]
-fn exclusive_not_delayed() {
+fn exclusive_waits_only_for_what_runs() {
     let machine = || Machine::new("ms01", 64, vec![nv(), amd()]);
     let running = || vec![(run("r1", 4, &[], 30), 30), (run("r2", 4, &[NV], 50), 50)];
     let excl = || (job("excl").excl().ram(16).mins(30).at(1), 20);
@@ -254,15 +242,15 @@ fn exclusive_not_delayed() {
 
     assert_eq!(alone.start_of("excl"), m(50));
     assert_eq!(busy.start_of("excl"), m(50));
-    assert_eq!(busy.start_of("short"), m(10));
+    // Everything that arrived meanwhile starts when it ends, after its 20 minutes.
+    assert_eq!(busy.start_of("short"), m(70));
     for i in 0..10 {
-        // Each waits for the exclusive job, which ends after its 20 minutes.
         assert_eq!(busy.start_of(&format!("long-{i}")), m(70), "long-{i}");
     }
 }
 
-/// CPU-only jobs that start while two jobs wait on a busy GPU don't pass them over: when the GPU
-/// frees, the priority-3 job gets it ahead of the priority-2 one.
+/// CPU-only jobs of a higher priority that start while two jobs wait on a busy GPU don't pass them
+/// over: when the GPU frees, the priority-3 job gets it ahead of the priority-2 one.
 #[test]
 fn cpu_starts_do_not_age_gpu_waiters() {
     let mut sim = Sim::new(
@@ -271,8 +259,8 @@ fn cpu_starts_do_not_age_gpu_waiters() {
         vec![
             (job("gpu-2").gpu("nvidia").prio(2).at(0), 10),
             (job("gpu-3").gpu("nvidia").at(1), 10),
-            (job("cpu-1").at(5), 10),
-            (job("cpu-2").at(10), 10),
+            (job("cpu-1").prio(4).at(5), 10),
+            (job("cpu-2").prio(4).at(10), 10),
         ],
     );
     sim.run_until(120);

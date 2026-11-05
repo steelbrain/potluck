@@ -151,11 +151,14 @@ potluck: no machine could ever run this job (studio: needs linux=7.2 (this machi
 
 ## Order
 
-Jobs start by priority, `--priority 1` to `5` (5 highest, default 3), then by submit time. Each
-time a job is passed over, meaning a job submitted after it is granted something it was waiting
-for, its priority rises by one, up to 4, so priority-5 jobs still go first. While the first job in
-line waits, later jobs may start if they will end, by their run limits, before its resources are
-expected free, or if they don't touch those resources. Running jobs are never stopped for
+Jobs start by priority, `--priority 1` to `5` (5 highest, default 3), then by submit time. A job
+starts ahead of another only by a higher priority: while the first job in line on a machine waits
+for what it needs, no job behind it starts there, even one that would fit now (`why` says "it
+fits on NODE now, but waits its turn behind job JOB"). So an `--exclusive` job waits only for the
+jobs already running to end. Each time a job is passed over, meaning a job submitted after it
+is granted something it was waiting for, its priority rises by one, up to 4, so priority-5 jobs
+still go first. A job waiting only for its own workspace (see [Workspaces](workspaces.md)), or
+one a machine can never run, doesn't hold that machine. Running jobs are never stopped for
 priority.
 
 ## Keys, kept files and labels

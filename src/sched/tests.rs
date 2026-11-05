@@ -580,8 +580,8 @@ fn aging() {
             queue: vec![
                 job("gpu-2").gpu("nvidia").prio(2).at(-20),
                 job("gpu-3").gpu("nvidia").at(-15),
-                job("s1").at(-5),
-                job("s2").at(-4),
+                job("s1").prio(4).at(-5),
+                job("s2").prio(4).at(-4),
             ],
             start: &["s1", "s2"],
             passed: &[],
@@ -606,7 +606,7 @@ fn aging() {
                 Machine::new("ms01", 64, vec![nv(), amd()]),
                 vec![run("x", 4, &[NV], 30)],
             ),
-            queue: vec![job("w").gpu("nvidia").at(-10), job("s").gpu("amd")],
+            queue: vec![job("w").gpu("nvidia").at(-10), job("s").gpu("amd").prio(4)],
             start: &["s"],
             passed: &[],
             reserved: Some(("w", m(30))),
@@ -614,7 +614,7 @@ fn aging() {
         Case {
             name: "RAM when it didn't fit before the start: passed",
             machine: with(Machine::new("msi", 32, vec![]), vec![run("x", 24, &[], 30)]),
-            queue: vec![job("w").ram(16).at(-10), job("s").ram(4)],
+            queue: vec![job("w").ram(16).at(-10), job("s").ram(4).prio(4)],
             start: &["s"],
             passed: &["w"],
             reserved: Some(("w", m(30))),
@@ -629,25 +629,25 @@ fn aging() {
             reserved: Some(("w", m(10))),
         },
         Case {
-            name: "held back for the reservation, still fitting after the start: not passed",
+            name: "behind the first blocked job nothing starts, so nothing is passed",
             machine: with(
                 Machine::new("msi", 32, vec![nv()]),
                 vec![run("x", 8, &[NV], 30)],
             ),
             queue: vec![
                 job("g").gpu("nvidia").ram(16).at(-30),
-                // 24 GiB free; 16 spare at 30m after g's 16; 22 free after s.
+                // Both fit in the 24 GiB free now, but g is ahead of them.
                 job("w").ram(20).mins(60).at(-20),
                 job("s").ram(2).mins(5).at(-10),
             ],
-            start: &["s"],
+            start: &[],
             passed: &[],
             reserved: Some(("g", m(30))),
         },
         Case {
             name: "exclusive and waiting for the machine to empty: any start passes it",
             machine: with(Machine::new("msi", 64, vec![]), vec![run("x", 4, &[], 30)]),
-            queue: vec![job("e").excl().at(-10), job("s").ram(1).mins(5)],
+            queue: vec![job("e").excl().at(-10), job("s").ram(1).mins(5).prio(4)],
             start: &["s"],
             passed: &["e"],
             reserved: Some(("e", m(30))),
@@ -682,19 +682,18 @@ fn aging() {
             reserved: Some(("b", m(10))),
         },
         Case {
-            name: "held back for the reservation: passed when a later job takes its RAM",
+            name: "behind the blocked job: passed when a later job of higher priority takes its place",
             machine: with(
                 Machine::new("msi", 32, vec![nv()]),
                 vec![run("x", 8, &[NV], 30)],
             ),
             queue: vec![
                 job("g").gpu("nvidia").ram(16).at(-30),
-                // Fits now (24 GiB free) but not in the 16 GiB left at 30m after g's 16, and not
-                // in the 20 GiB left once short starts.
+                // Fits in the 24 GiB free before short starts, not in the 20 left after.
                 job("held").ram(22).mins(60).at(-20),
-                job("short").ram(4).mins(5).at(-10),
+                job("short").ram(4).mins(5).prio(4).at(-10),
             ],
-            // g waits on the GPU and fits in RAM either way.
+            // g waits on the GPU, which short doesn't take.
             start: &["short"],
             passed: &["held"],
             reserved: Some(("g", m(30))),
@@ -757,131 +756,82 @@ fn reservation_times() {
 }
 
 #[test]
-fn backfill() {
+fn no_jumping_the_line() {
     check(vec![
         Case {
-            name: "a short job ends before the reservation",
+            name: "a job that fits waits behind the first blocked one",
             machine: with(
                 Machine::new("msi", 32, vec![nv()]),
                 vec![run("r", 8, &[NV], 60)],
             ),
             queue: vec![
                 job("g").gpu("nvidia").ram(16).at(-1),
-                job("short").ram(16).mins(60),
+                job("short").ram(16).mins(5),
             ],
-            start: &["short"],
+            start: &[],
             passed: &[],
             reserved: Some(("g", m(60))),
         },
         Case {
-            name: "a long job that needs the reserved RAM waits",
-            machine: with(
-                Machine::new("msi", 32, vec![nv()]),
-                vec![run("r", 8, &[NV], 60), run("r2", 16, &[], 120)],
-            ),
-            queue: vec![
-                job("g").gpu("nvidia").ram(16).at(-1),
-                job("long").ram(8).mins(120),
-                job("short").ram(8).mins(30).at(1),
-            ],
-            start: &["short"],
-            passed: &["g", "long"],
-            reserved: Some(("g", m(60))),
-        },
-        Case {
-            name: "long jobs fit in RAM that stays free, until it is used up",
-            machine: with(
-                Machine::new("msi", 64, vec![nv()]),
-                vec![run("r", 8, &[NV], 60)],
-            ),
-            queue: vec![
-                job("g").gpu("nvidia").ram(16).at(-1),
-                job("l1").ram(8).mins(120),
-                job("l2").ram(40).mins(120).at(1),
-                job("l3").ram(36).mins(120).at(2),
-            ],
-            // At 60m: 64 - 16 for g = 48 spare; l1 takes 8, l2's 40 fits the 40 left, l3 can't.
-            start: &["l1", "l2"],
-            passed: &[],
-            reserved: Some(("g", m(60))),
-        },
-        Case {
-            name: "a long job on another GPU starts",
+            name: "one on another GPU waits too",
             machine: with(
                 Machine::new("ms01", 64, vec![nv(), amd()]),
                 vec![run("r", 4, &[NV], 60)],
             ),
-            queue: vec![job("g").gpu("nvidia").at(-1), job("l").gpu("amd").mins(120)],
-            start: &["l"],
+            queue: vec![job("g").gpu("nvidia").at(-1), job("l").gpu("amd").mins(5)],
+            start: &[],
             passed: &[],
             reserved: Some(("g", m(60))),
         },
         Case {
-            name: "a long job on the reserved GPU waits, a short one doesn't",
-            machine: with(
-                Machine::new("ms01", 64, vec![nv(), amd()]),
-                vec![run("r", 32, &[], 30)],
-            ),
-            queue: vec![
-                // Blocked on RAM; it will get the NVIDIA GPU at 30m.
-                job("g").gpu("nvidia").ram(48).at(-1),
-                job("long-nv").gpu("nvidia").mins(120),
-                job("long-amd").gpu("amd").mins(120).at(1),
-                job("short-nv").gpu("nvidia").mins(20).at(2),
-            ],
-            start: &["long-amd", "short-nv"],
-            passed: &["g", "long-nv"],
-            reserved: Some(("g", m(30))),
-        },
-        Case {
-            name: "exclusive waiting: only jobs that end before the machine empties",
+            name: "an exclusive job waits only for what already runs",
             machine: with(
                 Machine::new("ms01", 64, vec![nv(), amd()]),
                 vec![run("r", 4, &[], 40)],
             ),
             queue: vec![
                 job("e").excl().at(-1),
-                job("long").ram(1).mins(120),
-                job("short").ram(1).mins(30).at(1),
-                job("gpu-short").gpu("amd").mins(40).at(2),
+                job("short").ram(1).mins(5).at(1),
+                job("gpu-short").gpu("amd").mins(5).at(2),
             ],
-            start: &["short", "gpu-short"],
-            passed: &["e"],
+            start: &[],
+            passed: &[],
             reserved: Some(("e", m(40))),
         },
         Case {
-            name: "later jobs in the reserved job's workspace wait, short or long",
+            name: "a later job of higher priority goes ahead",
             machine: with(
                 Machine::new("msi", 32, vec![nv()]),
-                vec![run("r", 4, &[NV], 30)],
+                vec![run("r", 8, &[NV], 60)],
             ),
             queue: vec![
-                // Blocked on the GPU; it will have it at 30m, and needs its workspace then.
-                job("g").gpu("nvidia").ws("msi-w3", "msi", false).at(-2),
-                job("long").ws("msi-w3", "msi", false).mins(60).at(-1),
-                job("short").ws("msi-w3", "msi", false).mins(5).at(-1),
-                job("other-ws").ws("msi-w4", "msi", false).mins(60),
+                job("g").gpu("nvidia").at(-1),
+                job("hi").ram(4).prio(4).at(1),
+                job("same").ram(4).at(2),
             ],
-            start: &["other-ws"],
+            // hi takes nothing g waits for; same stays behind g.
+            start: &["hi"],
             passed: &[],
-            reserved: Some(("g", m(30))),
+            reserved: Some(("g", m(60))),
         },
         Case {
-            name: "only the first blocked job is protected",
-            machine: with(
-                Machine::new("ms01", 64, vec![nv(), amd()]),
-                vec![run("r", 4, &[NV], 60)],
-            ),
+            name: "a job waiting for its own busy workspace doesn't hold the machine",
+            machine: with(Machine::new("msi", 32, vec![]), vec![run("r", 4, &[], 30)]),
             queue: vec![
-                job("g").gpu("nvidia").at(-2),
-                // Blocked too, behind g, but holds no reservation: c may take the AMD GPU.
-                job("both").gpu("nvidia").gpu("amd").at(-1),
-                job("c").gpu("amd").mins(120),
+                job("busy").ws("msi-w3", "msi", true).at(-1),
+                job("s").ram(4),
             ],
-            // c takes the AMD GPU both asks for, not g's NVIDIA one.
-            start: &["c"],
-            passed: &["both"],
-            reserved: Some(("g", m(60))),
+            start: &["s"],
+            passed: &[],
+            reserved: None,
+        },
+        Case {
+            name: "a job this machine can never run doesn't hold it",
+            machine: Machine::new("msi", 32, vec![nv()]),
+            queue: vec![job("amd").gpu("amd").at(-1), job("s").ram(4)],
+            start: &["s"],
+            passed: &[],
+            reserved: None,
         },
     ]);
 }

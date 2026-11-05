@@ -518,14 +518,9 @@ impl Why<'_, '_> {
                     r.job
                 ));
                 if !short {
-                    let until = match r.at {
-                        t if now.saturating_add(q.timeout_ms) > t => {
-                            format!("; its {} run limit ends after that", fmt_ms(q.timeout_ms))
-                        }
-                        _ => String::new(),
-                    };
+                    // Nothing starts behind the first job in line that can't start.
                     self.line(format!(
-                        "it fits on {node} now, but would take what job {} needs{until}",
+                        "it fits on {node} now, but waits its turn behind job {}",
                         r.job
                     ));
                 }

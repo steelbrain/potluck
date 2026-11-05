@@ -23,18 +23,17 @@
 //!   it could have had what it asks for just before that start and not after. Passed jobs could
 //!   run on this machine and are still waiting; they are returned in [`Plan::passed`] (once per
 //!   plan) and the caller adds one to their `passes`.
-//! - **Backfill.** The first job in order that can't start gets a reservation: when its resources are
-//!   expected free if every holder runs to its deadline. A later job may still start if it will end
-//!   (by its run limit) before then, or doesn't touch what the reserved job needs: none of its GPUs,
-//!   not its workspace, and only RAM that stays free after the reserved job takes its share at that
-//!   time. An exclusive job needs the whole machine, so while it waits only jobs that end before it
-//!   is expected to empty start there.
+//! - **No jumping the line.** The first job in order that can't start holds the machine: no job
+//!   after it in order starts there until it does, even one that would fit now. So a job starts
+//!   ahead of another only by going ahead of it in order, that is, by a higher priority (after
+//!   aging), and an exclusive job waits only for what already runs to end. Its reservation says
+//!   when what it needs is expected free, if every holder runs to its deadline (for `why`).
 //! - **No preemption.** Nothing here stops a running job.
 
 use crate::types::{Facts, Gpu, Grant, JobId, Millis, NodeName, Request, WorkspaceId};
 use crate::types::{effective_priority, gpu_matches};
 use std::cmp::{Ordering, Reverse};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 #[cfg(test)]
 mod sim;
@@ -158,7 +157,6 @@ fn cmp_job_ids(a: &str, b: &str) -> Ordering {
 pub fn plan(now: Millis, machine: &MachineView, queue: &[Queued]) -> Plan {
     let mut load = Load::new(now, machine);
     let mut out = Plan::default();
-    let mut guard: Option<Guard> = None;
     let heads = workspace_heads(machine, queue);
     // Jobs that could run here and wait for something another job may get (aging candidates).
     let mut waiting: Vec<usize> = Vec::new();
@@ -177,24 +175,19 @@ pub fn plan(now: Millis, machine: &MachineView, queue: &[Queued]) -> Plan {
             // earlier goes first. No reservation, and no other start passes it over.
             continue;
         }
-        let Some(grant) = load.grant(q) else {
-            waiting.push(i);
-            if guard.is_none() {
-                let g = load.reserve(q);
-                out.reservation = Some(Reservation {
-                    job: q.job.clone(),
-                    at: g.at,
-                });
-                guard = Some(g);
-            }
-            continue;
-        };
-        if let Some(g) = guard.as_mut()
-            && !g.admits(now, q, &grant)
-        {
+        // Behind the first job that can't start: it holds the machine.
+        if out.reservation.is_some() {
             waiting.push(i);
             continue;
         }
+        let Some(grant) = load.grant(q) else {
+            waiting.push(i);
+            out.reservation = Some(Reservation {
+                job: q.job.clone(),
+                at: load.free_at(q),
+            });
+            continue;
+        };
         starts.push((i, grant.clone(), load.holds.clone()));
         load.add(&q.job, &grant, now.saturating_add(q.timeout_ms));
         out.start.push((q.job.clone(), grant));
@@ -510,69 +503,16 @@ impl<'m, 'a> Load<'m, 'a> {
         (times.last().copied().unwrap_or(base), Vec::new())
     }
 
-    /// The reservation for `q`, first in order and unable to start: when what it needs is expected
-    /// free, and what later jobs must leave alone.
-    fn reserve(&self, q: &Queued) -> Guard {
+    /// When what `q`, first in order and unable to start, needs is expected free, if every
+    /// holder runs to its deadline.
+    fn free_at(&self, q: &Queued) -> Millis {
         let r = &q.request;
-        let gpus = &self.machine.facts.gpus;
         if r.exclusive {
-            let empty = self.holds.iter().map(|h| h.end).max().unwrap_or(self.now);
-            return Guard {
-                at: empty,
-                gpus: gpus.iter().map(|g| g.id.clone()).collect(),
-                exclusive: true,
-                spare_mib: 0,
-                workspace: workspace(q),
-            };
+            return self.holds.iter().map(|h| h.end).max().unwrap_or(self.now);
         }
         let base = self
             .ram_time(r.ram_mib)
             .max(self.exclusive_end().unwrap_or(self.now));
-        let (at, picked) = self.gpu_wait(&r.gpus, base);
-        // Free RAM only grows as holders end, so what is spare at the earliest possible start
-        // stays spare whenever the reserved job really starts.
-        Guard {
-            at,
-            gpus: picked.iter().map(|&i| gpus[i].id.clone()).collect(),
-            exclusive: false,
-            spare_mib: self.ram_free_at(at).saturating_sub(r.ram_mib),
-            workspace: workspace(q),
-        }
-    }
-}
-
-/// The workspace a job is pinned to, if any.
-fn workspace(q: &Queued) -> Option<WorkspaceId> {
-    q.workspace.as_ref().map(|(ws, _, _)| ws.clone())
-}
-
-/// What the reserved job needs protected from jobs that start after it in order.
-struct Guard {
-    at: Millis,
-    gpus: BTreeSet<String>,
-    exclusive: bool,
-    /// RAM still free at the reservation time after the reserved job takes its share, less what
-    /// jobs started beside it will still hold then.
-    spare_mib: u64,
-    /// The workspace it is pinned to: one invocation at a time runs there.
-    workspace: Option<WorkspaceId>,
-}
-
-impl Guard {
-    /// Whether `q`, which could start now with `grant`, may start without delaying the reserved
-    /// job. A job admitted for the RAM it leaves alone uses up that spare RAM.
-    fn admits(&mut self, now: Millis, q: &Queued, grant: &Grant) -> bool {
-        if now.saturating_add(q.timeout_ms) <= self.at {
-            return true;
-        }
-        let untouched = !self.exclusive
-            && !grant.exclusive
-            && grant.gpus.iter().all(|g| !self.gpus.contains(g))
-            && grant.ram_mib <= self.spare_mib
-            && (self.workspace.is_none() || workspace(q) != self.workspace);
-        if untouched {
-            self.spare_mib -= grant.ram_mib;
-        }
-        untouched
+        self.gpu_wait(&r.gpus, base).0
     }
 }

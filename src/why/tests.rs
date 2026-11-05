@@ -249,10 +249,7 @@ fn order_behind_the_reservation() {
         &why,
         "waits behind job g, first in line on msi, expected to start within 1h",
     );
-    has(
-        &why,
-        "it fits on msi now, but would take what job g needs; its 2h run limit ends after that",
-    );
+    has(&why, "it fits on msi now, but waits its turn behind job g");
     assert_eq!(kinds(&why), ["order"]);
     assert_eq!(why.blockers[0].holder.as_deref(), Some("g"));
     assert_eq!(why.blockers[0].free_by, Some(m(60)));

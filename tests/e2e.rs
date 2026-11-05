@@ -1103,7 +1103,7 @@ fn exclusive_waits_for_an_empty_machine() {
 }
 
 #[test]
-fn priority_aging_and_backfill() {
+fn priority_aging_and_no_jumping_the_line() {
     let n = Node::new();
     // 8 GiB capacity: A takes 6, until the test lets it end (a fixed sleep would race with the
     // dispatches below, which take seconds in a slow run).
@@ -1143,10 +1143,16 @@ fn priority_aging_and_backfill() {
         "sleep",
         "1",
     ]);
-    // Small and short: ends by its run limit before A's resources are due, so it backfills.
+    // Small and short, and it fits beside A, but `high` is ahead of it in line and waits: it
+    // waits its turn.
     let small = n.dispatch(&["--timeout", "20s", "--ram", "1G", "--", "sleep", "1"]);
-    n.running(&small);
-    assert_eq!(n.get(&a).state, JobState::Running, "started beside A");
+    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!(
+        n.get(&small).state,
+        JobState::Queued,
+        "it waits behind high"
+    );
+    assert_eq!(n.get(&a).state, JobState::Running);
     assert_eq!(n.get(&high).state, JobState::Queued);
     std::fs::write(&flag, "").unwrap();
     for j in [&a, &low, &high, &small] {
@@ -1156,6 +1162,13 @@ fn priority_aging_and_backfill() {
     assert!(
         rh.started_at < rl.started_at,
         "priority 5 first: {rh:?} {rl:?}"
+    );
+    // Granted with high or after it, never before (their processes may start in either order).
+    let rs = n.get(&small);
+    let granted = |r: &potluck::types::JobRecord| r.lease.as_ref().map(|l| l.granted_at);
+    assert!(
+        granted(&rh) <= granted(&rs),
+        "small not before high: {rh:?} {rs:?}"
     );
     assert!(rl.passes >= 1, "the low one was passed over: {}", rl.passes);
 }
