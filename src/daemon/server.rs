@@ -301,7 +301,10 @@ fn describe(req: &Request) -> String {
         Request::PairRequest => ("pair_request", None),
         Request::PairFinish { .. } => ("pair_finish", None),
         Request::Admit { .. } => ("admit", None),
-        Request::Remove { node } => ("remove", Some(node)),
+        Request::Remove { node, .. } => ("remove", Some(node)),
+        Request::Membership => ("membership", None),
+        Request::UserInit { .. } => ("user_init", None),
+        Request::UserRecord { .. } => ("user_record", None),
         Request::SelfUpdate => ("self_update", None),
         Request::Restart { .. } => ("restart", None),
     };
@@ -429,6 +432,9 @@ fn handle_req<W: Write>(
         | Request::PairFinish { .. }
         | Request::Admit { .. }
         | Request::Remove { .. }
+        | Request::Membership
+        | Request::UserInit { .. }
+        | Request::UserRecord { .. }
         | Request::SelfUpdate => Err("not available yet".to_string()),
         // Only a client of this machine's own socket restarts it (never a relayed request).
         Request::Restart { .. } => Err("a restart is asked on the machine itself".to_string()),

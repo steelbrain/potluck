@@ -7,6 +7,8 @@
 //! The CLI only ever talks to its own machine's daemon; from phase 2 the daemon forwards requests
 //! about jobs and workspaces on other machines over the mesh.
 
+use crate::mesh::MembershipView;
+use crate::mesh::trust::{Admission, Record, Removal, UserAdmission};
 use crate::types::{
     Facts, Grant, JobId, JobRecord, JobSpec, Millis, NodeName, Reminder, WorkspaceId,
     WorkspaceRecord,
@@ -94,12 +96,32 @@ pub enum Request {
     PairFinish {
         reply: String,
     },
-    /// Admit a machine from its pairing request; answers with the reply to paste back.
+    /// Admit a machine from its pairing request; answers with the reply to paste back. In a
+    /// cluster with users, `admission` is a user's signed admission of that machine (the CLI
+    /// signs it); without users, None (this machine signs one).
     Admit {
         request: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        admission: Option<Box<Admission>>,
     },
+    /// Remove a machine. In a cluster with users, `removal` is a user's signed removal of it;
+    /// without users, None (a member signs one).
     Remove {
         node: NodeName,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        removal: Option<Box<Removal>>,
+    },
+    /// What the CLI signs membership records from: this machine, the members, the users.
+    Membership,
+    /// The first user: its admission of its own key, signed by it (this machine co-signs it),
+    /// and its admission of every member, taken together.
+    UserInit {
+        genesis: Box<UserAdmission>,
+        admissions: Vec<Admission>,
+    },
+    /// A user's admission or removal (`user add`, `user remove`), signed by a user.
+    UserRecord {
+        record: Box<Record>,
     },
     /// Update this machine to the latest release (the other members follow when they meet it).
     SelfUpdate,
@@ -178,6 +200,10 @@ pub enum Response {
         remaining_ms: Option<u64>,
     },
     Ok,
+    /// What [`Request::Membership`] asks for.
+    Membership {
+        membership: Box<MembershipView>,
+    },
     /// Text for the user, e.g. a pairing request or reply to paste.
     Text {
         text: String,

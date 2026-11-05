@@ -163,15 +163,16 @@ A machine joins once, with the daemon running on it and on a member:
 
 From then on a job dispatched on any member runs on whichever member can run it, and its output
 comes back to the machine it was dispatched from. Members reach each other's port over a LAN or a
-VPN. [docs/cluster.md](docs/cluster.md) covers pairing, removing machines, how jobs move between
-members and what happens when one is lost.
+VPN. [docs/cluster.md](docs/cluster.md) covers pairing, users, removing machines, how jobs move
+between members and what happens when one is lost.
 
 ## Documentation
 
 - [Jobs](docs/jobs.md): dispatching, run limits, resources, where a job runs, output, how a job
   ends, its environment, dispatching from inside a job, recipes.
 - [Workspaces](docs/workspaces.md): seeding, reuse, holds, removal, `cp`.
-- [A cluster](docs/cluster.md): pairing, removal, sources and mirrors, the queue, lost machines.
+- [A cluster](docs/cluster.md): pairing, removal, users, sources and mirrors, the queue, lost
+  machines.
 - [Versions and updates](docs/updates.md): updates across the cluster, `self-update`, restart in
   place.
 - [Security](docs/security.md): keys, TLS, membership records, the local socket.
@@ -196,8 +197,11 @@ members and what happens when one is lost.
 | `nodes` | Every machine with its facts, GPUs, version and address. |
 | `env [NODE]` | Print the login environment a job on NODE (default: this machine) starts from. |
 | `pair`, `pair --finish REPLY` | Ask to join a cluster, and finish joining. |
-| `admit REQUEST` | Admit a machine and print the reply. |
-| `remove NODE` | Remove a machine from the cluster. |
+| `admit [--pool POOL] REQUEST` | Admit a machine and print the reply; with users, signed with this command line's user key, into POOL. |
+| `remove NODE` | Remove a machine from the cluster; with users, signed with this command line's user key. |
+| `user init [--name NAME]` | Make this command line's user key the cluster's first user and sign every member in with it. |
+| `user add NAME KEY`, `user remove NAME`, `user list` | Add, remove or list the users. |
+| `user key` | Print this command line's public user key, making the key first if there is none. |
 | `self-update [--here]` | Update this machine to the latest release, through the daemon or (`--here`) from this process; the other members follow. |
 | `restart` | Restart the daemon in place on the binary at its path, keeping running jobs and open connections. |
 | `service install`, `service uninstall` | Install or remove the daemon's service. |

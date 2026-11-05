@@ -2,8 +2,9 @@
 //! another machine, a workspace on another machine, or another machine's login environment
 //! (`potluck env NODE`), is relayed there over a `client` stream and answered from there, frame by
 //! frame (with this machine's reminders). Status, nodes and why cover every member; pairing,
-//! admission, removal and self-update go to the mesh. A removal goes to the oldest member up that
-//! was admitted before the machine removed, which makes it final.
+//! admission, removal and self-update go to the mesh. In a cluster without users, a removal goes
+//! to the oldest member up that was admitted before the machine removed, which makes it final; in
+//! one with users, a user signs it and no member signs one for another.
 
 use super::peer::{StreamHeader, node_of_ws, owner_of};
 use super::{Cluster, membership, owner, self_update, views};
@@ -174,7 +175,7 @@ pub(crate) fn intercept<W: Write>(
         }
         Request::Status => answer(w, views::status(sh, &c)),
         Request::Nodes => answer(w, Ok(views::nodes(sh, &c))),
-        Request::Remove { node } if !relayed && !c.removed() => {
+        Request::Remove { node, .. } if !relayed && !c.removed() && !c.mesh().users_exist() => {
             // Signed by the oldest member up that was admitted before `node`, the removal is
             // final: `node` can't undo it by removing that member back. This machine signs it
             // when none is up, or none that is signs it (saying the removal holds only until
@@ -207,7 +208,10 @@ pub(crate) fn intercept<W: Write>(
         Request::PairRequest
         | Request::PairFinish { .. }
         | Request::Admit { .. }
-        | Request::Remove { .. } => answer(w, membership(sh, &c, &req.req)),
+        | Request::Remove { .. }
+        | Request::Membership
+        | Request::UserInit { .. }
+        | Request::UserRecord { .. } => answer(w, membership(sh, &c, &req.req)),
         Request::SelfUpdate => answer(w, self_update(sh, &c).map(|text| Response::Text { text })),
         _ => Ok(false),
     }
@@ -425,6 +429,11 @@ fn serve_removal<W: Write>(
     let _answering = sh.up.serving();
     let result = match sh.cluster() {
         None => Err("this machine is in no cluster".to_string()),
+        // A user signs every removal there: no member signs one for another.
+        Some(c) if c.mesh().users_exist() => Err(format!(
+            "this cluster has users, so {} signs no removal: a user's signed removal removes {node}",
+            c.node
+        )),
         Some(c) if c.mesh().admitted_before(node).is_empty() && c.mesh().member(node).is_none() => {
             Err(format!("{} does not know {node} (yet)", c.node))
         }
@@ -456,7 +465,7 @@ fn serve_removal<W: Write>(
 /// word.
 pub(super) fn serve(sh: &Arc<Shared>, req: &ClientRequest, stream: crate::mesh::Stream) {
     let mut s = stream;
-    if let Request::Remove { node } = &req.req {
+    if let Request::Remove { node, .. } = &req.req {
         let requester = s.peer().name.clone();
         let answered = serve_removal(sh, req, node, &requester, &mut s);
         if let Err(e) = answered {

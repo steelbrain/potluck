@@ -28,8 +28,11 @@ joined the cluster: mini, studio
 
 Each text is one line, shortened here. The request holds the new machine's name, public key,
 address, potluck version and a nonce; `admit` refuses a request from another version. The reply
-holds the member's signed admission of that key, the membership records that make the members
-members, and the members' addresses; the new machine takes the rest of the records from the members.
+holds the signed admission of that key, the membership records that make the members members,
+and the members' addresses; the new machine takes the rest of the records from the members. In a
+cluster with [users](#users), `admit` signs the admission with the command line's user key and
+refuses without one, and `--pool POOL` puts the machine in pool POOL (default `default`); without
+users, the member's machine key signs it.
 A machine's name is the one its daemon first ran under (see
 [Installing](install.md#the-machines-name)). Names must be unique, and are letters, digits, `.`, `_`
 and `-`, not starting with `-`. A machine that isn't in a cluster founds one with its first `admit`.
@@ -38,8 +41,9 @@ first `admit` or from `pair --finish`, until it is removed or its admission is v
 after the removal of every other member.
 
 The admitting member announces the admission, and every member accepts a key that a member
-signed, so joining one member joins the cluster. Members compare their records on every heartbeat
-and exchange them when they differ, so a member that was offline catches up when it returns. A
+signed (in a cluster with users, a user), so joining one member joins the cluster. Members compare
+their records on every heartbeat and exchange them when they differ, so a member that was offline
+catches up when it returns. A
 member back from being away (its daemon restarted, or it heard from no member for 30 seconds)
 takes jobs from another member, or hands jobs to one, only once it has compared records with every
 other member, waiting up to 30 seconds for those it doesn't hear from; so it learns of a removal
@@ -49,6 +53,10 @@ that machine could start (a `catch_up` blocker).
 `potluck remove NODE`, on any other member, removes a machine. The removal is announced the same
 way, and the machine's key is refused everywhere after. The removed machine runs only its own jobs
 from then on and says so in `status`; `potluck pair` there makes a new key to join again.
+
+In a cluster with users, the command line's user key signs the removal, and `remove` refuses
+without one. Such a removal is final: the machine removed signs nothing that counts, so it can't
+undo it. The next two paragraphs are about a cluster without users.
 
 Wherever you run it, the removal is signed by the oldest member that is up and was admitted before
 NODE, the founder first, and such a removal is for good. When removals cross, the one signed by the
@@ -76,6 +84,43 @@ keep and pass on records that count nowhere for now, such as the admission that 
 place, so that members that reach each other only through another member end with the same
 records. They turn away the records a removal voids, and drop those they took before when the
 daemon next starts.
+
+## Users
+
+Without users, every member's machine key signs admissions and removals, so any member can admit a
+machine or remove one. `potluck user init` makes a user key for this command line, if there is
+none, and makes it the cluster's first user:
+
+```console
+studio$ potluck user init --name anees
+anees is the cluster's first user; signed in its members: mini, studio
+potluck: made a user key at /Users/anees/.config/potluck/user.key
+```
+
+The user key is an ed25519 key in the file `$POTLUCK_USER_KEY`, else `user.key` beside the command
+line's `node.toml`, with mode 0600. Only the command line reads it; the daemon never does. The
+first user's admission is signed by the user key and co-signed by this machine's machine key, and
+the user key signs every member in again, in one batch with it, so no member drops out. On a
+machine in no cluster, `user init` founds one with that machine as its only member. `user init`
+refuses once the cluster has users.
+
+From then on:
+
+- Only a user's signed record admits or removes a machine. Admissions and removals signed by
+  machine keys count for nothing, and a member's daemon signs neither.
+- A machine's pool is the one its admission names: `potluck admit --pool POOL`, default `default`.
+  The members `user init` signs in are in `default`. Pool names are letters, digits, `.`, `_` and
+  `-`, not starting with `-`.
+- Only a user's signed record adds or removes a user. `potluck user key` prints this command line's
+  public key, making the key first if there is none. A user adds that key with `potluck user add
+  NAME KEY` and removes it with `potluck user remove NAME`; `user remove` refuses to remove the
+  last user. A removed user's key signs nothing that counts after; what it signed that the machine
+  you removed it on knew of stays. `potluck user list` lists the users.
+
+When first users compete (`user init` on two members at once), the one co-signed by the member
+admitted earliest counts, the founder first. A member admitted before the one you run `user init`
+on can therefore make a first user that counts instead of yours, with its machine key, at any time;
+`user init` names such members. Run it on the founder to rule that out.
 
 ## Sources
 

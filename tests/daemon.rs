@@ -1240,6 +1240,7 @@ fn dispatch_refuses_what_cannot_run() {
         Request::PairRequest,
         Request::Admit {
             request: "x".into(),
+            admission: None,
         },
         Request::SelfUpdate,
     ] {

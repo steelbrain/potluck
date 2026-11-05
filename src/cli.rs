@@ -99,14 +99,27 @@ pub enum Command {
         finish: Option<String>,
     },
     /// Admit a machine: takes the request `potluck pair` printed, prints the reply to paste back.
+    ///
+    /// In a cluster with users (`potluck user init`), the admission is signed with this command
+    /// line's user key.
     Admit {
         /// The request `potluck pair` printed on the new machine.
         request: String,
+        /// The machine's pool (a cluster with users only). Default: default.
+        #[arg(long, value_name = "POOL")]
+        pool: Option<String>,
     },
     /// Remove a machine from the cluster.
+    ///
+    /// In a cluster with users, the removal is signed with this command line's user key.
     Remove {
         /// The machine's name, as `potluck nodes` lists it.
         node: String,
+    },
+    /// The cluster's users: keys that sign who joins and leaves it, and who else is a user.
+    User {
+        #[command(subcommand)]
+        action: UserAction,
     },
     /// Update this machine's daemon to the latest release; the other members update themselves
     /// when they meet its new version.
@@ -158,6 +171,36 @@ pub enum Command {
     /// place); 5 if it wouldn't start here at all (node.toml); otherwise says why and exits 2.
     #[command(name = "_handover-check", hide = true)]
     HandoverCheck { file: PathBuf },
+}
+
+#[derive(Subcommand)]
+pub enum UserAction {
+    /// Make this command line's user key (if there is none) the cluster's first user, and sign
+    /// every member in with it. From then on only a user's signed admission or removal admits or
+    /// removes a machine. On a machine in no cluster, founds one.
+    Init {
+        /// The user's name. Default: $USER.
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Make KEY (another command line's `potluck user key`) a user, as NAME.
+    Add {
+        /// Letters, digits, '.', '_' and '-', not starting with '-'.
+        name: String,
+        /// The user's public key.
+        key: String,
+    },
+    /// Remove user NAME: its key signs nothing that counts after. The last user stays.
+    Remove {
+        /// The user's name, as `potluck user list` lists it.
+        name: String,
+    },
+    /// The users.
+    List,
+    /// Print this command line's public user key, making the key first if there is none.
+    ///
+    /// The key file is $POTLUCK_USER_KEY, else user.key beside node.toml (mode 0600).
+    Key,
 }
 
 #[derive(Subcommand)]
@@ -263,6 +306,7 @@ pub use output::{JsonText, Report, fmt_bytes, fmt_mib, table};
 
 use crate::client::Client;
 use crate::config::Paths;
+use crate::mesh::user::UserKey;
 use crate::proto::{Request as Req, Response};
 use crate::types::{JobRecord, now_ms, parse_duration_ms};
 use serde_json::{Value, json};
@@ -629,17 +673,15 @@ impl Cx<'_> {
                 }),
                 Some(reply) => self.text_request(Req::PairFinish { reply }, "pair --finish"),
             },
-            Command::Admit { request } => {
-                self.text_request(Req::Admit { request }, "admit")
-                    .map(|r| Report {
-                        note: "paste this line into `potluck pair --finish` on the new machine"
-                            .into(),
-                        ..r
-                    })
-            }
+            Command::Admit { request, pool } => self.admit(request, pool),
+            Command::User { action } => self.user(action),
             Command::Remove { node } => {
+                let removal = self.signed_removal(&node)?;
                 // Text: the removal holds until the machine removed contests it, and why.
-                let warning = match self.call(Req::Remove { node: node.clone() })? {
+                let warning = match self.call(Req::Remove {
+                    node: node.clone(),
+                    removal,
+                })? {
                     Response::Ok => None,
                     Response::Text { text } => Some(text),
                     other => return Err(unexpected("remove", &other)),
@@ -1290,6 +1332,330 @@ impl Cx<'_> {
     }
 
     /// A request answered with text to show (pairing), or just Ok.
+    /// What the daemon says membership records are signed from.
+    fn membership(&mut self) -> anyhow::Result<crate::mesh::MembershipView> {
+        self.membership_if_known()?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "the daemon here runs a potluck from before users; `potluck restart` restarts it \
+                 on the binary at its path"
+            )
+        })
+    }
+
+    /// [`Cx::membership`]; None from a daemon from before users (its cluster has none).
+    fn membership_if_known(&mut self) -> anyhow::Result<Option<crate::mesh::MembershipView>> {
+        match self.call(Req::Membership) {
+            Ok(Response::Membership { membership }) => Ok(Some(*membership)),
+            Ok(other) => Err(unexpected("membership", &other)),
+            Err(e) if crate::client::not_understood(&e) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// For `admit` and `remove`, whether to sign: [`Cx::membership`] if the daemon says, else
+    /// None. The daemon decides whether a request needs a user's signature, and says so when one
+    /// that has none does.
+    fn membership_for_signing(&mut self) -> anyhow::Result<Option<crate::mesh::MembershipView>> {
+        match self.membership_if_known() {
+            Err(e) if !crate::client::is_disconnected(&e) => Ok(None),
+            other => other,
+        }
+    }
+
+    /// This command line's user key, and its user's name in the cluster `m` describes, to sign
+    /// `what` with.
+    fn signing_user(
+        &self,
+        m: &crate::mesh::MembershipView,
+        what: &str,
+    ) -> anyhow::Result<(UserKey, String)> {
+        let path = crate::mesh::user::key_path(&self.env.paths);
+        let Some(key) = UserKey::load(&path)? else {
+            anyhow::bail!(
+                "this cluster has users, so {what} is signed with a user's key, and there is none at {} (on the machine where a user's key is, run it there; or make one here with `potluck user key` and have a user run `potluck user add NAME KEY`)",
+                path.display()
+            );
+        };
+        match m.users.iter().find(|u| u.key == key.public()) {
+            Some(u) => Ok((key, u.name.clone())),
+            None => anyhow::bail!(
+                "the user key at {} is no user of this cluster; a user adds it with `potluck user add NAME {}`",
+                path.display(),
+                key.public()
+            ),
+        }
+    }
+
+    /// `potluck admit [--pool P] REQUEST`: in a cluster with users, the admission signed here.
+    fn admit(&mut self, request: String, pool: Option<String>) -> anyhow::Result<Report> {
+        use crate::mesh::trust::{self, DEFAULT_POOL};
+        let m = self.membership_for_signing()?;
+        let pool = pool.unwrap_or_else(|| DEFAULT_POOL.to_string());
+        if !trust::valid_pool(&pool) {
+            anyhow::bail!(
+                "bad pool name {pool:?}: use letters, digits, '.', '_' and '-', not starting with '-'"
+            );
+        }
+        let admission = if let Some(m) = m.filter(|m| m.users_exist) {
+            let req = trust::PairRequest::from_text(&request)?;
+            let (key, by) = self.signing_user(&m, "an admission")?;
+            Some(Box::new(crate::mesh::Admission::sign_by_user(
+                &key,
+                &by,
+                &req.name,
+                req.key,
+                &req.address,
+                &pool,
+                &req.nonce,
+                m.next_clock,
+            )))
+        } else if pool != DEFAULT_POOL {
+            anyhow::bail!(
+                "this cluster has no users, and pools come with them: every machine is in pool {DEFAULT_POOL} until `potluck user init`"
+            );
+        } else {
+            None
+        };
+        let by_user = admission.is_some();
+        let reply = self.text_request(Req::Admit { request, admission }, "admit")?;
+        let mut json = reply.json;
+        if let Value::Object(map) = &mut json {
+            map.insert("pool".into(), json!(pool));
+            map.insert("signed_by_user".into(), json!(by_user));
+        }
+        Ok(Report {
+            json,
+            note: "paste this line into `potluck pair --finish` on the new machine".into(),
+            ..reply
+        })
+    }
+
+    /// In a cluster with users, the removal of `node` signed with this command line's user key;
+    /// None without users (a member signs it).
+    fn signed_removal(&mut self, node: &str) -> anyhow::Result<Option<Box<crate::mesh::Removal>>> {
+        let Some(m) = self.membership_for_signing()?.filter(|m| m.users_exist) else {
+            return Ok(None);
+        };
+        let Some(target) = m.members.iter().chain(&m.removed).find(|e| e.name == node) else {
+            anyhow::bail!("{node} is not a member of this cluster");
+        };
+        let (key, by) = self.signing_user(&m, "a removal")?;
+        Ok(Some(Box::new(crate::mesh::Removal::sign_by_user(
+            &key,
+            &by,
+            node,
+            target.key,
+            m.next_clock,
+        ))))
+    }
+
+    fn user(&mut self, action: UserAction) -> anyhow::Result<Report> {
+        use crate::mesh::{Record, UserAdmission, UserRemoval};
+        let path = crate::mesh::user::key_path(&self.env.paths);
+        match action {
+            UserAction::Key => {
+                let (key, made) = UserKey::load_or_create(&path)?;
+                Ok(Report {
+                    note: match made {
+                        true => format!(
+                            "made a user key at {}; a user makes it a user with `potluck user add NAME {}`",
+                            path.display(),
+                            key.public()
+                        ),
+                        false => String::new(),
+                    },
+                    ..Report::new(
+                        json!({ "key": key.public(), "file": path, "made": made }),
+                        key.public().to_text(),
+                    )
+                })
+            }
+            UserAction::List => {
+                let m = self.membership()?;
+                let mine = UserKey::load(&path).ok().flatten().map(|k| k.public());
+                let rows: Vec<Vec<String>> = m
+                    .users
+                    .iter()
+                    .map(|u| {
+                        vec![
+                            u.name.clone(),
+                            u.key.to_text(),
+                            u.by.clone(),
+                            if Some(u.key) == mine { "yes" } else { "" }.to_string(),
+                        ]
+                    })
+                    .collect();
+                let users: Vec<Value> = m
+                    .users
+                    .iter()
+                    .map(|u| {
+                        json!({
+                            "name": u.name, "key": u.key, "by": u.by, "at": u.at,
+                            "this_cli": Some(u.key) == mine,
+                        })
+                    })
+                    .collect();
+                let human = match m.users_exist {
+                    false => "this cluster has no users: its members sign who joins and leaves it (`potluck user init` makes the first user)\n".to_string(),
+                    true => table(&["NAME", "KEY", "ADDED BY", "THIS CLI"], &rows),
+                };
+                Ok(Report::new(
+                    json!({ "users_exist": m.users_exist, "users": users }),
+                    human,
+                ))
+            }
+            UserAction::Init { name } => {
+                let m = self.membership()?;
+                if m.users_exist {
+                    let names: Vec<&str> = m.users.iter().map(|u| u.name.as_str()).collect();
+                    anyhow::bail!(
+                        "this cluster has users already ({}); `potluck user add NAME KEY` adds another",
+                        names.join(", ")
+                    );
+                }
+                if !m.member {
+                    anyhow::bail!(
+                        "{} is not in its cluster (`potluck status` says why); run `potluck pair` to join one",
+                        m.node
+                    );
+                }
+                let name = name
+                    .or_else(|| std::env::var("USER").ok().filter(|u| !u.is_empty()))
+                    .unwrap_or_else(|| "user".to_string());
+                if !crate::mesh::trust::valid_name(&name) {
+                    anyhow::bail!(
+                        "bad user name {name:?}: use letters, digits, '.', '_' and '-', not starting with '-' (--name)"
+                    );
+                }
+                let (key, made) = UserKey::load_or_create(&path)?;
+                let genesis = UserAdmission::genesis(&key, &name, &m.node, m.key, m.next_clock);
+                let admissions: Vec<crate::mesh::Admission> = m
+                    .members
+                    .iter()
+                    .map(|e| {
+                        crate::mesh::Admission::sign_by_user(
+                            &key,
+                            &name,
+                            &e.name,
+                            e.key,
+                            &e.address,
+                            crate::mesh::trust::DEFAULT_POOL,
+                            "",
+                            m.next_clock + 1,
+                        )
+                    })
+                    .collect();
+                match self.call(Req::UserInit {
+                    genesis: Box::new(genesis),
+                    admissions,
+                })? {
+                    Response::Ok => {}
+                    other => return Err(unexpected("user init", &other)),
+                }
+                let members: Vec<&str> = m.members.iter().map(|e| e.name.as_str()).collect();
+                let warning = match m.elders.as_slice() {
+                    [] => None,
+                    elders => Some(format!(
+                        "{} {} admitted before {}, and with {} machine key {} can co-sign a first user's admission that counts instead of this one",
+                        elders.join(", "),
+                        if elders.len() == 1 { "was" } else { "were" },
+                        m.node,
+                        if elders.len() == 1 { "its" } else { "its own" },
+                        if elders.len() == 1 { "it" } else { "each" },
+                    )),
+                };
+                let mut notes = Vec::new();
+                if made {
+                    notes.push(format!("made a user key at {}", path.display()));
+                }
+                notes.extend(warning.clone());
+                Ok(Report {
+                    note: notes.join("\npotluck: "),
+                    ..Report::new(
+                        json!({
+                            "user": name,
+                            "key": key.public(),
+                            "file": path,
+                            "made": made,
+                            "members": members,
+                            "warning": warning,
+                        }),
+                        format!(
+                            "{name} is the cluster's first user; signed in {}: {}",
+                            if members.len() == 1 {
+                                "its member"
+                            } else {
+                                "its members"
+                            },
+                            members.join(", ")
+                        ),
+                    )
+                })
+            }
+            UserAction::Add { name, key } => {
+                let m = self.membership()?;
+                if !m.users_exist {
+                    anyhow::bail!(
+                        "this cluster has no users yet: `potluck user init` makes the first"
+                    );
+                }
+                if !crate::mesh::trust::valid_name(&name) {
+                    anyhow::bail!(
+                        "bad user name {name:?}: use letters, digits, '.', '_' and '-', not starting with '-'"
+                    );
+                }
+                let new = crate::mesh::PublicKey::from_text(&key).map_err(|_| {
+                    anyhow::anyhow!(
+                        "{key:?} is not a user key: `potluck user key` prints one, 43 characters"
+                    )
+                })?;
+                let (signer, by) = self.signing_user(&m, "a user's admission")?;
+                let rec = UserAdmission::sign(&signer, &by, &name, new, m.next_clock);
+                match self.call(Req::UserRecord {
+                    record: Box::new(Record::User(rec)),
+                })? {
+                    Response::Ok => {}
+                    other => return Err(unexpected("user add", &other)),
+                }
+                Ok(Report::new(
+                    json!({ "added": name, "key": new, "by": by }),
+                    format!("{name} is a user of the cluster"),
+                ))
+            }
+            UserAction::Remove { name } => {
+                let m = self.membership()?;
+                if !m.users_exist {
+                    anyhow::bail!("this cluster has no users");
+                }
+                let Some(target) = m.users.iter().find(|u| u.name == name) else {
+                    anyhow::bail!("no user is named {name} (`potluck user list` lists them)");
+                };
+                if m.users.len() == 1 {
+                    anyhow::bail!("{name} is the last user, and a cluster with users keeps one");
+                }
+                let (signer, by) = self.signing_user(&m, "a user's removal")?;
+                let rec = UserRemoval::sign(
+                    &signer,
+                    &by,
+                    &name,
+                    target.key,
+                    target.signed.clone(),
+                    m.next_clock,
+                );
+                match self.call(Req::UserRecord {
+                    record: Box::new(Record::UserRemoval(rec)),
+                })? {
+                    Response::Ok => {}
+                    other => return Err(unexpected("user remove", &other)),
+                }
+                Ok(Report::new(
+                    json!({ "removed": name, "by": by }),
+                    format!("{name} is no user of the cluster any more"),
+                ))
+            }
+        }
+    }
+
     fn text_request(&mut self, req: Req, what: &str) -> anyhow::Result<Report> {
         match self.call(req)? {
             Response::Text { text } => Ok(Report::new(json!({ "text": text }), text)),

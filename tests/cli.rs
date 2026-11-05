@@ -3471,7 +3471,12 @@ fn every_command_answers_in_json_without_a_daemon() {
         &["pair"],
         &["pair", "--finish", "x"],
         &["admit", "x"],
+        &["admit", "--pool", "cloud", "x"],
         &["remove", "n"],
+        &["user", "init"],
+        &["user", "add", "u", "k"],
+        &["user", "remove", "u"],
+        &["user", "list"],
         &["self-update"],
     ];
     for args in commands {

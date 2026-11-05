@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Added
+
+- Users. `potluck user init` makes a user key for the command line (`user.key` beside node.toml,
+  or `$POTLUCK_USER_KEY`) the cluster's first user and signs every member in with it. From then on
+  only a user's signed admission or removal admits or removes a machine: `admit` and `remove` sign
+  with the user key, a member's daemon signs neither, and records machine keys sign count for
+  nothing. `admit --pool POOL` puts a machine in a pool. `user add`, `user remove`, `user list`
+  and `user key` manage the users. A cluster without users works as before. See
+  [A cluster](docs/cluster.md#users).
+
 ### Fixed
 
 - Linux with systemd older than 256 (Ubuntu 24.04 has 255): a job that the kernel's OOM killer

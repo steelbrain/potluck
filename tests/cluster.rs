@@ -758,6 +758,8 @@ impl Node {
             .env_remove("POTLUCK_JOB")
             .env_remove("POTLUCK_LEASE")
             .env_remove("POTLUCK_WORKSPACE")
+            // Each node's user key is user.key beside its node.toml.
+            .env_remove("POTLUCK_USER_KEY")
             .stdin(Stdio::null())
             .output()
             .unwrap();
@@ -785,6 +787,8 @@ impl Node {
             .env_remove("POTLUCK_JOB")
             .env_remove("POTLUCK_LEASE")
             .env_remove("POTLUCK_WORKSPACE")
+            // Each node's user key is user.key beside its node.toml.
+            .env_remove("POTLUCK_USER_KEY")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -1807,6 +1811,253 @@ fn with_the_founder_down_a_removal_says_it_can_be_undone() {
     wait_until("y holds a's removal of x", || holds_removal(&y, "x", "a"));
     let back = removal_by(&x, "x", &y);
     assert_eq!(members_with(&y, back), ["a", "y"]);
+}
+
+/// `node`'s saved store, as its daemon last saved it.
+fn trust_of(node: &Node) -> potluck::mesh::trust::Trust {
+    potluck::mesh::trust::Trust::load_read_only(&node.paths.keys_dir()).unwrap()
+}
+
+/// `node`'s machine key.
+fn key_of(node: &Node) -> potluck::mesh::PublicKey {
+    potluck::mesh::identity::Identity::load(&node.paths.keys_dir())
+        .unwrap()
+        .public()
+}
+
+fn error_of(o: &Out) -> String {
+    o.json["error"].as_str().unwrap_or_default().to_string()
+}
+
+/// `potluck user init` on the founder of a cluster of three: every member stays one, now by the
+/// user's admission, and jobs run across them as before. From then on only what a user signs
+/// admits or removes a machine: `admit --pool cloud` with the user's key joins a machine in that
+/// pool; a member without a user's key can't admit or remove, its daemon signs neither, and the
+/// records members sign count for nothing; a removal the user signs is final.
+#[test]
+fn after_user_init_only_what_users_sign_admits_and_removes() {
+    let w = World::new();
+    let a = w.node("a").start();
+    let b = w.node("b").start();
+    let c = w.node("c").start();
+    pair(&a, &b);
+    pair(&a, &c);
+    wait_until("b and c see each other", || {
+        b.node_alive("c") && c.node_alive("b")
+    });
+    let out = a.cli_ok(&["user", "init", "--name", "owner"]);
+    assert_eq!(out["user"], "owner", "{out}");
+    assert_eq!(out["members"], serde_json::json!(["a", "b", "c"]), "{out}");
+    assert!(out["warning"].is_null(), "a founded the cluster: {out}");
+    assert_eq!(
+        std::path::PathBuf::from(out["file"].as_str().unwrap()),
+        a.dir.join("user.key")
+    );
+    for n in [&a, &b, &c] {
+        wait_until(&format!("{} has the first user", n.name), || {
+            let t = trust_of(n);
+            t.users_exist()
+                && t.view.members.len() == 3
+                && t.view
+                    .members
+                    .values()
+                    .all(|m| m.by_user() && m.by == "owner")
+        });
+    }
+    for n in [&a, &b, &c] {
+        let log = n.daemon_log();
+        assert!(
+            !log.contains(" left (") && !log.contains(" removed "),
+            "{log}"
+        );
+    }
+    let job = a.dispatch(&["--on", "node=c", "--", "true"]);
+    let j = a.done(&job);
+    assert_eq!(
+        (j.state, j.node.as_deref()),
+        (JobState::Succeeded, Some("c"))
+    );
+    let users = a.cli_ok(&["user", "list"]);
+    assert_eq!(users["users"][0]["name"], "owner", "{users}");
+    assert_eq!(users["users"][0]["this_cli"], true, "{users}");
+    assert_eq!(b.cli_ok(&["user", "list"])["users"][0]["this_cli"], false);
+    let again = a.cli(&["user", "init"]);
+    assert!(
+        again.code == 2 && error_of(&again).contains("has users already"),
+        "{}",
+        again.stdout
+    );
+
+    // d joins in pool cloud, admitted with the user's key.
+    let d = w.node("d").start();
+    let request = d.cli_ok(&["pair"])["text"].as_str().unwrap().to_string();
+    let refused = b.cli(&["admit", &request]);
+    assert!(
+        refused.code == 2 && error_of(&refused).contains("signed with a user's key"),
+        "{}",
+        refused.stdout
+    );
+    let e = b
+        .client()
+        .call(Request::Admit {
+            request: request.clone(),
+            admission: None,
+        })
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("only a user's signed admission"), "{e}");
+    let reply = a.cli_ok(&["admit", "--pool", "cloud", &request]);
+    assert_eq!(reply["pool"], "cloud", "{reply}");
+    d.cli_ok(&["pair", "--finish", reply["text"].as_str().unwrap()]);
+    wait_until("a and d meet", || a.node_alive("d") && d.node_alive("a"));
+    let dk = key_of(&d);
+    for n in [&a, &b, &c, &d] {
+        wait_until(&format!("{} has d in pool cloud", n.name), || {
+            trust_of(n).pool_of(&dk) == Some("cloud")
+        });
+    }
+    assert_eq!(trust_of(&a).pool_of(&key_of(&b)), Some("default"));
+
+    // What a member signs counts for nothing: an admission of another machine, a removal.
+    let stranger = tempfile::tempdir().unwrap();
+    let ek = potluck::mesh::identity::Identity::load_or_create(stranger.path())
+        .unwrap()
+        .public();
+    let by_b = {
+        let id = potluck::mesh::identity::Identity::load(&b.paths.keys_dir()).unwrap();
+        let t = trust_of(&b);
+        potluck::mesh::Record::Admission(potluck::mesh::Admission::sign(
+            &id,
+            "b",
+            "e",
+            ek,
+            "127.0.0.1:1",
+            "",
+            t.next_clock(),
+        ))
+    };
+    assert_eq!(members_with(&a, by_b), ["a", "b", "c", "d"]);
+    assert_eq!(
+        members_with(&a, removal_by(&b, "b", &c)),
+        ["a", "b", "c", "d"]
+    );
+    let refused = b.cli(&["remove", "c"]);
+    assert!(
+        refused.code == 2 && error_of(&refused).contains("signed with a user's key"),
+        "{}",
+        refused.stdout
+    );
+    let e = b
+        .client()
+        .call(Request::Remove {
+            node: "c".into(),
+            removal: None,
+        })
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("only a user's signed removal"), "{e}");
+    // Nor does a sign one that b relays (as it signs, without users, one of a machine admitted
+    // after it).
+    let relayed = {
+        let req = potluck::proto::ClientRequest {
+            ctx: ClientContext::default(),
+            req: Request::Remove {
+                node: "c".into(),
+                removal: None,
+            },
+        };
+        let header = serde_json::json!({ "kind": "client", "req": req });
+        let stream = client_mesh(&b).open_stream("a", header).unwrap();
+        let mut r = std::io::BufReader::new(stream);
+        potluck::proto::read_msg::<_, potluck::proto::ServerResponse>(&mut r)
+            .unwrap()
+            .unwrap()
+            .resp
+    };
+    match relayed {
+        Response::Error { message } => assert!(message.contains("signs no removal"), "{message}"),
+        other => panic!("a relayed removal was answered: {other:?}"),
+    }
+    assert!(trust_of(&a).view.by_name("c").is_some());
+    assert!(trust_of(&b).view.by_name("c").is_some());
+
+    // The user's removal: final, everywhere.
+    let out = a.cli_ok(&["remove", "c"]);
+    assert_eq!(out["final"], true, "{out}");
+    assert!(out["warning"].is_null(), "{out}");
+    for n in [&a, &b, &d] {
+        wait_until(&format!("{} holds owner's removal of c", n.name), || {
+            holds_removal(n, "c", "owner")
+        });
+    }
+    wait_until("c knows it was removed", || says_out(&c));
+    // a settled the removal once, as the command made it.
+    let log = a.daemon_log();
+    assert_eq!(log.matches("cluster: removed c\n").count(), 1, "{log}");
+    assert!(!log.contains("cluster: owner removed c"), "{log}");
+    assert!(b.daemon_log().contains("cluster: owner removed c"));
+}
+
+/// On a machine in no cluster, `potluck user init` founds one. A second command line's user key,
+/// added with `potluck user add`, signs admissions there until a user removes it; what it signed
+/// before stays. The last user stays.
+#[test]
+fn a_second_users_key_signs_until_it_is_removed() {
+    let w = World::new();
+    let a = w.node("a").start();
+    let b = w.node("b").start();
+    let out = a.cli_ok(&["user", "init", "--name", "owner"]);
+    assert_eq!(out["members"], serde_json::json!(["a"]), "{out}");
+    assert!(trust_of(&a).users_exist());
+    assert!(a.listening().is_none(), "a cluster of one doesn't listen");
+    pair(&a, &b);
+    let made = b.cli_ok(&["user", "key"]);
+    assert_eq!(made["made"], true, "{made}");
+    let key = made["key"].as_str().unwrap().to_string();
+    assert_eq!(b.cli_ok(&["user", "key"])["key"], key.as_str());
+    let bob = potluck::mesh::PublicKey::from_text(&key).unwrap();
+    let refused = b.cli(&["user", "add", "eve", &key]);
+    assert!(
+        refused.code == 2 && error_of(&refused).contains("is no user of this cluster"),
+        "{}",
+        refused.stdout
+    );
+    // A machine's key is no user's: its daemon holds it.
+    let machine = a.cli(&["user", "add", "bkey", &key_of(&b).to_text()]);
+    assert!(
+        machine.code == 2 && error_of(&machine).contains("b's machine key"),
+        "{}",
+        machine.stdout
+    );
+    a.cli_ok(&["user", "add", "bob", &key]);
+    wait_until("b knows bob", || trust_of(&b).recognized_user(&bob));
+    // bob, on b, admits c.
+    let c = w.node("c").start();
+    pair(&b, &c);
+    wait_until("a sees c", || a.node_alive("c"));
+    assert_eq!(trust_of(&a).view.by_name("c").unwrap().by, "bob");
+    // owner removes bob: b's key signs nothing that counts after, and c, which bob admitted
+    // before, stays.
+    a.cli_ok(&["user", "remove", "bob"]);
+    wait_until("b knows bob is no user", || {
+        !trust_of(&b).recognized_user(&bob)
+    });
+    let refused = b.cli(&["remove", "c"]);
+    assert!(
+        refused.code == 2 && error_of(&refused).contains("is no user of this cluster"),
+        "{}",
+        refused.stdout
+    );
+    assert!(trust_of(&a).view.by_name("c").is_some());
+    assert!(a.node_alive("c"));
+    let last = a.cli(&["user", "remove", "owner"]);
+    assert!(
+        last.code == 2 && error_of(&last).contains("the last user"),
+        "{}",
+        last.stdout
+    );
+    let users = a.cli_ok(&["user", "list"]);
+    assert_eq!(users["users"].as_array().unwrap().len(), 1, "{users}");
 }
 
 /// b can't save its records (a full disk; here its keys directory is read-only) when it hears it
@@ -3870,7 +4121,10 @@ fn only_job_workspace_and_removal_requests_are_relayed() {
         .as_str()
         .unwrap()
         .to_string();
-    match relay(Request::Admit { request }) {
+    match relay(Request::Admit {
+        request,
+        admission: None,
+    }) {
         Response::Error { message } => assert!(message.contains("relayed"), "{message}"),
         other => panic!("a relayed admission was answered: {other:?}"),
     }
@@ -3881,14 +4135,20 @@ fn only_job_workspace_and_removal_requests_are_relayed() {
         Response::Error { message } if message.contains("no job a-999")
     ));
     // A removal only when a was admitted before the machine removed: never of a, the founder.
-    match relay(Request::Remove { node: "a".into() }) {
+    match relay(Request::Remove {
+        node: "a".into(),
+        removal: None,
+    }) {
         Response::Error { message } => {
             assert!(message.contains("a was not admitted before a"), "{message}")
         }
         other => panic!("a relayed removal of the founder was answered: {other:?}"),
     }
     assert!(matches!(
-        relay(Request::Remove { node: "b".into() }),
+        relay(Request::Remove {
+            node: "b".into(),
+            removal: None
+        }),
         Response::Ok
     ));
     assert!(

@@ -1412,7 +1412,7 @@ pub(crate) fn membership(
                 )),
             }
         }
-        Request::Admit { request } => {
+        Request::Admit { request, admission } => {
             // The founder's first admission: it listens before it answers, so the reply says
             // where; if nobody is admitted after all, it stops again.
             let mut l = c.listening.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1420,7 +1420,9 @@ pub(crate) fn membership(
                 true => Ok(()),
                 false => set_listener_locked(sh, c, &mut l, Some(true), true),
             };
-            let admitted = c.mesh().admit(request.trim());
+            let admitted = c
+                .mesh()
+                .admit_signed(request.trim(), admission.as_deref().cloned());
             let fitted = set_listener_locked(sh, c, &mut l, None, true);
             drop(l);
             let reply = admitted.map_err(|e| e.to_string())?;
@@ -1463,14 +1465,17 @@ pub(crate) fn membership(
             c.wake();
             text(reply)
         }
-        Request::Remove { node } => {
+        Request::Remove { node, removal } => {
             let elders = c.mesh().admitted_before(node);
+            let by_user = c.mesh().users_exist();
             {
                 // Not while the mesh is being replaced, as for PairRequest: made on the mesh
                 // going, the removal would be on disk but not in the mesh that serves on (whose
                 // next save drops it there too), and announced from a mesh stopped.
                 let _l = c.listening.lock().unwrap_or_else(PoisonError::into_inner);
-                c.mesh().remove(node).map_err(|e| e.to_string())?;
+                c.mesh()
+                    .remove_signed(node, removal.as_deref().cloned())
+                    .map_err(|e| e.to_string())?;
             }
             sh.log.log(format!("cluster: removed {node}"));
             {
@@ -1482,10 +1487,44 @@ pub(crate) fn membership(
             owner::runner_lost(sh, c, node, "was removed from the cluster");
             remote::owner_gone(sh, c, node);
             sh.kick();
-            Ok(match contestable(&c.node, node, &elders) {
-                None => Response::Ok,
-                Some(text) => Response::Text { text },
-            })
+            // A user's removal is final: the machine removed signs nothing that counts.
+            Ok(
+                match contestable(&c.node, node, &elders).filter(|_| !by_user) {
+                    None => Response::Ok,
+                    Some(text) => Response::Text { text },
+                },
+            )
+        }
+        Request::Membership => Ok(Response::Membership {
+            membership: Box::new(c.mesh().membership()),
+        }),
+        Request::UserInit {
+            genesis,
+            admissions,
+        } => {
+            // Not while the mesh is being replaced, as for PairRequest.
+            let _l = c.listening.lock().unwrap_or_else(PoisonError::into_inner);
+            let name = genesis.name.clone();
+            c.mesh()
+                .user_init((**genesis).clone(), admissions.clone())
+                .map_err(|e| e.to_string())?;
+            sh.log.log(format!(
+                "cluster: {name} is the first user; from now on only what users sign admits and removes machines"
+            ));
+            Ok(Response::Ok)
+        }
+        Request::UserRecord { record } => {
+            let _l = c.listening.lock().unwrap_or_else(PoisonError::into_inner);
+            let what = match &**record {
+                crate::mesh::Record::User(u) => format!("{} made {} a user", u.by, u.name),
+                crate::mesh::Record::UserRemoval(r) => format!("{} removed user {}", r.by, r.name),
+                _ => String::new(),
+            };
+            c.mesh()
+                .user_record((**record).clone())
+                .map_err(|e| e.to_string())?;
+            sh.log.log(format!("cluster: {what}"));
+            Ok(Response::Ok)
         }
         _ => Err("not a membership request".into()),
     }
@@ -1753,7 +1792,14 @@ mod tests {
         cfg.address = Some("127.0.0.1".into());
         let b = Mesh::start(cfg, Arc::new(NoCalls)).unwrap();
         let request = b.pair_request().unwrap();
-        let reply = match membership(&sh, &c, &crate::proto::Request::Admit { request }) {
+        let reply = match membership(
+            &sh,
+            &c,
+            &crate::proto::Request::Admit {
+                request,
+                admission: None,
+            },
+        ) {
             Ok(crate::proto::Response::Text { text }) => text,
             other => panic!("{other:?}"),
         };
@@ -2105,7 +2151,14 @@ mod tests {
             let name = format!("m{i}");
             let m = bare_mesh(dir.path(), &name);
             let request = m.pair_request().unwrap();
-            let reply = match membership(&sh, &c, &Request::Admit { request }) {
+            let reply = match membership(
+                &sh,
+                &c,
+                &Request::Admit {
+                    request,
+                    admission: None,
+                },
+            ) {
                 Ok(Response::Text { text }) => text,
                 other => panic!("{other:?}"),
             };
@@ -2119,7 +2172,14 @@ mod tests {
                 })
             };
             go.wait();
-            match membership(&sh, &c, &Request::Remove { node: name.clone() }) {
+            match membership(
+                &sh,
+                &c,
+                &Request::Remove {
+                    node: name.clone(),
+                    removal: None,
+                },
+            ) {
                 Ok(_) => {}
                 other => panic!("{other:?}"),
             }
@@ -2280,7 +2340,14 @@ mod tests {
         cfg.address = Some("127.0.0.1".into());
         let e = Mesh::start(cfg, Arc::new(NoCalls)).unwrap();
         let request = e.pair_request().unwrap();
-        let reply = match membership(&sh, &c, &Request::Admit { request }) {
+        let reply = match membership(
+            &sh,
+            &c,
+            &Request::Admit {
+                request,
+                admission: None,
+            },
+        ) {
             Ok(Response::Text { text }) => text,
             other => panic!("{other:?}"),
         };
