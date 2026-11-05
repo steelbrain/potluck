@@ -23,6 +23,10 @@ const CLAIM_TIMEOUT: Duration = Duration::from_secs(15);
 const CALL_TIMEOUT: Duration = Duration::from_secs(15);
 /// A refused claim isn't tried again before this long.
 const REJECTED_MS: u64 = 2_000;
+/// A job this machine refused to run is kept from its claims this long at least, though no report
+/// lists it queued: from the grant until the owner takes it back and reports it again, it is
+/// starting there, in no queue.
+const REFUSED_MS: u64 = 60_000;
 /// The most output one log frame carries, and one pass of the courier sends.
 const LOG_FRAME: u64 = 1 << 20;
 const LOG_PASS: u64 = 16 << 20;
@@ -238,13 +242,15 @@ pub(crate) fn adjust_queue(sh: &Shared, st: &State, queue: &mut Vec<Queued>, now
         }
     }
     queue.extend(added);
-    // A job refused here stays refused while its owner queues it.
+    // A job refused here stays refused while its owner queues it, and for REFUSED_MS after the
+    // refusal whether or not a report lists it.
     let queued: BTreeSet<&JobId> = cs
         .reports
         .values()
         .flat_map(|r| r.report.queue.iter().map(|j| &j.id))
         .collect();
-    cs.refused.retain(|id, _| queued.contains(id));
+    cs.refused
+        .retain(|id, (_, at)| queued.contains(id) || boot.saturating_sub(*at) < REFUSED_MS);
 
     // Locality: a machine without a workspace of the repository leaves the job to a live member
     // with one that could start it within the wait, for that long.
@@ -433,7 +439,9 @@ fn claim(sh: &Arc<Shared>, id: &str, passed: Vec<JobId>) {
                 sh.log.log(format!(
                     "WARNING: {id}: granted by {owner}, but not run here: {why}"
                 ));
-                c.cs().refused.insert(id.to_string(), why.clone());
+                c.cs()
+                    .refused
+                    .insert(id.to_string(), (why.clone(), c.boot()));
                 let back = format!("{} did not run it: {why}", c.node);
                 undo(sh, &c, id, Some(back));
                 return;

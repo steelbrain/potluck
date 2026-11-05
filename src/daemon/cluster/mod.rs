@@ -271,9 +271,10 @@ pub(crate) struct CState {
     /// Claims refused lately: not tried again until this time (boot clock).
     pub rejected: BTreeMap<JobId, u64>,
     /// Jobs granted here that this machine did not run because they don't verify (an unsigned or
-    /// forged job, or one not for this machine's pool), with why: never claimed again while their
-    /// owners still queue them.
-    pub refused: BTreeMap<JobId, String>,
+    /// forged job, or one not for this machine's pool), with why and when (boot clock): never
+    /// claimed again while their owners still queue them, nor in the minute after the refusal,
+    /// while no report lists the job (the owner has it as starting until the hand-back).
+    pub refused: BTreeMap<JobId, (String, u64)>,
     /// Other machines' jobs the latest plan may start: job -> (owner, record).
     pub candidates: BTreeMap<JobId, (NodeName, crate::types::JobRecord)>,
     /// Other machines' jobs granted here: the numbers of the last report the owner made before
