@@ -197,11 +197,10 @@ between members and what happens when one is lost.
 | `nodes` | Every machine with its pool, facts, GPUs, version and address. |
 | `env [NODE]` | Print the login environment a job on NODE (default: this machine) starts from. |
 | `pair`, `pair --finish REPLY` | Ask to join a cluster, and finish joining. |
-| `admit [--pool POOL] REQUEST` | Admit a machine and print the reply; with users, signed with this command line's user key, into POOL. |
-| `remove NODE` | Remove a machine from the cluster; with users, signed with this command line's user key. |
-| `user init [--name NAME]` | Make this command line's user key the cluster's first user and sign every member in with it, and the jobs this machine queued before it. |
-| `user add NAME KEY`, `user remove NAME`, `user list` | Add, remove or list the users. |
-| `user key` | Print this command line's public user key, making the key first if there is none. |
+| `admit [--pool POOL] REQUEST` | Admit a machine, into POOL, and print the reply. |
+| `remove NODE` | Remove a machine from the cluster. |
+| `user init` | Make this command line's user key the cluster's first user. |
+| `user add NAME KEY`, `user remove NAME`, `user list`, `user key` | Add, remove or list users; print this command line's key. |
 | `self-update [--here]` | Update this machine to the latest release, through the daemon or (`--here`) from this process; the other members follow. |
 | `restart` | Restart the daemon in place on the binary at its path, keeping running jobs and open connections. |
 | `service install`, `service uninstall` | Install or remove the daemon's service. |
