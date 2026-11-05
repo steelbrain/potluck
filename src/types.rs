@@ -398,8 +398,8 @@ pub struct JobSpec {
     pub rerun_if_lost: bool,
     /// End the job early when it stalls (otherwise it is only marked stalled).
     pub kill_on_stall: bool,
-    /// `--hold-line` (a recipe's `hold_line`): while it can't start on a machine, no job behind it
-    /// in order starts there ([`crate::sched`]). False in records from before it, and not written
+    /// `--hold-line` (a recipe's `hold_line`): while it doesn't start on a machine, no job behind
+    /// it in order starts there ([`crate::sched`]). False in records from before it, and not written
     /// when false, so a spec without it signs and reads as before.
     #[serde(default, skip_serializing_if = "is_false")]
     pub hold_line: bool,

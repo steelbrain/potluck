@@ -24,20 +24,23 @@
 //! - **Holding the line.** A job holds the line when it was dispatched with `--hold-line`
 //!   ([`crate::types::JobSpec::hold_line`]) or has been queued for [`HOLD_LINE_AFTER_MS`] (30
 //!   minutes) since it was submitted (a job queued again after its machine was lost keeps its
-//!   submit time). The first job in order that holds the line and can't start holds this machine:
-//!   no job after it in order starts here until it does, even one that would fit now. So jobs
-//!   fill in ahead of a job for at most 30 minutes after it was submitted: an exclusive job then
-//!   waits for what runs then to end (and for jobs ahead of it in order).
+//!   submit time), and it doesn't start here. One dispatched with `--hold-line` holds this machine:
+//!   no job after it in order starts here until it does, even one that would fit now. One that
+//!   holds the line only for its 30 minutes keeps back only the jobs after it in order that would
+//!   take something it waits for ([`Takes`]): a GPU one of its selectors matches; RAM, while it
+//!   lacks RAM; anything, while it is exclusive and waits for the machine to empty; or its place,
+//!   when it could start before that job and not after. Other jobs after it go on filling in. So an
+//!   exclusive job waits for at most 30 minutes of filling after it was submitted, then for what
+//!   runs then to end (and for jobs ahead of it in order), and a job waiting for a busy GPU keeps
+//!   back only jobs that would take a GPU it could use.
 //! - **Aging.** A waiting job is passed over when a job after it in order starts here (it fills in
 //!   ahead of it), or when a job submitted later and ahead of it in order (by a higher priority,
-//!   after aging) is granted something it waits for: a GPU one of its selectors matches; RAM, when
-//!   it didn't fit in the RAM free just before; anything, when it is exclusive and waits for the
-//!   machine to empty; or its place, when it could have had what it asks for just before that
-//!   start and not after. Passed jobs could run on this machine and are still waiting; they are
-//!   returned in [`Plan::passed`] (once per plan) and the caller adds one to their `passes`.
+//!   after aging) is granted something it waits for, as for holding the line ([`Takes`]). Passed
+//!   jobs could run on this machine and are still waiting; they are returned in [`Plan::passed`]
+//!   (once per plan) and the caller adds one to their `passes`.
 //! - **Reservations.** For `why`: when what the first job in order that can't start needs is
-//!   expected free, and the same for the job holding the line, if every holder (the jobs this plan
-//!   starts included) runs to its deadline.
+//!   expected free, and the same for each job holding the line, if every holder (the jobs this
+//!   plan starts included) runs to its deadline.
 //! - **No preemption.** Nothing here stops a running job.
 
 use crate::types::{Facts, Gpu, Grant, JobId, MINUTE_MS, Millis, NodeName, Request, WorkspaceId};
@@ -122,9 +125,13 @@ pub struct Plan {
     pub passed: Vec<JobId>,
     /// The first blocked job's reservation, if a job is blocked.
     pub reservation: Option<Reservation>,
-    /// The job holding the line, if one does: the first in order that holds it
-    /// ([`Queued::holds_line`]) and can't start. No job after it in order starts.
-    pub line: Option<Line>,
+    /// The jobs holding the line here, in order: each holds it ([`Queued::holds_line`]) and
+    /// doesn't start. After one dispatched with `--hold-line` (the last, when one is) nothing
+    /// starts; one that holds it for its 30 minutes keeps back only the jobs in [`Plan::held`].
+    pub lines: Vec<Line>,
+    /// Jobs that could start but are kept back by a job ahead of them holding the line for its 30
+    /// minutes, each with that job and what of its needs it would take.
+    pub held: Vec<Held>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -132,6 +139,27 @@ pub struct Line {
     /// Its reservation.
     pub reservation: Reservation,
     pub why: HoldsLine,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Held {
+    pub job: JobId,
+    /// The job holding the line that keeps it back.
+    pub by: JobId,
+    pub takes: Takes,
+}
+
+/// What of a waiting job's needs another job would take, were it granted ([`takes`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Takes {
+    /// A GPU (its id) one of the waiting job's selectors matches.
+    Gpu(String),
+    /// RAM, which the waiting job lacks.
+    Ram,
+    /// Anything: the waiting job is exclusive and waits for the machine to empty.
+    Machine,
+    /// Its place: it could start before, and not after.
+    Place,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -228,7 +256,9 @@ pub fn plan(now: Millis, machine: &MachineView, queue: &[Queued]) -> Plan {
     // Each start: the job, its grant, and the machine's load just before it.
     let mut starts: Vec<(usize, Grant, Vec<Hold>)> = Vec::new();
     let mut first = None;
-    let mut line = None;
+    // The jobs holding the line so far, and whether one was dispatched with --hold-line.
+    let mut lines: Vec<(usize, HoldsLine)> = Vec::new();
+    let mut strict = false;
 
     for &i in &order {
         let q = &queue[i];
@@ -242,20 +272,43 @@ pub fn plan(now: Millis, machine: &MachineView, queue: &[Queued]) -> Plan {
             // earlier goes first. No reservation, and no other start passes it over.
             continue;
         }
-        // Behind the job holding the line: nothing starts.
-        if line.is_some() {
+        // Behind a job dispatched with --hold-line that doesn't start: nothing starts.
+        if strict {
             waiting.push(i);
             continue;
         }
-        let Some(grant) = load.grant(q) else {
-            waiting.push(i);
-            first.get_or_insert(i);
-            line = q.holds_line(now).map(|why| (i, why));
-            continue;
-        };
-        starts.push((i, grant.clone(), load.holds.clone()));
-        load.add(&q.job, &grant, now.saturating_add(q.timeout_ms));
-        out.start.push((q.job.clone(), grant));
+        let grant = load.grant(q);
+        // Kept back by a job holding the line for its 30 minutes, when it would take something
+        // that job waits for.
+        let kept = grant.as_ref().and_then(|g| {
+            lines
+                .iter()
+                .find_map(|&(h, _)| takes(&load, q, g, &queue[h]).map(|t| (h, t)))
+        });
+        match (grant, kept) {
+            (Some(grant), None) => {
+                starts.push((i, grant.clone(), load.holds.clone()));
+                load.add(&q.job, &grant, now.saturating_add(q.timeout_ms));
+                out.start.push((q.job.clone(), grant));
+            }
+            (grant, kept) => {
+                waiting.push(i);
+                if grant.is_none() {
+                    first.get_or_insert(i);
+                }
+                if let Some((h, takes)) = kept {
+                    out.held.push(Held {
+                        job: q.job.clone(),
+                        by: queue[h].job.clone(),
+                        takes,
+                    });
+                }
+                if let Some(why) = q.holds_line(now) {
+                    lines.push((i, why));
+                    strict = why == HoldsLine::Asked;
+                }
+            }
+        }
     }
 
     // With what this plan starts holding what it was granted: jobs that filled in ahead of the
@@ -265,17 +318,20 @@ pub fn plan(now: Millis, machine: &MachineView, queue: &[Queued]) -> Plan {
         at: load.free_at(&queue[i]),
     };
     out.reservation = first.map(reserve);
-    out.line = line.map(|(i, why)| Line {
-        reservation: reserve(i),
-        why,
-    });
+    out.lines = lines
+        .into_iter()
+        .map(|(i, why)| Line {
+            reservation: reserve(i),
+            why,
+        })
+        .collect();
     out.passed = waiting
         .into_iter()
         .filter(|&w| {
             starts.iter().any(|(s, grant, before)| {
                 place[*s] > place[w]
                     || (queue[w].submitted_at < queue[*s].submitted_at
-                        && passes_over(&load.at(before), &queue[*s], grant, &queue[w]))
+                        && takes(&load.at(before), &queue[*s], grant, &queue[w]).is_some())
             })
         })
         .map(|w| queue[w].job.clone())
@@ -315,33 +371,34 @@ pub(crate) fn workspace_heads<'q>(
     heads
 }
 
-/// Whether start `s`, ahead of the waiting job `w` in order and granted `grant` on a machine loaded
-/// as `before`, passes over `w`: `s` was granted something `w` needs and lacks.
+/// What of the waiting job `w`'s needs `s`, granted `grant` on a machine loaded as `before`, would
+/// take, if anything:
 ///
 /// - a GPU one of `w`'s selectors matches;
-/// - RAM, when `w` didn't fit in the RAM free before `s` started;
+/// - RAM, when `w` doesn't fit in the RAM free before `s` starts;
 /// - anything, when `w` is exclusive (it waits for the machine to empty);
-/// - its place: `w` could have been granted what it asks for just before `s`, and not after.
-fn passes_over(before: &Load, s: &Queued, grant: &Grant, w: &Queued) -> bool {
+/// - its place: `w` could be granted what it asks for just before `s`, and not after.
+fn takes(before: &Load, s: &Queued, grant: &Grant, w: &Queued) -> Option<Takes> {
     let want = &w.request;
     if want.exclusive {
-        return true;
+        return Some(Takes::Machine);
     }
     let gpus = &before.machine.facts.gpus;
-    let gpu_wanted = grant.gpus.iter().any(|id| {
+    let gpu = grant.gpus.iter().find(|id| {
         gpus.iter()
-            .find(|g| g.id == *id)
+            .find(|g| g.id == **id)
             .is_some_and(|g| want.gpus.iter().any(|sel| gpu_matches(sel, g)))
     });
-    if gpu_wanted || (grant.ram_mib > 0 && want.ram_mib > before.ram_free()) {
-        return true;
+    if let Some(id) = gpu {
+        return Some(Takes::Gpu(id.clone()));
     }
-    if before.grant(w).is_none() {
-        return false;
+    if grant.ram_mib > 0 && want.ram_mib > before.ram_free() {
+        return Some(Takes::Ram);
     }
+    before.grant(w)?;
     let mut after = before.at(&before.holds);
     after.add(&s.job, grant, before.now.saturating_add(s.timeout_ms));
-    after.grant(w).is_none()
+    after.grant(w).is_none().then_some(Takes::Place)
 }
 
 /// A RAM amount in GiB, for [`feasible`]'s reasons: `16`, `0.5`, `1.3`.

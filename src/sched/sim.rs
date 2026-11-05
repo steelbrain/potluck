@@ -293,7 +293,8 @@ fn an_exclusive_job_waits_at_most_30_minutes_of_filling() {
 
 /// A job waiting on a busy GPU is passed over by every job that starts after it in order, CPU-only
 /// ones too: its priority rises by one each time, and stops at 4. A priority-5 job dispatched later
-/// still goes first.
+/// still goes first. Queued for 30 minutes, it keeps back no CPU-only job: they take nothing it
+/// waits for.
 #[test]
 fn filling_in_ages_the_waiting_job_up_to_4() {
     let mut jobs = vec![
@@ -319,15 +320,41 @@ fn filling_in_ages_the_waiting_job_up_to_4() {
         assert_eq!(got, (passes, eff), "at {t}");
     }
     sim.run_until(600);
-    for i in 0..6 {
+    // From 30 gpu holds the line, for the GPU: c-6 (31) to c-11 (56) start as they arrive too.
+    for i in 0..12 {
         assert_eq!(sim.start_of(&format!("c-{i}")), m(1 + 5 * i), "c-{i}");
     }
-    // urgent gets the GPU first, passing gpu over once more.
+    // urgent gets the GPU first, passing gpu over once more: 12 + 1 passes.
     assert_eq!(sim.start_of("urgent"), m(60));
-    assert_eq!(sim.started["gpu"], (m(70), 7));
-    // From 30 gpu holds the line: c-6 (31) to c-11 (56) wait for it, though they would fit.
-    for i in 6..12 {
-        assert_eq!(sim.start_of(&format!("c-{i}")), m(70), "c-{i}");
+    assert_eq!(sim.started["gpu"], (m(70), 13));
+}
+
+/// A job that needs both GPUs at once waits while single-GPU jobs keep filling in, one GPU or the
+/// other always busy. Queued for 30 minutes, it keeps back the jobs that would take a GPU, and gets
+/// both once those running end; CPU-only jobs, which take nothing it waits for, start as they
+/// arrive all along.
+#[test]
+fn a_job_queued_for_30_minutes_keeps_back_only_what_takes_what_it_waits_for() {
+    let mut jobs = vec![(job("both").gpu("any").gpu("any").at(0), 10)];
+    for i in 0..20 {
+        jobs.push((job(&format!("g-{i}")).gpu("any").mins(5).at(1 + 3 * i), 5));
+        jobs.push((job(&format!("c-{i}")).ram(1).mins(5).at(2 + 3 * i), 5));
+    }
+    let mut sim = Sim::new(
+        Machine::new("ms01", 64, vec![nv(), amd()]),
+        vec![(run("x", 4, &[NV], 2), 2)],
+        jobs,
+    );
+    sim.run_until(600);
+    // g-0 to g-9 (1 to 28) fill in as they arrive.
+    for i in 0..10 {
+        assert_eq!(sim.start_of(&format!("g-{i}")), m(1 + 3 * i), "g-{i}");
+    }
+    // From 30 g-10 (31) waits: both starts when g-9 ends, at 33, and g-10 when it ends.
+    assert_eq!(sim.start_of("both"), m(33));
+    assert_eq!(sim.start_of("g-10"), m(43));
+    for i in 0..20 {
+        assert_eq!(sim.start_of(&format!("c-{i}")), m(2 + 3 * i), "c-{i}");
     }
 }
 

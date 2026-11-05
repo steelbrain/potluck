@@ -20,7 +20,7 @@
 
 use crate::cli::{fmt_bytes, fmt_mib};
 use crate::proto::{Blocker, WhyView};
-use crate::sched::{self, Hold, Load, MachineView, Queued, Reservation};
+use crate::sched::{self, Hold, HoldsLine, Load, MachineView, Queued, Reservation, Takes};
 use crate::types::{
     JobId, JobRecord, JobState, Millis, NodeName, SECOND_MS, effective_priority, fmt_ms, fmt_on,
     fmt_on_all, gpu_matches,
@@ -517,10 +517,20 @@ impl Why<'_, '_> {
             ),
             _ => "expected to start once jobs past their run limits are stopped".to_string(),
         };
-        // Behind the job holding the line: nothing after it in order starts here.
-        if let Some(l) = plan.line.as_ref().filter(|l| {
-            rank.get(l.reservation.job.as_str())
-                .is_some_and(|&p| p < mine)
+        let order_block = |job: &str, at: Millis| Holder {
+            job: job.to_string(),
+            clause: String::new(),
+            held_for_ms: None,
+            limit_ms: None,
+            idle_ms: None,
+            free_by: Some(at),
+        };
+        // Behind a job dispatched with --hold-line: nothing after it in order starts here.
+        if let Some(l) = plan.lines.last().filter(|l| {
+            l.why == HoldsLine::Asked
+                && rank
+                    .get(l.reservation.job.as_str())
+                    .is_some_and(|&p| p < mine)
         }) {
             let r = &l.reservation;
             // When it is the first in line, whatever else waits there goes after it.
@@ -533,9 +543,9 @@ impl Why<'_, '_> {
                 String::new()
             };
             self.line(format!(
-                "waits behind job {}, which holds the line on {node} ({}){expected}",
-                r.job,
-                holds_line(l.why)
+                "waits behind job {}, which holds the line on {node} (dispatched with \
+                 --hold-line){expected}",
+                r.job
             ));
             if !short {
                 self.line(format!(
@@ -543,25 +553,47 @@ impl Why<'_, '_> {
                     r.job
                 ));
             }
-            let h = Holder {
-                job: r.job.clone(),
-                clause: String::new(),
-                held_for_ms: None,
-                limit_ms: None,
-                idle_ms: None,
-                free_by: Some(r.at),
+            self.block("order", Some(node), Some(&order_block(&r.job, r.at)));
+            return;
+        }
+        // Kept back by a job queued for 30 minutes, whose needs it would take.
+        if let Some(h) = plan.held.iter().find(|h| h.job == q.job) {
+            let what = match &h.takes {
+                Takes::Gpu(id) => format!(
+                    "waits for the GPU this job would take (gpu {})",
+                    gpu_label(m, id)
+                ),
+                Takes::Ram => "waits for the RAM this job would take".to_string(),
+                Takes::Machine => format!("waits for {node} to empty (exclusive)"),
+                Takes::Place => "would no longer fit there if this job started".to_string(),
             };
-            self.block("order", Some(node), Some(&h));
+            self.line(format!(
+                "waits behind job {} on {node}, which has been queued for {} or more and {what}",
+                h.by,
+                fmt_ms(sched::HOLD_LINE_AFTER_MS)
+            ));
+            let at = plan
+                .lines
+                .iter()
+                .find(|l| l.reservation.job == h.by)
+                .map_or(now, |l| l.reservation.at);
+            self.block("order", Some(node), Some(&order_block(&h.by, at)));
             return;
         }
         if let Some(r) = plan.reservation.as_ref().filter(|r| r.job == q.job) {
             self.line(format!("first in line on {node}: {}", when(r.at)));
         }
-        if let Some(l) = plan.line.as_ref().filter(|l| l.reservation.job == q.job) {
-            self.line(format!(
-                "holds the line on {node} ({}): nothing behind it starts there until it does",
-                holds_line(l.why)
-            ));
+        match plan.lines.iter().find(|l| l.reservation.job == q.job) {
+            Some(l) if l.why == HoldsLine::Asked => self.line(format!(
+                "holds the line on {node} (dispatched with --hold-line): nothing behind it starts \
+                 there until it does"
+            )),
+            Some(_) => self.line(format!(
+                "holds the line on {node} (queued for {} or more): no job behind it that would \
+                 take what it waits for starts there until it does",
+                fmt_ms(sched::HOLD_LINE_AFTER_MS)
+            )),
+            None => {}
         }
     }
 
@@ -847,16 +879,6 @@ fn asks(q: &Queued) -> String {
         parts.join(", "),
         fmt_ms(q.timeout_ms)
     )
-}
-
-/// Why a job holds the line, as `why` says it.
-fn holds_line(why: sched::HoldsLine) -> String {
-    match why {
-        sched::HoldsLine::Asked => "dispatched with --hold-line".into(),
-        sched::HoldsLine::Waited => {
-            format!("queued for {} or more", fmt_ms(sched::HOLD_LINE_AFTER_MS))
-        }
-    }
 }
 
 /// The job with no RAM, to ask whether its GPUs alone could be granted.

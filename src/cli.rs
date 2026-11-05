@@ -256,7 +256,9 @@ pub struct DispatchArgs {
     #[arg(long)]
     pub exclusive: bool,
     /// While this job waits on a machine, no job behind it in the queue starts there, even one
-    /// that fits now. Without it, such jobs start ahead of it until it has been queued for 30m.
+    /// that fits now. Without it, jobs behind it start while they fit, and once it has been
+    /// queued for 30m only those that would take what it waits for wait (a GPU it could use, RAM
+    /// it lacks, or anything while it is --exclusive).
     #[arg(long)]
     pub hold_line: bool,
     /// A fact the machine must have, KEY=VALUE: gpu=nvidia, gpu_driver=amdgpu (Linux only),

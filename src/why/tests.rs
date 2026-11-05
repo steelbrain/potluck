@@ -313,22 +313,17 @@ fn order_behind_the_line() {
     );
     assert_eq!(kinds(&why), [format!("gpu:{NV}")]);
 
-    // Queued for 30 minutes, it holds the line without --hold-line.
+    // Queued for 30 minutes, it holds the line for what it waits for: long takes neither the GPU
+    // nor RAM g lacks, and starts.
     let w = world(g().at(-30));
-    let why = w.why("long");
     has(
-        &why,
-        "waits behind job g, which holds the line on msi (queued for 30m or more) and is \
-         expected to start within 1h",
-    );
-    has(
-        &why,
-        "it fits on msi now, but nothing behind job g starts there until it does",
+        &w.why("long"),
+        "can start now on msi; the scheduler takes it on its next pass",
     );
     has(
         &w.why("g"),
-        "holds the line on msi (queued for 30m or more): nothing behind it starts there until it \
-         does",
+        "holds the line on msi (queued for 30m or more): no job behind it that would take what it \
+         waits for starts there until it does",
     );
 
     // A job held behind it that doesn't fit now says what it lacks, and not that it fits.
@@ -346,6 +341,56 @@ fn order_behind_the_line() {
     );
     gone(&why, "it fits");
     assert_eq!(kinds(&why), ["ram", "order"]);
+}
+
+/// Behind a job queued for 30 minutes, a job that would take what it waits for waits, and says
+/// what: the GPU, the RAM, or the machine it waits to have to itself.
+#[test]
+fn kept_back_by_a_job_queued_for_30_minutes() {
+    let mut w = World::new(vec![Machine::new("ms01", 64, vec![nv(), amd()])]);
+    w.runs(0, "r", 4, &[NV], false, -30, 90, 0);
+    // Two GPUs, and only the AMD one free.
+    w.queue(job("g").gpu("any").gpu("any").at(-30));
+    w.queue(job("on-amd").gpu("amd").at(-5));
+    w.queue(job("cpu").ram(1).at(-4));
+    let why = w.why("on-amd");
+    has(
+        &why,
+        "waits behind job g on ms01, which has been queued for 30m or more and waits for the GPU \
+         this job would take (gpu xtx)",
+    );
+    assert_eq!(kinds(&why), ["order"]);
+    assert_eq!(why.blockers[0].holder.as_deref(), Some("g"));
+    assert_eq!(why.blockers[0].free_by, Some(m(60)));
+    has(
+        &w.why("cpu"),
+        "can start now on ms01; the scheduler takes it on its next pass",
+    );
+
+    let mut w = World::new(vec![Machine::new("msi", 32, vec![nv()])]);
+    w.runs(0, "x", 24, &[], false, -10, 40, 0);
+    w.queue(job("big").ram(16).at(-30));
+    w.queue(job("s").gpu("nvidia").at(-4));
+    has(
+        &w.why("s"),
+        "waits behind job big on msi, which has been queued for 30m or more and waits for the RAM \
+         this job would take",
+    );
+
+    let mut w = World::new(vec![Machine::new("ms01", 64, vec![nv(), amd()])]);
+    w.runs(0, "r", 4, &[], false, -10, 40, 0);
+    w.queue(job("e").excl().at(-30));
+    w.queue(job("short").ram(1).mins(5).at(-4));
+    has(
+        &w.why("short"),
+        "waits behind job e on ms01, which has been queued for 30m or more and waits for ms01 to \
+         empty (exclusive)",
+    );
+    has(
+        &w.why("e"),
+        "holds the line on ms01 (queued for 30m or more): no job behind it that would take what it \
+         waits for starts there until it does",
+    );
 }
 
 /// A job holding the line that isn't the first in line: a job ahead of it waits too, and jobs

@@ -243,14 +243,19 @@ jobs want the same free RAM or GPU, the first in that order gets it. A job that 
 free on a machine starts there even while a job ahead of it waits on that machine: a small job
 starts while a `--gpu` job waits for its GPU, or an `--exclusive` job for the machine to empty.
 
-A job holds the line when it was dispatched with `--hold-line` (a recipe's `hold_line = true`), or
-once it has been queued for 30 minutes. While a job that holds the line waits on a machine, no job
-behind it starts there, even one that would fit now (`why` says "waits behind job JOB, which holds
-the line on NODE (dispatched with --hold-line)", or "(queued for 30m or more)"). Only jobs of a
-higher priority start ahead of it, so an `--exclusive --hold-line` job waits only for the jobs
-already running to end, and a plain `--exclusive` job for at most 30 minutes of jobs starting ahead
-of it, then for the jobs running then to end. A job queued again after its machine was lost counts
-the 30 minutes from its submit time.
+A job dispatched with `--hold-line` (a recipe's `hold_line = true`) holds the line: while it waits
+on a machine, no job behind it starts there, even one that would fit now (`why` says "waits behind
+job JOB, which holds the line on NODE (dispatched with --hold-line)"). Only jobs of a higher
+priority start ahead of it, so an `--exclusive --hold-line` job waits only for the jobs already
+running to end.
+
+A job that has been queued for 30 minutes holds the line too, against the jobs behind it that would
+take what it waits for: a GPU it could use, RAM while it lacks RAM, or anything while it is
+`--exclusive` and waits for the machine to empty. Other jobs behind it go on starting. `why` of a
+job kept back says so: "waits behind job JOB on NODE, which has been queued for 30m or more and
+waits for the GPU this job would take (gpu 5080)". So a plain `--exclusive` job waits for at most
+30 minutes of jobs starting ahead of it, then for the jobs running then to end. A job queued again
+after its machine was lost counts the 30 minutes from its submit time.
 
 Each time a job is passed over, its priority rises by one, up to 4, so priority-5 jobs still go
 first. A job is passed over when a job behind it starts on a machine where it waits, or when a job

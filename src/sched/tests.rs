@@ -348,26 +348,51 @@ struct Case {
 
 /// Cases in which no job holds the line.
 fn check(cases: Vec<Case>) {
-    check_lines(cases.into_iter().map(|c| (c, None)).collect());
+    check_lines(
+        cases
+            .into_iter()
+            .map(|case| Lines {
+                case,
+                lines: vec![],
+                held: vec![],
+            })
+            .collect(),
+    );
 }
 
-/// The job holding the line, when its reservation is, and why it holds the line.
-type Held<'a> = Option<(&'a str, Millis, HoldsLine)>;
+/// A case, with the jobs that must hold the line (their reservations, and why) and the jobs that
+/// must be kept back by one queued for 30 minutes (by whom, and what they would take).
+struct Lines {
+    case: Case,
+    lines: Vec<(&'static str, Millis, HoldsLine)>,
+    held: Vec<(&'static str, &'static str, Takes)>,
+}
 
-/// Cases, each with the job that must hold the line.
-fn check_lines(cases: Vec<(Case, Held)>) {
-    for (c, line) in cases {
+fn check_lines(cases: Vec<Lines>) {
+    for Lines {
+        case: c,
+        lines,
+        held,
+    } in cases
+    {
         let p = plan(NOW, &c.machine.view(), &c.queue);
         let start: Vec<&str> = p.start.iter().map(|(j, _)| j.as_str()).collect();
         assert_eq!(start, c.start, "{}: start", c.name);
         assert_eq!(p.passed, c.passed, "{}: passed", c.name);
         let reserved = p.reservation.as_ref().map(|r| (r.job.as_str(), r.at));
         assert_eq!(reserved, c.reserved, "{}: reservation", c.name);
-        let held = p
-            .line
-            .as_ref()
-            .map(|l| (l.reservation.job.as_str(), l.reservation.at, l.why));
-        assert_eq!(held, line, "{}: line", c.name);
+        let got: Vec<(&str, Millis, HoldsLine)> = p
+            .lines
+            .iter()
+            .map(|l| (l.reservation.job.as_str(), l.reservation.at, l.why))
+            .collect();
+        assert_eq!(got, lines, "{}: lines", c.name);
+        let got: Vec<(&str, &str, Takes)> = p
+            .held
+            .iter()
+            .map(|h| (h.job.as_str(), h.by.as_str(), h.takes.clone()))
+            .collect();
+        assert_eq!(got, held, "{}: held", c.name);
     }
 }
 
@@ -925,8 +950,8 @@ fn filling() {
 fn holding_the_line() {
     use HoldsLine::{Asked, Waited};
     check_lines(vec![
-        (
-            Case {
+        Lines {
+            case: Case {
                 name: "--hold-line: a job that fits waits behind it",
                 machine: with(
                     Machine::new("msi", 32, vec![nv()]),
@@ -940,10 +965,11 @@ fn holding_the_line() {
                 passed: &[],
                 reserved: Some(("g", m(60))),
             },
-            Some(("g", m(60), Asked)),
-        ),
-        (
-            Case {
+            lines: vec![("g", m(60), Asked)],
+            held: vec![],
+        },
+        Lines {
+            case: Case {
                 name: "--hold-line: one on another GPU waits too",
                 machine: with(
                     Machine::new("ms01", 64, vec![nv(), amd()]),
@@ -957,10 +983,11 @@ fn holding_the_line() {
                 passed: &[],
                 reserved: Some(("g", m(60))),
             },
-            Some(("g", m(60), Asked)),
-        ),
-        (
-            Case {
+            lines: vec![("g", m(60), Asked)],
+            held: vec![],
+        },
+        Lines {
+            case: Case {
                 name: "--hold-line: an exclusive job waits only for what already runs",
                 machine: with(
                     Machine::new("ms01", 64, vec![nv(), amd()]),
@@ -975,28 +1002,88 @@ fn holding_the_line() {
                 passed: &[],
                 reserved: Some(("e", m(40))),
             },
-            Some(("e", m(40), Asked)),
-        ),
-        (
-            Case {
-                name: "queued for 30 minutes: a job holds the line without --hold-line",
+            lines: vec![("e", m(40), Asked)],
+            held: vec![],
+        },
+        Lines {
+            case: Case {
+                name: "queued for 30m, waiting on the GPU: a job taking no GPU starts",
                 machine: with(
                     Machine::new("msi", 32, vec![nv()]),
                     vec![run("r", 8, &[NV], 60)],
                 ),
                 queue: vec![
                     job("g").gpu("nvidia").ram(16).at(-30),
-                    job("short").ram(16).mins(5),
+                    job("cpu").ram(4).mins(5),
+                ],
+                start: &["cpu"],
+                passed: &["g"],
+                reserved: Some(("g", m(60))),
+            },
+            lines: vec![("g", m(60), Waited)],
+            held: vec![],
+        },
+        Lines {
+            case: Case {
+                name: "queued for 30m: a job that would take a GPU it matches waits; one that \
+                       takes none starts",
+                machine: with(
+                    Machine::new("ms01", 64, vec![nv(), amd()]),
+                    vec![run("r", 4, &[NV], 60)],
+                ),
+                queue: vec![
+                    // Two GPUs, and only the AMD one free.
+                    job("g").gpu("any").gpu("any").at(-30),
+                    job("amd").gpu("amd").mins(5),
+                    job("cpu").ram(1).mins(5).at(1),
+                ],
+                start: &["cpu"],
+                passed: &["g", "amd"],
+                reserved: Some(("g", m(60))),
+            },
+            lines: vec![("g", m(60), Waited)],
+            held: vec![("amd", "g", Takes::Gpu(AMD.into()))],
+        },
+        Lines {
+            case: Case {
+                name: "queued for 30m and lacking RAM: a job that would take RAM waits",
+                machine: with(
+                    Machine::new("msi", 32, vec![nv()]),
+                    vec![run("x", 24, &[], 30)],
+                ),
+                queue: vec![job("w").ram(16).at(-30), job("s").ram(4).gpu("nvidia")],
+                start: &[],
+                passed: &[],
+                reserved: Some(("w", m(30))),
+            },
+            lines: vec![("w", m(30), Waited)],
+            held: vec![("s", "w", Takes::Ram)],
+        },
+        Lines {
+            case: Case {
+                name: "queued for 30m and exclusive: no job starts behind it",
+                machine: with(
+                    Machine::new("ms01", 64, vec![nv(), amd()]),
+                    vec![run("r", 4, &[], 40)],
+                ),
+                queue: vec![
+                    job("e").excl().at(-30),
+                    job("short").ram(1).mins(5).at(1),
+                    job("gpu-short").gpu("amd").mins(5).at(2),
                 ],
                 start: &[],
                 passed: &[],
-                reserved: Some(("g", m(60))),
+                reserved: Some(("e", m(40))),
             },
-            Some(("g", m(60), Waited)),
-        ),
-        (
-            Case {
-                name: "queued for 29 minutes: not yet",
+            lines: vec![("e", m(40), Waited)],
+            held: vec![
+                ("short", "e", Takes::Machine),
+                ("gpu-short", "e", Takes::Machine),
+            ],
+        },
+        Lines {
+            case: Case {
+                name: "queued for 29m: not yet",
                 machine: with(
                     Machine::new("msi", 32, vec![nv()]),
                     vec![run("r", 8, &[NV], 60)],
@@ -1009,21 +1096,26 @@ fn holding_the_line() {
                 passed: &["g"],
                 reserved: Some(("g", m(60))),
             },
-            None,
-        ),
-        (
-            Case {
-                name: "both: --hold-line is the reason given",
-                machine: with(Machine::new("msi", 32, vec![]), vec![run("x", 24, &[], 30)]),
-                queue: vec![job("w").ram(16).at(-45).hold_line(), job("s").ram(4)],
+            lines: vec![],
+            held: vec![],
+        },
+        Lines {
+            case: Case {
+                name: "both: --hold-line holds the line on everything",
+                machine: with(
+                    Machine::new("msi", 32, vec![nv()]),
+                    vec![run("x", 4, &[NV], 30)],
+                ),
+                queue: vec![job("w").gpu("nvidia").at(-45).hold_line(), job("s").ram(4)],
                 start: &[],
                 passed: &[],
                 reserved: Some(("w", m(30))),
             },
-            Some(("w", m(30), Asked)),
-        ),
-        (
-            Case {
+            lines: vec![("w", m(30), Asked)],
+            held: vec![],
+        },
+        Lines {
+            case: Case {
                 name: "a job ahead of it in order starts, taking nothing it waits for",
                 machine: with(
                     Machine::new("msi", 32, vec![nv()]),
@@ -1038,10 +1130,11 @@ fn holding_the_line() {
                 passed: &[],
                 reserved: Some(("g", m(60))),
             },
-            Some(("g", m(60), Asked)),
-        ),
-        (
-            Case {
+            lines: vec![("g", m(60), Asked)],
+            held: vec![],
+        },
+        Lines {
+            case: Case {
                 name: "a waiting job ahead of the holder holds nothing: jobs between them fill in",
                 machine: with(
                     Machine::new("msi", 32, vec![nv()]),
@@ -1058,10 +1151,11 @@ fn holding_the_line() {
                 passed: &["a", "h"],
                 reserved: Some(("a", m(60))),
             },
-            Some(("h", m(60), Asked)),
-        ),
-        (
-            Case {
+            lines: vec![("h", m(60), Asked)],
+            held: vec![],
+        },
+        Lines {
+            case: Case {
                 name: "a holder that can start starts, and so do the jobs behind it",
                 machine: Machine::new("msi", 32, vec![]),
                 queue: vec![job("h").ram(8).at(-40).hold_line(), job("s").ram(8)],
@@ -1069,25 +1163,48 @@ fn holding_the_line() {
                 passed: &[],
                 reserved: None,
             },
-            None,
-        ),
-        (
-            Case {
-                name: "the first holder that can't start holds the line, not one after it",
-                machine: with(Machine::new("msi", 32, vec![]), vec![run("x", 24, &[], 30)]),
+            lines: vec![],
+            held: vec![],
+        },
+        Lines {
+            case: Case {
+                name: "a job queued for 30m keeps back a --hold-line job, which then holds the \
+                       line on everything",
+                machine: with(Machine::new("msi", 32, vec![]), vec![run("x", 20, &[], 30)]),
                 queue: vec![
                     job("w").ram(16).at(-40),
-                    job("w2").ram(12).at(-35).hold_line(),
-                    job("s").ram(4),
+                    job("w2").ram(8).at(-35).hold_line(),
+                    job("s").ram(1),
                 ],
                 start: &[],
                 passed: &[],
                 reserved: Some(("w", m(30))),
             },
-            Some(("w", m(30), Waited)),
-        ),
-        (
-            Case {
+            // w2 fits in the 12 GiB free, but would take RAM w lacks.
+            lines: vec![("w", m(30), Waited), ("w2", NOW, Asked)],
+            held: vec![("w2", "w", Takes::Ram)],
+        },
+        Lines {
+            case: Case {
+                name: "two jobs queued for 30m: each keeps back what would take what it waits for",
+                machine: with(
+                    Machine::new("ms01", 64, vec![nv(), amd()]),
+                    vec![run("r", 4, &[NV, AMD], 60)],
+                ),
+                queue: vec![
+                    job("g-nv").gpu("nvidia").at(-40),
+                    job("g-amd").gpu("amd").at(-35),
+                    job("cpu").ram(1),
+                ],
+                start: &["cpu"],
+                passed: &["g-nv", "g-amd"],
+                reserved: Some(("g-nv", m(60))),
+            },
+            lines: vec![("g-nv", m(60), Waited), ("g-amd", m(60), Waited)],
+            held: vec![],
+        },
+        Lines {
+            case: Case {
                 name: "waiting for its own busy workspace, a job holds nothing, however long queued",
                 machine: with(Machine::new("msi", 32, vec![]), vec![run("r", 4, &[], 30)]),
                 queue: vec![
@@ -1098,10 +1215,11 @@ fn holding_the_line() {
                 passed: &[],
                 reserved: None,
             },
-            None,
-        ),
-        (
-            Case {
+            lines: vec![],
+            held: vec![],
+        },
+        Lines {
+            case: Case {
                 name: "a job this machine can never run holds nothing here",
                 machine: Machine::new("msi", 32, vec![nv()]),
                 queue: vec![job("amd").gpu("amd").at(-40).hold_line(), job("s").ram(4)],
@@ -1109,8 +1227,9 @@ fn holding_the_line() {
                 passed: &[],
                 reserved: None,
             },
-            None,
-        ),
+            lines: vec![],
+            held: vec![],
+        },
     ]);
 }
 

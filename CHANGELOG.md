@@ -46,11 +46,13 @@
   there. Each job that starts behind a waiting one passes it over, and the waiting job's priority
   rises by one, up to 4. See [Order](docs/jobs.md#order).
 - `dispatch --hold-line`, and a recipe's `hold_line = true`, keep the 0.1.1 rule for one job: while
-  it waits on a machine, no job behind it starts there. A job queued for 30 minutes holds the line
-  the same way without it, so a plain `--exclusive` job waits for at most 30 minutes of jobs
-  starting ahead of it, then for the jobs running then to end. `potluck why` of a job waiting
-  behind it names the job holding the line and why: "waits behind job studio-7, which holds the
-  line on studio (dispatched with --hold-line)".
+  it waits on a machine, no job behind it starts there. Without it, a job queued for 30 minutes
+  keeps back the jobs behind it that would take what it waits for (a GPU it could use, RAM it
+  lacks, or anything while it is `--exclusive`), so a plain `--exclusive` job waits for at most 30
+  minutes of jobs starting ahead of it, then for the jobs running then to end. `potluck why` of a
+  job kept back names the job holding the line and why: "waits behind job studio-7, which holds
+  the line on studio (dispatched with --hold-line)", or "waits behind job studio-7 on studio, which
+  has been queued for 30m or more and waits for the RAM this job would take".
 
 ### Fixed
 
