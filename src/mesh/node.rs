@@ -165,6 +165,8 @@ struct PeerState {
     mismatch: Option<String>,
     /// Since when it has answered on another version.
     mismatch_since: Option<Instant>,
+    /// Why the last heartbeat to it failed, until one gets through: said when it goes down.
+    last_error: Option<String>,
 }
 
 impl PeerState {
@@ -177,6 +179,7 @@ impl PeerState {
             version: None,
             mismatch: None,
             mismatch_since: None,
+            last_error: None,
         }
     }
 }
@@ -1252,6 +1255,8 @@ impl Inner {
                     version: s.version,
                     mismatch: s.mismatch,
                     mismatch_since: s.mismatch_ago_ms.map(at),
+                    // Not handed over: the next heartbeat says it again.
+                    last_error: None,
                 },
             );
         }
@@ -2111,7 +2116,11 @@ impl Inner {
             let sock = match listener.accept() {
                 Ok((sock, _)) => sock,
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
-                Err(_) => {
+                // Reset before it was taken: nothing to say.
+                Err(e) if e.kind() == io::ErrorKind::ConnectionAborted => continue,
+                Err(e) => {
+                    // Out of file descriptors, say: rate-limited like refused connections.
+                    self.refused_event("an unknown address".into(), format!("accept failed: {e}"));
                     thread::sleep(Duration::from_millis(50));
                     continue;
                 }
@@ -2405,7 +2414,12 @@ impl Inner {
         let ping = Frame::Ping {
             digest: digest.to_string(),
         };
-        let Ok(Reply::Pong { digest: theirs }) = self.request(t, &ping, timeout) else {
+        let pong = self.request(t, &ping, timeout);
+        // Members only: a former member pinged has no state to keep, nor gets one.
+        if let Some(p) = lock(&self.peers).get_mut(&t.key) {
+            p.last_error = pong.as_ref().err().map(|e| e.to_string());
+        }
+        let Ok(Reply::Pong { digest: theirs }) = pong else {
             return;
         };
         let mine = lock(&self.trust).digest();
@@ -2437,12 +2451,12 @@ impl Inner {
                 let since = p.last_seen.unwrap_or(p.known_since);
                 if now.duration_since(since) >= self.cfg.down_after && p.up != Some(false) {
                     p.up = Some(false);
-                    down.push(t.name.clone());
+                    down.push((t.name.clone(), p.last_error.clone()));
                 }
             }
         }
-        for node in down {
-            self.emit(Event::Down { node });
+        for (node, why) in down {
+            self.emit(Event::Down { node, why });
         }
     }
 }

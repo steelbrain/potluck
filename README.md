@@ -39,7 +39,9 @@ mirror of each repository on every machine. The rest belongs to the projects tha
   on Linux.
 - `git` 2.31 or newer.
 - In a cluster: one TCP port per machine that the other members can reach (7465 by default), and
-  the same potluck version on every member.
+  the same potluck version on every member. On a Mac with the application firewall on, that means
+  an allow rule for the potluck binary, added again for each new binary
+  ([docs/install.md](docs/install.md#requirements) has the commands).
 
 The daemon refuses to start on a machine that lacks one of the first three.
 [docs/install.md](docs/install.md#requirements) says what each is for.

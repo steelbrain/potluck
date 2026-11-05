@@ -1072,12 +1072,17 @@ fn on_event(sh: &Arc<Shared>, c: &Arc<Cluster>, ev: Event) {
             drop(cs);
             c.wake();
         }
-        Event::Down { node } => {
+        Event::Down { node, why } => {
             {
                 let mut cs = c.cs();
                 cs.up.remove(&node);
                 if cs.lost.insert(node.clone()) {
-                    sh.log.log(format!("cluster: {node} is down"));
+                    match why {
+                        Some(why) => sh
+                            .log
+                            .log(format!("cluster: {node} is down; last try: {why}")),
+                        None => sh.log.log(format!("cluster: {node} is down")),
+                    }
                 }
             }
             owner::runner_lost(sh, c, &node, "was lost");

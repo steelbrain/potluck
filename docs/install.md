@@ -21,6 +21,21 @@
   when there is none.
 - In a cluster: one TCP port per machine that the other members can reach (7465 by default), and
   the same potluck version on every member.
+- In a cluster, on a Mac with the application firewall on
+  (`/usr/libexec/ApplicationFirewall/socketfilterfw --getglobalstate` says `enabled`): an allow
+  rule for the potluck binary. potluck's binaries are ad-hoc signed, so the firewall's automatic
+  allowing of signed software doesn't cover them. Without the rule, members' connections to the
+  Mac's port open but the daemon never receives them, and the members list the Mac as down.
+  `socketfilterfw --getappblocked` may still say the binary is permitted. Add the rule with:
+
+  ```sh
+  sudo /usr/libexec/ApplicationFirewall/socketfilterfw --add ~/.local/bin/potluck
+  sudo /usr/libexec/ApplicationFirewall/socketfilterfw --unblockapp ~/.local/bin/potluck
+  ```
+
+  The firewall knows an ad-hoc-signed binary by its code hash (`codesign -d -r- ~/.local/bin/potluck`
+  prints `designated => cdhash H"..."`), and every new binary has a new one: run both commands
+  again after install.sh, `potluck self-update` or a rebuild replaces the binary.
 
 ## install.sh
 

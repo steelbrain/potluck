@@ -559,9 +559,11 @@ fn answers_on_another_version_past_the_updating_time_are_silence() {
     );
     // Updating: b counts as heard from.
     assert!(a.member("b").unwrap().alive);
-    wait_event(&a, "b down once the updating time is over", |e| {
-        *e == Event::Down { node: "b".into() }
-    });
+    wait_event(
+        &a,
+        "b down once the updating time is over",
+        |e| matches!(e, Event::Down { node, .. } if node == "b"),
+    );
     // b still answers every heartbeat, on its version: a has heard from no member it can compare
     // records with for the down time.
     thread::sleep(HEARTBEAT * 3);
@@ -635,8 +637,21 @@ fn heartbeats_tell_down_and_up() {
     });
     let dir = b.dir.clone();
     drop(b);
-    wait_event(&a, "b down", |e| *e == Event::Down { node: "b".into() });
+    let down = wait_event(
+        &a,
+        "b down",
+        |e| matches!(e, Event::Down { node, .. } if node == "b"),
+    );
     assert!(t.elapsed() >= DOWN_AFTER, "{:?}", t.elapsed());
+    // It says how the last heartbeat failed: b's port refuses connections now, or a ping in
+    // flight as b stopped broke or ran out of time.
+    let Event::Down { why: Some(why), .. } = &down else {
+        panic!("no reason: {down:?}")
+    };
+    assert!(
+        why.starts_with("can't reach b: ") || why == "b did not answer in time",
+        "{why}"
+    );
     wait_until("a sees b down", || !a.member("b").unwrap().alive);
 
     let b = start_version("b", &dir, "0.1.0");

@@ -183,8 +183,10 @@ pub struct Seen {
 pub enum Event {
     /// A member was heard from, after being down or not heard from since start.
     Up { node: NodeName },
-    /// A member has been silent for the down time (or never answered since start).
-    Down { node: NodeName },
+    /// A member has been silent for the down time (or never answered since start). `why`: how
+    /// the last heartbeat to it failed (`can't reach b: 192.168.1.9:7465: No route to host (os
+    /// error 65)`), if one did.
+    Down { node: NodeName, why: Option<String> },
     /// A machine was admitted to the cluster.
     Joined { node: NodeName, by: NodeName },
     /// A machine left the cluster: removed by `by`, or (`by` None) dropped: the member that
