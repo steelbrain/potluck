@@ -1713,24 +1713,29 @@ fn a_machine_whose_removal_turns_out_void_takes_work_again() {
 /// out void) doesn't keep c from listening again: c's listener stopped listening when c was
 /// removed, whoever held a copy. It listened on in the child, and c, back in, couldn't listen
 /// ("Address already in use") until the child let go. Linux only: macOS can't stop a listener
-/// another process holds a copy of, and a stopping mesh waits there a moment for it instead.
+/// another process holds a copy of, and a stopping mesh waits there a moment for it instead. As
+/// in [`a_machine_whose_removal_turns_out_void_takes_work_again`], in a cluster paired before
+/// users, where b removes c as members on 0.1.1 did.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_member_back_in_listens_again_while_a_child_holds_its_old_listener() {
     let w = World::new();
-    let mut a = w.node("a").start();
-    let b = w.node("b").start();
-    let c = w.node("c").start();
-    pair(&a, &b);
-    pair(&a, &c);
+    let mut a = w.node("a").no_user_key().start();
+    let mut b = w.node("b").no_user_key().start();
+    let c = w.node("c").no_user_key().start();
+    pair_unsigned(&mut a, &b);
+    pair_unsigned(&mut a, &c);
     wait_until("b and c see each other", || {
         b.node_alive("c") && c.node_alive("b")
     });
     let held = ChildHolding::listener(c.port);
     a.stop();
-    b.cli_ok(&["remove", "c"]);
+    let as_b = b.impostor(Arc::new(Scripted::default()));
+    as_b.remove("c").unwrap();
     wait_until("c knows b removed it", || says_out(&c));
     wait_until("c stopped listening", || c.listening().is_none());
+    as_b.stop();
+    b.start();
     {
         use potluck::mesh::{Record, Removal, identity::Identity, trust::Trust};
         let keys = a.paths.keys_dir();
@@ -5676,11 +5681,17 @@ fn a_wait_while_the_owner_is_away_takes_no_third_members_word() {
     });
     let j = a.dispatch(&["--on", "node=a", "--", "false"]);
     assert_eq!(a.done(&j).state, JobState::Failed);
+    // Neither running nor queued: a report of a's from before the job started lists it queued,
+    // and `wait` would take that one's word.
     wait_until("b has a's report without the job", || {
-        b.cli_ok(&["status"])["running"]
-            .as_array()
-            .unwrap()
-            .is_empty()
+        let s = b.cli_ok(&["status"]);
+        ["running", "queued"].iter().all(|k| {
+            !s[k]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["id"] == j.as_str())
+        })
     });
     let mut report = report_to(&b, "c");
     let mut rec = a.get(&j);
