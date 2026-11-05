@@ -61,12 +61,13 @@ pub struct ServiceDone {
     pub warning: Option<String>,
 }
 
-/// On macOS, why the daemon run from `exe` can't reach members: `exe` has no valid code
-/// signature. Local Network privacy asks the user about a signed LaunchAgent's first connection
-/// to a machine on the local network, but blocks an unsigned one's without asking, and System
-/// Settings lists nothing to allow. Apple's linker signs arm64 binaries (ad hoc), not x86_64 ones,
-/// so a potluck built for an Intel Mac has none until `codesign` gives it one. None when it has
-/// one, off macOS, or when `codesign` can't run.
+/// On macOS, why the daemon run from `exe` can't reach members: `exe` has no code signature
+/// (one that no longer matches the binary isn't caught: `codesign -d` doesn't check it). Local
+/// Network privacy asks the user about a signed LaunchAgent's first connection to a machine on
+/// the local network, but blocks an unsigned one's without asking, and System Settings lists
+/// nothing to allow. Apple's linker signs arm64 binaries (ad hoc), not x86_64 ones, so a potluck
+/// built for an Intel Mac has none until `codesign` gives it one. None when it has one, off
+/// macOS, or when `codesign` can't run.
 pub fn signature_problem(exe: &Path) -> Option<String> {
     if !cfg!(target_os = "macos") {
         return None;
