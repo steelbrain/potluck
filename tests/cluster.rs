@@ -716,6 +716,7 @@ impl Node {
             usage_report_ms: 300,
             linger_ms: 1_000,
             keep_give_up_ms: self.keep_give_up_ms,
+            run_limit_grace_ms: 600_000,
             tunnel: Arc::new(FakeTunnel),
             updater: self.updater.clone(),
         };

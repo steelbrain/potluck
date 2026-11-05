@@ -8,8 +8,8 @@ use crate::daemon::state::State;
 use crate::daemon::{Shared, files, runner};
 use crate::proto::{Response, ServerResponse, read_msg};
 use crate::types::{
-    EXIT_CANCELLED, EXIT_LOST, JobId, JobRecord, JobState, Lease, Millis, NodeName, RepoRef,
-    WorkspaceId,
+    EXIT_CANCELLED, EXIT_LOST, EXIT_TIMEOUT, JobId, JobRecord, JobState, Lease, Millis, NodeName,
+    RepoRef, WorkspaceId,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -134,7 +134,13 @@ pub(super) fn claim(
         j.state = JobState::Starting;
         j.node = Some(from.to_string());
         j.workspace = Some(workspace.clone());
-        j.lease = Some(lease);
+        // Its run limit as this machine counts it ([`tick`]), not as the runner's lease says.
+        let granted_at = now();
+        j.lease = Some(Lease {
+            granted_at,
+            deadline: granted_at.saturating_add(j.spec.timeout_ms),
+            ..lease
+        });
         j.handle = None;
         j.started_at = None;
         // "requeued: ..." was about the run before; the log keeps it.
@@ -142,7 +148,12 @@ pub(super) fn claim(
         let rec = j.clone();
         st.save_job(id);
         st.refresh_pending();
-        c.cs().granted_at.insert(id.to_string(), c.boot());
+        let boot = c.boot();
+        let mut cs = c.cs();
+        cs.granted_at.insert(id.to_string(), boot);
+        cs.run_limits
+            .insert(id.to_string(), boot.saturating_add(rec.spec.timeout_ms));
+        drop(cs);
         (rec, reported())
     };
     sh.log.log(format!("{id}: claimed by {from}"));
@@ -238,8 +249,15 @@ pub(super) fn update(
         if rec.workspace.is_some() {
             j.workspace = rec.workspace.clone();
         }
-        if let (Some(l), Some(rl)) = (j.lease.as_mut(), rec.lease.as_ref()) {
-            l.deadline = rl.deadline;
+        // The run limit counts from the start, as for a job run here (seeding its workspace
+        // doesn't count): from when the runner said it started, on this machine's clocks. The
+        // deadline the runner's record says is its own.
+        let started = before == JobState::Starting && rec.state == JobState::Running;
+        if started && let Some(l) = j.lease.as_mut() {
+            l.deadline = now().saturating_add(j.spec.timeout_ms);
+            c.cs()
+                .run_limits
+                .insert(id.clone(), c.boot().saturating_add(j.spec.timeout_ms));
         }
         j.usage = rec.usage.clone();
         j.stalled = rec.stalled;
@@ -693,6 +711,7 @@ pub(super) fn tick(sh: &Arc<Shared>, c: &Arc<Cluster>, now: Millis, boot: u64) {
         // ends (however it ends).
         let active = |id: &JobId| st.jobs.get(id).is_some_and(|j| !j.state.is_done());
         cs.granted_at.retain(|id, _| active(id));
+        cs.run_limits.retain(|id, _| active(id));
         // A reconcile sent before a job's end arrived is answered within its call's time.
         cs.delivered
             .retain(|_, (_, at)| boot.saturating_sub(*at) < DELIVERED_MS);
@@ -736,6 +755,56 @@ pub(super) fn tick(sh: &Arc<Shared>, c: &Arc<Cluster>, now: Millis, boot: u64) {
                 ));
             }
         }
+        // Jobs running elsewhere whose runner hasn't ended them by their run limit, as this
+        // machine counts it, and the grace after it, end as timed out: the runner's word doesn't
+        // keep a job going. The grace counts only while this machine is awake and the runner up
+        // (its end, delivered, waits for both: this machine asleep, or the runner unreachable,
+        // uses none of it). The runner learns that it is no longer its job at its next update or
+        // reconcile, and stops it. One that ended there and waits for its kept files is over.
+        let grace = c.opts.run_limit_grace_ms;
+        let awake = c.clock.awake_ms();
+        let mut over = Vec::new();
+        let mut overdue = BTreeMap::new();
+        for j in st.jobs.values() {
+            if owner_of(&j.id) != me
+                || !matches!(j.state, JobState::Starting | JobState::Running)
+                || cs.endings.contains_key(&j.id)
+            {
+                continue;
+            }
+            let (Some(runner), Some(l)) = (j.node.as_deref().filter(|n| *n != me), &j.lease) else {
+                continue;
+            };
+            // After a restart: what is left of the lease's deadline, counted from now.
+            let limit = *cs
+                .run_limits
+                .entry(j.id.clone())
+                .or_insert_with(|| boot.saturating_add(l.deadline.saturating_sub(now)));
+            if boot < limit {
+                continue;
+            }
+            let (mut used, at) = cs.overdue.get(&j.id).copied().unwrap_or((0, awake));
+            if c.alive(runner) {
+                used = used.saturating_add(awake.saturating_sub(at));
+            }
+            overdue.insert(j.id.clone(), (used, awake));
+            if used < grace {
+                continue;
+            }
+            let (what, from) = match j.state {
+                JobState::Starting => ("started", "its claim"),
+                _ => ("ended", "its start"),
+            };
+            over.push((
+                j.id.clone(),
+                format!(
+                    "{runner} had not {what} it {} past its run limit ({}), counted on {me} from {from}",
+                    crate::types::fmt_ms(grace),
+                    crate::types::fmt_ms(j.spec.timeout_ms)
+                ),
+            ));
+        }
+        cs.overdue = overdue;
         // Queued jobs (not pinned) that no machine up can run, and whose every capable machine is
         // lost, end: they would wait for machines that may never come back.
         let machines = capable::machines(st, Some((c, &*cs)));
@@ -753,6 +822,11 @@ pub(super) fn tick(sh: &Arc<Shared>, c: &Arc<Cluster>, now: Millis, boot: u64) {
                 false => (JobState::Failed, None),
             };
             if let Some(r) = end(st, &id, state, code, why) {
+                unpins.push((r, id));
+            }
+        }
+        for (id, why) in over {
+            if let Some(r) = end(st, &id, JobState::TimedOut, Some(EXIT_TIMEOUT), why) {
                 unpins.push((r, id));
             }
         }

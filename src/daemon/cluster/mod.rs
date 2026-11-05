@@ -138,6 +138,11 @@ pub struct ClusterOptions {
     /// Kept files that can't be delivered for this long are given up on: the owner ends the job
     /// without them, with a note saying so; the runner keeps them.
     pub keep_give_up_ms: u64,
+    /// A job of this machine's that another machine runs and hasn't ended this long after its run
+    /// limit, as this machine counts it, ends here as timed out: the runner's own end at the limit,
+    /// with the job's output and kept files, arrives in this time. It counts while this machine is
+    /// awake and the runner up.
+    pub run_limit_grace_ms: u64,
     pub tunnel: Arc<dyn Tunnel>,
     pub updater: Updater,
 }
@@ -154,6 +159,7 @@ impl ClusterOptions {
             usage_report_ms: 3_000,
             linger_ms: 30_000,
             keep_give_up_ms: 600_000,
+            run_limit_grace_ms: 600_000,
             tunnel: Arc::new(GitTunnel),
             updater: real_updater(),
         }
@@ -235,6 +241,13 @@ pub(crate) struct CState {
     pub sources: BTreeMap<String, PathBuf>,
     /// When each job was granted to a runner (boot clock; not kept across restarts).
     pub granted_at: BTreeMap<JobId, u64>,
+    /// When each job running elsewhere reaches its run limit as this machine counts it (boot
+    /// clock): its timeout from the grant, then from when its runner said it started. After a
+    /// restart, from the lease's deadline, which this machine set the same way.
+    pub run_limits: BTreeMap<JobId, u64>,
+    /// Jobs running elsewhere past those run limits: how much of the grace each has used (this
+    /// machine awake and the runner up), and the awake clock's reading when that was counted.
+    pub overdue: BTreeMap<JobId, (u64, u64)>,
     /// Where the current run's output starts in the job's log (after a run lost earlier).
     pub log_base: BTreeMap<JobId, u64>,
     /// Cancels to forward to the jobs' runners.
@@ -1656,17 +1669,20 @@ mod tests {
         daemon_on_port_with(dir, port, Arc::new(crate::daemon::SystemClock))
     }
 
-    /// The machine's clocks, with the boot clock moved on as a test says (time passing) and the
-    /// wall clock as it is.
+    /// The machine's clocks, with the boot clock moved on as a test says, and the wall clock as it
+    /// is: time passing (`.0`, the awake clock too) or the machine asleep (`.1`, not the awake
+    /// clock).
     #[derive(Default)]
-    struct BootStep(AtomicU64);
+    struct BootStep(AtomicU64, AtomicU64);
 
     impl crate::daemon::Clock for BootStep {
         fn wall_ms(&self) -> Millis {
             crate::types::now_ms()
         }
         fn boot_ms(&self) -> u64 {
-            crate::daemon::clock::boot_ms() + self.0.load(Ordering::SeqCst)
+            crate::daemon::clock::boot_ms()
+                + self.0.load(Ordering::SeqCst)
+                + self.1.load(Ordering::SeqCst)
         }
         fn awake_ms(&self) -> u64 {
             crate::daemon::clock::awake_ms() + self.0.load(Ordering::SeqCst)
@@ -1990,6 +2006,96 @@ mod tests {
         reconcile();
         let j = sh.lock().job("lone-1").unwrap();
         assert_eq!(j.state, JobState::Queued, "{j:#?}");
+        b.stop();
+        d.stop();
+    }
+
+    /// The owner counts the run limit of a job another machine runs on its own clocks: from the
+    /// grant, then from when the runner said it started, whatever deadline the runner's lease and
+    /// records give. A job its runner hasn't ended by then, and the grace after (awake), ends here
+    /// as timed out (124), and the runner's next record of it is stale.
+    #[test]
+    fn the_owner_ends_a_job_its_runner_keeps_past_the_run_limit() {
+        use crate::types::{JobState, Lease};
+        let dir = tempfile::tempdir().unwrap();
+        let clock = Arc::new(BootStep::default());
+        let (d, b) = daemon_with_b_on(dir.path(), clock.clone());
+        let sh = d.shared.clone();
+        let c = sh.cluster().unwrap();
+        let mut queued = job_on("lone-1", JobState::Queued, "b", "t1");
+        queued.node = None;
+        queued.lease = None;
+        {
+            let mut st = sh.lock();
+            st.jobs.insert("lone-1".into(), queued);
+            st.save_job("lone-1");
+        }
+        let far = now() + 86_400_000;
+        let lease = Lease {
+            grant: Default::default(),
+            granted_at: now(),
+            deadline: far,
+            token: "t1".into(),
+        };
+        let claim = call_as_b(
+            &b,
+            &PeerRequest::Claim {
+                job: "lone-1".into(),
+                lease: Box::new(lease),
+                workspace: "b-w1".into(),
+                passed: Vec::new(),
+            },
+        );
+        assert!(matches!(claim, PeerResponse::Granted { .. }), "{claim:?}");
+        let job = || sh.lock().job("lone-1").unwrap();
+        let deadline = || job().lease.unwrap().deadline;
+        assert!(deadline() <= now() + 60_000, "{:#?}", job());
+        // b says it started, with a deadline of its own a day away.
+        let mut running = job_on("lone-1", JobState::Running, "b", "t1");
+        running.lease.as_mut().unwrap().deadline = far;
+        running.started_at = Some(now());
+        running.workspace = Some("b-w1".into());
+        let update = || {
+            call_as_b(
+                &b,
+                &PeerRequest::Update {
+                    job: Box::new(running.clone()),
+                    keep_error: None,
+                },
+            )
+        };
+        assert!(matches!(update(), PeerResponse::Update { stale: false }));
+        assert!(deadline() <= now() + 60_000, "{:#?}", job());
+        // Past its run limit, within the grace: still b's. Time this machine sleeps uses none
+        // of the grace (b's end waits for it to be awake).
+        clock.0.fetch_add(61_000, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(300));
+        clock
+            .1
+            .fetch_add(2 * c.opts.run_limit_grace_ms, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(job().state, JobState::Running);
+        clock
+            .0
+            .fetch_add(c.opts.run_limit_grace_ms, Ordering::SeqCst);
+        let start = std::time::Instant::now();
+        while !job().state.is_done() {
+            assert!(start.elapsed() < Duration::from_secs(10), "{:#?}", job());
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let j = job();
+        assert_eq!(
+            (j.state, j.exit_code, j.message.as_deref()),
+            (
+                JobState::TimedOut,
+                Some(crate::types::EXIT_TIMEOUT),
+                Some(
+                    "b had not ended it 10m past its run limit (1m), counted on lone from its start"
+                )
+            ),
+            "{j:#?}"
+        );
+        assert!(matches!(update(), PeerResponse::Update { stale: true }));
         b.stop();
         d.stop();
     }

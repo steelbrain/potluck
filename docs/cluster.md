@@ -169,6 +169,11 @@ its own exit code and a note saying so (`why` shows it), and the files stay in t
 on the machine that ran it. `cancel`, `cp`, `hold`, `release` and `env NODE` are forwarded to
 the machine concerned, and `status`, `nodes` and `why` show every member.
 
+The dispatching machine counts the run limit of a job running elsewhere on its own clocks: from
+its grant, then from when the machine running it says it started. A job that machine hasn't ended
+10 minutes past that limit ends as timed out (exit 124), and that machine stops it when it next
+reports. The 10 minutes count while the dispatching machine is awake and the other machine up.
+
 ## Lost machines
 
 Members exchange heartbeats every 3 seconds, and a member silent for 30 seconds, or removed, is
