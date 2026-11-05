@@ -19,6 +19,12 @@ A daemon still running after its binary was replaced (with `POTLUCK_NO_RESTART=1
 manager) starts each job's supervisor and git's tunnel from a copy of the binary it started from,
 `bin/potluck` in the state directory, not from the new one.
 
+On a Mac, a new binary may have to be allowed again before the daemon can reach members: Local
+Network access is asked for on the Mac's screen, and on a Mac with the application firewall on,
+the firewall rule names the old binary (see [Installing](install.md#requirements)). A member that
+updates itself does so with nobody asked, so until someone answers there, the Mac can't reach the
+members, or they can't reach it.
+
 ## Restart in place
 
 A restart in place (`potluck restart`, or the daemon after an update) runs the potluck binary at

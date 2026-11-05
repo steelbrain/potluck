@@ -128,6 +128,13 @@ jobs:
             bin=target/$target/release/potluck
             info=$(file "$bin")
             echo "$info"
+            # Apple's linker signs arm64 binaries ad hoc but not x86_64 ones, and macOS's Local
+            # Network privacy blocks an unsigned LaunchAgent's connections to members without
+            # asking: both macOS binaries are signed ad hoc, as `potluck`, before they run below.
+            if [[ $target == *-apple-darwin ]]; then
+              codesign --force --sign - --identifier potluck "$bin"
+              codesign --verify --verbose "$bin"
+            fi
             if [[ $target == *-linux-musl && $info != *"statically linked"* && $info != *"static-pie linked"* ]]; then
               echo "$bin is not statically linked" >&2
               exit 1

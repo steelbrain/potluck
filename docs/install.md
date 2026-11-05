@@ -36,18 +36,32 @@
   The firewall knows an ad-hoc-signed binary by its code hash (`codesign -d -r- ~/.local/bin/potluck`
   prints `designated => cdhash H"..."`), and every new binary has a new one: run both commands
   again after install.sh, `potluck self-update` or a rebuild replaces the binary.
-- In a cluster, on macOS: Local Network access for the daemon. The service is a LaunchAgent, and
-  macOS's Local Network privacy can block an agent's connections to machines on the local network
-  until it is allowed in System Settings > Privacy & Security > Local Network (Apple's
-  [TN3179](https://developer.apple.com/documentation/technotes/tn3179-understanding-local-network-privacy)).
-  It blocked them on macOS 26.7.1. The members still list the Mac as up, because their connections
-  to it get through, but it can't reach them: its `daemon.log` says
+- In a cluster, on macOS: a code-signed potluck binary, and Local Network access for it. The
+  service is a LaunchAgent, and macOS's Local Network privacy (Apple's
+  [TN3179](https://developer.apple.com/documentation/technotes/tn3179-understanding-local-network-privacy))
+  holds back an agent's connections to machines on the local network until the user allows them.
+  - A signed binary asks: the first time the daemon connects to a member after it starts (or
+    restarts in place), the Mac shows a prompt on its screen, and Allow lets the connections
+    through. The answer lasted across `potluck restart` and a service restart
+    (`launchctl kickstart -k`). A new binary may ask again, so after `potluck self-update` or
+    install.sh someone has to be at the Mac's screen.
+  - A binary with no signature at all is blocked without asking, and System Settings >
+    Privacy & Security > Local Network lists nothing to allow. Apple's linker signs arm64 binaries
+    ad hoc but not x86_64 ones, so a potluck built for an Intel Mac (`cargo install` on one, or
+    `--target x86_64-apple-darwin`) has none; the release binaries are signed. `codesign -d
+    PATH` says `code object is not signed at all` for one without, and `potluck service install`
+    and the daemon's log at start warn about it. To sign one, sign a copy and move it into place
+    (a binary changed in place can be killed when it next runs), then restart the daemon:
+    `cp PATH PATH.new && codesign -s - -i potluck PATH.new && mv PATH.new PATH`, then
+    `potluck restart`.
+
+  While the connections are held back, the members still list the Mac as up, because theirs to it
+  get through, but it can't reach them: its `daemon.log` says
   `cluster: NODE reaches this machine, but this machine can't reach it: can't reach NODE: ADDRESS: No route to host (os error 65)`,
   and the kernel log has lines for potluck ending in `reason: NECP`
   (`/usr/bin/log show --last 10m --predicate 'eventMessage CONTAINS "potluck"' | grep NECP`; in
   zsh a bare `log` is zsh's own builtin). A shell, local or over ssh, isn't subject to it, so `nc`
-  from one doesn't show the block. macOS tracks the permission by the binary's code signature, so
-  a new binary may need allowing again.
+  from one doesn't show the block.
 
 ## install.sh
 

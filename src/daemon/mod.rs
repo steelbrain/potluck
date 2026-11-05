@@ -690,6 +690,13 @@ impl Daemon {
                 None => String::new(),
             }
         ));
+        // On macOS, an unsigned binary (built for an Intel Mac) can't reach members at all.
+        if let Some(why) = crate::service::this_executable()
+            .ok()
+            .and_then(|exe| crate::service::signature_problem(&exe))
+        {
+            shared.log.log(format!("warning: {why}"));
+        }
         let sh = shared.clone();
         let accepting = daemon.socket.as_ref().expect("set above").try_clone()?;
         daemon.accept = Some(

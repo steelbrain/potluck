@@ -56,6 +56,38 @@ pub struct ServiceDone {
     /// Installed and started, or stopped and removed.
     pub changed: bool,
     pub message: String,
+    /// Installed, but members won't be reachable from it: [`signature_problem`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
+}
+
+/// On macOS, why the daemon run from `exe` can't reach members: `exe` has no valid code
+/// signature. Local Network privacy asks the user about a signed LaunchAgent's first connection
+/// to a machine on the local network, but blocks an unsigned one's without asking, and System
+/// Settings lists nothing to allow. Apple's linker signs arm64 binaries (ad hoc), not x86_64 ones,
+/// so a potluck built for an Intel Mac has none until `codesign` gives it one. None when it has
+/// one, off macOS, or when `codesign` can't run.
+pub fn signature_problem(exe: &Path) -> Option<String> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    // `-d`, not `-v`: it reads the signature without hashing the whole binary (10 ms, not 130,
+    // for a debug build), and fails just the same for a binary that has none.
+    let out = Command::new("/usr/bin/codesign")
+        .arg("-d")
+        .arg(exe)
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    if out.status.success() {
+        return None;
+    }
+    let why = String::from_utf8_lossy(&out.stderr);
+    let exe = exe.display();
+    Some(format!(
+        "{}; macOS's Local Network privacy blocks an unsigned daemon's connections to members without asking, so this machine can't reach them. Sign a copy and move it into place: `cp {exe} {exe}.new && codesign -s - -i potluck {exe}.new && mv {exe}.new {exe}`, then `potluck restart`",
+        why.trim()
+    ))
 }
 
 /// The running executable's canonical path (symlinks resolved): the file `self-update` replaces,
@@ -483,12 +515,21 @@ fn installed(spec: &ServiceSpec, file: &Path, changed: bool, logs: &str) -> Serv
             if spec.manage { " and started it" } else { "" }
         )
     };
+    let warning = match spec.manager {
+        Manager::Launchd => signature_problem(&spec.exe),
+        Manager::Systemd => None,
+    };
+    let message = match &warning {
+        Some(w) => format!("{message}\nwarning: {w}"),
+        None => message,
+    };
     ServiceDone {
         manager: spec.manager,
         name: spec.name.clone(),
         file: file.to_path_buf(),
         changed,
         message,
+        warning,
     }
 }
 
@@ -520,6 +561,7 @@ fn uninstall_systemd(spec: &ServiceSpec) -> anyhow::Result<ServiceDone> {
                 file.display()
             )
         },
+        warning: None,
     })
 }
 
@@ -610,11 +652,35 @@ fn uninstall_launchd(spec: &ServiceSpec) -> anyhow::Result<ServiceDone> {
                 file.display()
             )
         },
+        warning: None,
     })
 }
 
 #[cfg(test)]
 mod tests {
+    /// A copy of this test binary, signed ad hoc, then with its signature removed.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_unsigned_binary_is_told() {
+        let tmp = tempfile::tempdir().unwrap();
+        let copy = tmp.path().join("potluck");
+        std::fs::copy(std::env::current_exe().unwrap(), &copy).unwrap();
+        let codesign = |args: &[&str]| {
+            let out = Command::new("/usr/bin/codesign")
+                .args(args)
+                .arg(&copy)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{out:?}");
+        };
+        codesign(&["--force", "-s", "-", "-i", "potluck"]);
+        assert_eq!(super::signature_problem(&copy), None);
+        codesign(&["--remove-signature"]);
+        let why = super::signature_problem(&copy).unwrap();
+        assert!(why.contains("not signed at all"), "{why}");
+        assert!(why.contains("codesign -s - -i potluck"), "{why}");
+    }
+
     use super::*;
 
     fn spec(manager: Manager, dir: &Path) -> ServiceSpec {
