@@ -49,7 +49,8 @@ pub const NEEDS_USER_KEY: &str = "needs this cluster's user key";
 /// [`Request`] with its long-poll waits left out (`wait`'s `timeout_ms` as null, `logs`'
 /// `wait_ms` as 0): a daemon relaying a long poll shortens them after waiting for an owner that
 /// was away, or while it restarts, and how long a poll waits carries no authority. The request's
-/// context (the caller's repository and branch) is not signed.
+/// context (the caller's repository and branch) is not signed; a daemon relaying the request
+/// passes on only a hold's branch of it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RequestAuth {
     pub key: PublicKey,

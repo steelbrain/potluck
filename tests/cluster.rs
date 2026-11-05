@@ -6130,6 +6130,75 @@ fn after_user_init_a_relayed_request_needs_a_users_signature() {
     );
 }
 
+/// What an impostor ([`Node::impostor`]) was sent on each `client` stream (a relayed request), each
+/// answered with an error.
+#[derive(Default)]
+struct RelayedTo {
+    got: Mutex<Vec<potluck::proto::ClientRequest>>,
+}
+
+impl Handler for RelayedTo {
+    fn call(&self, _from: &Peer, msg: Value) -> Result<Value, String> {
+        Err(format!("no {} here", msg["op"]))
+    }
+
+    fn stream(&self, _from: &Peer, header: Value, mut stream: Stream) {
+        if let Ok(req) = serde_json::from_value(header["req"].clone()) {
+            self.got.lock().unwrap().push(req);
+        }
+        let answer = potluck::proto::ServerResponse {
+            reminders: vec![],
+            resp: Response::Error {
+                message: "recorded".into(),
+            },
+        };
+        let _ = potluck::proto::write_msg(&mut stream, &answer);
+        let _ = stream.close_write();
+    }
+}
+
+/// A request a member relays carries none of its caller's context but the branch of a hold: not
+/// the job and lease token of a caller inside a job, nor its repository.
+#[test]
+fn a_relayed_request_leaves_the_callers_lease_token_behind() {
+    let w = World::new();
+    let a = w.node("a").start();
+    let mut b = w.node("b").start();
+    pair(&a, &b);
+    let recorder = Arc::new(RelayedTo::default());
+    let mesh = b.impostor(recorder.clone());
+    let ctx = ClientContext {
+        repo_id: Some(potluck::types::repo_id(&a.repo.join(".git"))),
+        branch: Some(BRANCH.into()),
+        job: Some("a-7".into()),
+        lease_token: Some("the-lease-token".into()),
+    };
+    let mut client = Client::connect(&a.paths, ctx).unwrap();
+    for req in [
+        Request::Get { job: "b-1".into() },
+        Request::Hold {
+            workspace: "b-w1".into(),
+            duration_ms: 60_000,
+        },
+    ] {
+        let e = client.call(req.clone()).unwrap_err().to_string();
+        assert!(e.contains("recorded"), "{req:?}: {e}");
+    }
+    mesh.stop();
+    let got = recorder.got.lock().unwrap();
+    assert_eq!(got.len(), 2, "{got:?}");
+    for r in got.iter() {
+        let ctx = &r.ctx;
+        assert_eq!(
+            (&ctx.repo_id, &ctx.job, &ctx.lease_token),
+            (&None, &None, &None),
+            "{r:?}"
+        );
+    }
+    assert_eq!(got[0].ctx.branch, None);
+    assert_eq!(got[1].ctx.branch.as_deref(), Some(BRANCH));
+}
+
 /// A cancel that a member relays to the machine running a job for another owner goes to that
 /// owner, which cancels it as it does any of its jobs running elsewhere: not around it. So in a
 /// cluster without users, and with users once a user signed it.

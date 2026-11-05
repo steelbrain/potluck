@@ -19,7 +19,8 @@ use crate::daemon::files::reply;
 use crate::daemon::server::{self, describe, handle_relayed, reminders};
 use crate::mesh::{Peer, PublicKey};
 use crate::proto::{
-    ClientRequest, NEEDS_USER_KEY, Request, RequestAuth, Response, ServerResponse, read_msg,
+    ClientContext, ClientRequest, NEEDS_USER_KEY, Request, RequestAuth, Response, ServerResponse,
+    read_msg,
 };
 use crate::types::Millis;
 use std::collections::BTreeMap;
@@ -358,6 +359,25 @@ fn no_news(c: &Cluster, req: &Request, why: &str) -> Option<Response> {
     }
 }
 
+/// `req` as it is relayed to another member: its context only as far as that member uses it, the
+/// caller's branch for a hold (the workspace keeps it, for its reminders). Not the job and lease
+/// token of a caller inside a job, nor the caller's repository: the answer's reminders are this
+/// machine's.
+fn as_relayed(req: &ClientRequest) -> ClientRequest {
+    let branch = match req.req {
+        Request::Hold { .. } => req.ctx.branch.clone(),
+        _ => None,
+    };
+    ClientRequest {
+        ctx: ClientContext {
+            branch,
+            ..ClientContext::default()
+        },
+        req: req.req.clone(),
+        auth: req.auth.clone(),
+    }
+}
+
 /// Relays a CLI request to `node` and copies its answer to `w`, with this machine's reminders.
 fn relay<W: Write>(
     sh: &Arc<Shared>,
@@ -376,7 +396,7 @@ fn relay<W: Write>(
     }
     let req = &req;
     let header = serde_json::to_value(StreamHeader::Client {
-        req: Box::new(req.clone()),
+        req: Box::new(as_relayed(req)),
     })
     .map_err(|e| RelayError::NotStarted(e.to_string()))?;
     let stream = c
@@ -431,7 +451,7 @@ fn ask(
     // As [`relay`]: a restart in place waits for the answer.
     let _relaying = (!sh.up.draining()).then(|| sh.up.relaying());
     let header = serde_json::to_value(StreamHeader::Client {
-        req: Box::new(req.clone()),
+        req: Box::new(as_relayed(req)),
     })
     .map_err(|e| e.to_string())?;
     let stream = c
@@ -739,6 +759,63 @@ fn to_owner<W: Write>(
 mod tests {
     use super::*;
     use crate::mesh::user::UserKey;
+
+    /// A relayed request carries of its context only the branch of a hold: never the caller's
+    /// job and lease token, nor its repository. Its signature goes along.
+    #[test]
+    fn a_relayed_request_carries_only_the_context_its_member_uses() {
+        let tmp = tempfile::tempdir().unwrap();
+        let k = UserKey::load_or_create(&tmp.path().join("u.key"))
+            .unwrap()
+            .0;
+        let ctx = ClientContext {
+            repo_id: Some("app-0011aabb".into()),
+            branch: Some("feature".into()),
+            job: Some("a-7".into()),
+            lease_token: Some("secret".into()),
+        };
+        let hold = Request::Hold {
+            workspace: "b-w1".into(),
+            duration_ms: 60_000,
+        };
+        for req in [
+            Request::Get { job: "b-1".into() },
+            Request::Cancel { job: "b-1".into() },
+            Request::Release {
+                workspace: "b-w1".into(),
+            },
+            Request::Env {
+                node: Some("b".into()),
+            },
+            hold.clone(),
+        ] {
+            let auth = RequestAuth::sign(&k, &req);
+            let sent = as_relayed(&ClientRequest {
+                ctx: ctx.clone(),
+                req: req.clone(),
+                auth: Some(auth.clone()),
+            });
+            let is_hold = matches!(req, Request::Hold { .. });
+            assert_eq!(
+                (sent.ctx.repo_id, sent.ctx.job, sent.ctx.lease_token),
+                (None, None, None),
+                "{req:?}"
+            );
+            let branch = is_hold.then(|| "feature".to_string());
+            assert_eq!(sent.ctx.branch, branch, "{req:?}");
+            assert_eq!(sent.auth.as_ref(), Some(&auth));
+            assert!(sent.auth.unwrap().verifies(&sent.req));
+            let line = serde_json::to_string(&StreamHeader::Client {
+                req: Box::new(as_relayed(&ClientRequest {
+                    ctx: ctx.clone(),
+                    req,
+                    auth: None,
+                })),
+            })
+            .unwrap();
+            assert!(!line.contains("secret") && !line.contains("a-7"), "{line}");
+        }
+    }
 
     #[test]
     fn a_signed_request_is_taken_once_and_only_near_its_time() {
