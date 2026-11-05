@@ -34,6 +34,21 @@ fn user_manager() -> bool {
     ok
 }
 
+/// Whether this systemd keeps an ended unit's MemoryPeak (256 and later). systemd 255 (Ubuntu 24.04)
+/// shows a stale one, so potluck counts every OOM kill there as over the unit's own limit.
+fn keeps_memory_peak() -> bool {
+    let out = Command::new("systemd-run")
+        .arg("--version")
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    let version = text
+        .split_whitespace()
+        .nth(1)
+        .and_then(|v| v.parse::<u32>().ok());
+    version.is_some_and(|v| v >= 256)
+}
+
 fn limits() -> Limits {
     Limits {
         mem_max_bytes: 512 << 20,
@@ -467,8 +482,10 @@ fn going_over_the_memory_limit_is_reported_as_over_memory() {
     let sample = job.wait_end();
     assert!(sample.over_memory && !sample.oom_killed, "{sample:?}");
     // It reached its limit, whatever the samples a second apart saw (memory.peak, then
-    // systemd's MemoryPeak once the cgroup is gone).
-    assert!(sample.peak_mem_bytes >= 62 << 20, "{sample:?}");
+    // systemd's MemoryPeak once the cgroup is gone, which systemd before 256 doesn't keep).
+    if keeps_memory_peak() {
+        assert!(sample.peak_mem_bytes >= 62 << 20, "{sample:?}");
+    }
     // The kernel killed the allocating process; the supervisor survived to record it.
     let status = wait_for("the status file", || job.status());
     assert_eq!(status.signal, Some(libc::SIGKILL), "{status:?}");
@@ -483,7 +500,9 @@ fn going_over_the_memory_limit_is_reported_as_over_memory() {
         again.over_memory && !again.oom_killed && again.pids.is_empty(),
         "{again:?}"
     );
-    assert!(again.peak_mem_bytes >= 62 << 20, "{again:?}");
+    if keeps_memory_peak() {
+        assert!(again.peak_mem_bytes >= 62 << 20, "{again:?}");
+    }
     job.finish();
 }
 
@@ -622,8 +641,12 @@ fn an_oom_kill_above_the_unit_is_not_over_its_limit() {
         invocation: None,
     };
     let sample = SystemdExecutor.sample(&mut handle, 0).unwrap();
+    // systemd before 256 keeps no peak to tell this from going over its own limit by.
+    let want_oom_killed = keeps_memory_peak();
     assert!(
-        sample.oom_killed && !sample.over_memory && sample.pids.is_empty(),
+        sample.oom_killed == want_oom_killed
+            && sample.over_memory != want_oom_killed
+            && sample.pids.is_empty(),
         "{sample:?} (MemoryPeak {}, MemoryMax {})",
         unit_prop(&unit, "MemoryPeak"),
         unit_prop(&unit, "MemoryMax")
@@ -1157,6 +1180,8 @@ fn the_daemon_refuses_to_start_when_the_user_manager_does_not_answer() {
         .env("POTLUCK_CONFIG", &config)
         .env("POTLUCK_RELEASES_URL", "http://127.0.0.1:9/")
         .env("XDG_RUNTIME_DIR", tmp.path().join("no-runtime-dir"))
+        // systemctl --user would find the manager through the user bus otherwise.
+        .env_remove("DBUS_SESSION_BUS_ADDRESS")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
