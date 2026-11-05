@@ -46,6 +46,8 @@ In a cluster with users, a machine whose root is hostile can still:
   it reports on other machines count for nothing;
 - say that it runs a job another machine dispatched: other members show the job running there
   only while the dispatching machine is away, and the claim ends no `wait`;
+- put its own queued jobs first in order, since their submit times and passes aren't signed, and
+  so make them hold the line on other machines at once, as a job queued for 30 minutes does;
 - withhold or delay the records and reports it passes on; it can't forge records other keys
   signed;
 - send a signed request it answered on to another machine within 5 minutes: a request names its
