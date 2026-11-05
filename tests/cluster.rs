@@ -471,7 +471,7 @@ impl World {
             name: name.into(),
             gpu: false,
             cpu_model: "slow".into(),
-            version: "0.1.0".into(),
+            version: TEST_VERSION.into(),
             locality_ms: 0,
             updating_ms: 600_000,
             down_after_ms: 1_500,
@@ -881,6 +881,19 @@ fn wait_until(what: &str, mut f: impl FnMut() -> bool) {
 }
 
 /// Pairs `new` into `member`'s cluster through the CLI: `pair`, `admit`, `pair --finish`.
+
+/// The version test nodes run unless a test gives another: not this build's, so a test that
+/// compares versions doesn't change meaning when Cargo.toml's does.
+const TEST_VERSION: &str = "0.1.0";
+
+/// A mesh that only connects, as `node`'s machine, on the test nodes' version: members talk only on
+/// the same version.
+fn client_mesh(node: &Node) -> potluck::mesh::Mesh {
+    let mut cfg = MeshConfig::new(&node.paths, &node.config);
+    cfg.version = TEST_VERSION.to_string();
+    potluck::mesh::Mesh::connect_only(cfg).unwrap()
+}
+
 fn pair(member: &Node, new: &Node) {
     let request = new.cli_ok(&["pair"])["text"].as_str().unwrap().to_string();
     let reply = member.cli_ok(&["admit", &request])["text"]
@@ -3629,7 +3642,7 @@ fn only_job_workspace_and_removal_requests_are_relayed() {
     wait_until("c sees b", || c.node_alive("b"));
     // c relays to a, with its own keys (as `potluck _tunnel` dials), a request to admit a
     // machine.
-    let mesh = potluck::mesh::Mesh::connect_only(MeshConfig::new(&c.paths, &c.config)).unwrap();
+    let mesh = client_mesh(&c);
     let relay = |req: Request| -> Response {
         let req = ClientRequest {
             ctx: ClientContext {
@@ -3933,7 +3946,7 @@ fn a_repeated_claim_is_granted_again() {
     let first = a.dispatch(&["--gpu", "any", "--", "sleep", "60"]);
     a.running_on(&first, "b");
     let second = a.dispatch(&["--gpu", "any", "--", "true"]);
-    let mesh = potluck::mesh::Mesh::connect_only(MeshConfig::new(&b.paths, &b.config)).unwrap();
+    let mesh = client_mesh(&b);
     let claim = serde_json::json!({
         "op": "claim",
         "job": second,
@@ -3964,7 +3977,7 @@ fn upload_pack_is_refused_for_a_repository_no_dispatch_named() {
     let a = w.node("a").start();
     let b = w.node("b").start();
     pair(&a, &b);
-    let mesh = potluck::mesh::Mesh::connect_only(MeshConfig::new(&b.paths, &b.config)).unwrap();
+    let mesh = client_mesh(&b);
     let mut stream = mesh
         .open_stream(
             "a",
@@ -4393,7 +4406,7 @@ fn a_restart_relayed_by_a_member_is_refused() {
     let a = w.node("a").start();
     let b = w.node("b").start();
     pair(&a, &b);
-    let mesh = potluck::mesh::Mesh::connect_only(MeshConfig::new(&b.paths, &b.config)).unwrap();
+    let mesh = client_mesh(&b);
     let req = potluck::proto::ClientRequest {
         ctx: ClientContext::default(),
         req: Request::Restart { binary: None },
