@@ -1370,7 +1370,14 @@ mod tests {
         // Killed, a zombie until reaped.
         assert!(own_children().contains(&pid));
         assert!(!running(pid));
-        assert!(reap(&[pid]).is_empty());
+        // On macOS, `running` says no as soon as the child is on its way out, a moment before
+        // waitpid has it as a zombie (seen on a slow CI runner): reaped within a moment, as the
+        // daemon reaps such a child later (`reap_orphans`).
+        let until = Instant::now() + Duration::from_secs(5);
+        while !reap(&[pid]).is_empty() {
+            assert!(Instant::now() < until, "{pid} not reaped");
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert!(!own_children().contains(&pid));
     }
 
