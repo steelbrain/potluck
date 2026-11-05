@@ -9,6 +9,8 @@
   memory, under its own limit", when potluck learned of the kill only after the job's unit had
   ended. That systemd shows a stale memory peak for an ended unit; potluck now ignores it there,
   and the job ends as `over_memory`.
+- Linux with systemd 255: a job that ended at once while the user manager was busy could be
+  reported as "systemd-run could not start" instead of with its own exit code.
 
 ## 0.1.1 (2026-11-04)
 

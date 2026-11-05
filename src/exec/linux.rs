@@ -223,14 +223,33 @@ impl Executor for SystemdExecutor {
             }
         };
         if !out.success() {
-            let result = show(&unit, &["Result"])
-                .ok()
-                .and_then(|mut p| p.remove("Result"))
-                .filter(|r| r != "success");
-            // The OOM killer can act before systemd has seen the start through (a job that goes
-            // over its limit at once while the manager is busy): the start then counts as failed,
-            // but the job ran. It ends like any other run that went over, and `finish` clears it.
-            if result.as_deref() == Some("oom-kill") {
+            let props = show(
+                &unit,
+                &[
+                    "Result",
+                    "ExecMainStartTimestampMonotonic",
+                    "ExecMainStatus",
+                ],
+            )
+            .ok();
+            let prop = |k: &str| props.as_ref().and_then(|p| p.get(k).cloned());
+            let number = |k: &str| prop(k).and_then(|v| v.parse::<u64>().ok());
+            let result = prop("Result").filter(|r| r != "success");
+            // Forked, though systemd's own setup in the child (its working directory, say) may
+            // still have failed: then it exits with one of systemd's statuses, 200 and up.
+            let forked = number("ExecMainStartTimestampMonotonic").is_some_and(|t| t > 0);
+            let setup_failed = number("ExecMainStatus").is_some_and(|s| (200..=254).contains(&s));
+            // The job can end before systemd has seen the start through, while the manager is
+            // busy: the OOM killer acted at once, or (systemd 255) the supervisor ran and exited
+            // early, with an exit code or a signal. The start then counts as failed, but the job
+            // ran. It ends like any other run, and `finish` clears it.
+            let ran = match result.as_deref() {
+                Some("oom-kill") => true,
+                Some("exit-code") => forked && !setup_failed,
+                Some("signal" | "core-dump") => forked,
+                _ => false,
+            };
+            if ran {
                 let (_, invocation) = current(&unit);
                 return Ok(Handle::Systemd {
                     cgroup: None,
@@ -298,12 +317,9 @@ impl Executor for SystemdExecutor {
             pids: Vec::new(),
             cpu_ms: number("CPUUsageNSec").map_or(0, |ns| ns / 1_000_000),
             mem_bytes: 0,
-            // systemd 256 and later keep it after the cgroup is gone ([`keeps_memory_peak`]).
-            peak_mem_bytes: if kept {
-                number("MemoryPeak").unwrap_or(0)
-            } else {
-                0
-            },
+            // systemd 256 and later keep it after the cgroup is gone; an older one's is a peak the
+            // unit reached at some point, which still counts toward the job's.
+            peak_mem_bytes: number("MemoryPeak").unwrap_or(0),
             over_memory: oom_kill && own,
             oom_killed: oom_kill && !own,
             over_tasks: None,
