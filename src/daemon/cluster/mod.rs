@@ -709,7 +709,7 @@ pub(crate) fn start(sh: &Arc<Shared>) -> anyhow::Result<()> {
     listen_warning(sh, &c, fit_listener(sh, &c, true));
     if c.mesh().local_addr().is_none() && c.listen_error().is_none() {
         sh.log.log(format!(
-            "cluster: {} is in no cluster, so it doesn't listen for members (`potluck admit` founds one, `potluck pair` joins one)",
+            "cluster: {} is in no cluster, so it doesn't listen for members (`potluck user init` founds one, `potluck pair` joins one)",
             c.node
         ));
     }
@@ -1452,6 +1452,10 @@ pub(crate) fn membership(
             }
         }
         Request::Admit { request, admission } => {
+            // This machine signs no admission with its machine key: a user signs each one.
+            let Some(admission) = admission else {
+                return Err(unsigned_membership(c, "an admission", "admits a machine"));
+            };
             // The founder's first admission: it listens before it answers, so the reply says
             // where; if nobody is admitted after all, it stops again.
             let mut l = c.listening.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1461,7 +1465,7 @@ pub(crate) fn membership(
             };
             let admitted = c
                 .mesh()
-                .admit_signed(request.trim(), admission.as_deref().cloned());
+                .admit_signed(request.trim(), Some((**admission).clone()));
             let fitted = set_listener_locked(sh, c, &mut l, None, true);
             drop(l);
             let reply = admitted.map_err(|e| e.to_string())?;
@@ -1505,15 +1509,17 @@ pub(crate) fn membership(
             text(reply)
         }
         Request::Remove { node, removal } => {
-            let elders = c.mesh().admitted_before(node);
-            let by_user = c.mesh().users_exist();
+            // Nor any removal: a user signs each one.
+            let Some(removal) = removal else {
+                return Err(unsigned_membership(c, "a removal", "removes a machine"));
+            };
             {
                 // Not while the mesh is being replaced, as for PairRequest: made on the mesh
                 // going, the removal would be on disk but not in the mesh that serves on (whose
                 // next save drops it there too), and announced from a mesh stopped.
                 let _l = c.listening.lock().unwrap_or_else(PoisonError::into_inner);
                 c.mesh()
-                    .remove_signed(node, removal.as_deref().cloned())
+                    .remove_signed(node, Some((**removal).clone()))
                     .map_err(|e| e.to_string())?;
             }
             sh.log.log(format!("cluster: removed {node}"));
@@ -1527,12 +1533,7 @@ pub(crate) fn membership(
             remote::owner_gone(sh, c, node);
             sh.kick();
             // A user's removal is final: the machine removed signs nothing that counts.
-            Ok(
-                match contestable(&c.node, node, &elders).filter(|_| !by_user) {
-                    None => Response::Ok,
-                    Some(text) => Response::Text { text },
-                },
-            )
+            Ok(Response::Ok)
         }
         Request::Membership => Ok(Response::Membership {
             membership: Box::new(c.mesh().membership()),
@@ -1569,25 +1570,17 @@ pub(crate) fn membership(
     }
 }
 
-/// What a removal of `node` signed by `me` leaves open, given the members admitted before
-/// `node` (oldest first): nothing when `me` is one of them (`node` can't undo it), else that
-/// `node` can undo it, by removing `me` back.
-pub(crate) fn contestable(me: &str, node: &str, elders: &[String]) -> Option<String> {
-    if elders.iter().any(|e| e == me) {
-        return None;
+/// Why `what` ("an admission", "a removal") that no user signed is refused here: only a user's
+/// signed one `does` ("admits a machine"), and this machine signs none with its machine key.
+fn unsigned_membership(c: &Cluster, what: &str, does: &str) -> String {
+    match c.mesh().users_exist() {
+        true => format!(
+            "this cluster has users: only a user's signed admission or removal {does} (the command line signs {what} with its user key)"
+        ),
+        false => format!(
+            "this cluster has no users yet, and only a user's signed admission or removal {does}: `potluck user init` makes the first user (on a machine in no cluster, it founds one)"
+        ),
     }
-    Some(match elders {
-        [] => format!(
-            "{node} founded the cluster, so {node} can undo this removal whenever its key is in use: a removal of the founder is never final"
-        ),
-        [only] => format!(
-            "{node} was admitted before every member that is up, so {node} can undo this removal; run `potluck remove {node}` again when {only} is up to make it final"
-        ),
-        [rest @ .., last] => format!(
-            "{node} was admitted before every member that is up, so {node} can undo this removal; run `potluck remove {node}` again when {} or {last} is up to make it final",
-            rest.join(", ")
-        ),
-    })
 }
 
 /// The record of a workspace on another machine, asked of that machine, for `dispatch

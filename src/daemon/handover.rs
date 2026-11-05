@@ -1605,6 +1605,8 @@ mod tests {
             pub executor: Option<Arc<dyn Executor>>,
             pub ws: Arc<dyn crate::daemon::WorkspaceProvider>,
             pub sched: Arc<dyn crate::daemon::Scheduler>,
+            /// It runs as a member of a cluster (of its own, alone): it can have users.
+            pub cluster: bool,
         }
 
         impl Lone {
@@ -1634,6 +1636,7 @@ mod tests {
                         home: dir.join("home"),
                         config: dir.join("node.toml"),
                     })),
+                    cluster: false,
                 }
             }
 
@@ -1655,8 +1658,30 @@ mod tests {
                 }
             }
 
+            /// With [`Lone::cluster`]: what it runs as a member with.
+            fn cluster_options(&self) -> Option<crate::daemon::ClusterOptions> {
+                self.cluster.then(|| {
+                    let mut c = crate::daemon::ClusterOptions::new(&self.paths, &self.config);
+                    c.tick_ms = 50;
+                    c.mesh.listen = "127.0.0.1:0".parse().unwrap();
+                    c
+                })
+            }
+
             pub fn start(&self) -> Daemon {
-                Daemon::start(&self.paths, &self.config, self.parts(), self.opts.clone()).unwrap()
+                match self.cluster_options() {
+                    Some(c) => Daemon::start_cluster(
+                        &self.paths,
+                        &self.config,
+                        self.parts(),
+                        self.opts.clone(),
+                        c,
+                    ),
+                    None => {
+                        Daemon::start(&self.paths, &self.config, self.parts(), self.opts.clone())
+                    }
+                }
+                .unwrap()
             }
 
             /// The daemon that starts from `inherited` in this process.
@@ -1666,10 +1691,28 @@ mod tests {
                     &self.config,
                     self.parts(),
                     self.opts.clone(),
-                    None,
+                    self.cluster_options(),
                     inherited,
                 )
                 .unwrap()
+            }
+
+            /// Makes the cluster's first user (the daemon running, [`Lone::cluster`] set), as
+            /// `potluck user init` does: its key, user.key beside node.toml.
+            pub fn first_user(&self) -> crate::mesh::user::UserKey {
+                use crate::proto::{Request, Response};
+                let path = self.paths.config.with_file_name("user.key");
+                let key = crate::mesh::user::UserKey::load_or_create(&path).unwrap().0;
+                let mut c =
+                    crate::client::Client::connect(&self.paths, Default::default()).unwrap();
+                let m = match c.call(Request::Membership).unwrap() {
+                    Response::Membership { membership } => *membership,
+                    other => panic!("{other:?}"),
+                };
+                match c.call(crate::cli::first_user(&m, &key, "owner")).unwrap() {
+                    Response::Ok => key,
+                    other => panic!("{other:?}"),
+                }
             }
         }
 
@@ -2014,10 +2057,14 @@ mod tests {
             let seed = Arc::new(SlowSeed::default());
             seed.hold_sync.store(true, Ordering::SeqCst);
             lone.ws = seed.clone();
+            lone.cluster = true;
             let d = lone.start();
+            let user = lone.first_user();
             let sh = d.shared.clone();
             let mut spec = job("x", JobState::Queued).spec;
             spec.on.clear();
+            spec.submitted_from = "lone".into();
+            let spec = crate::jobauth::sign(&spec, &user, crate::types::now_ms());
             let paths = sh.paths.clone();
             let dispatching = std::thread::spawn(move || {
                 crate::client::Client::connect(&paths, Default::default())

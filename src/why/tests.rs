@@ -884,6 +884,7 @@ fn sync_behind() {
             locality: &locality,
             catch_up: &BTreeMap::new(),
             held_out: &BTreeMap::new(),
+            only: None,
         },
     );
     has(
@@ -912,6 +913,7 @@ fn sync_behind() {
             locality: &locality,
             catch_up: &catch_up,
             held_out: &BTreeMap::new(),
+            only: None,
         },
     );
     has(
@@ -964,6 +966,7 @@ fn a_machine_plans_without_the_jobs_it_cannot_take_yet() {
             locality: &BTreeMap::new(),
             catch_up: &BTreeMap::new(),
             held_out: &held_out,
+            only: None,
         },
     );
     has(

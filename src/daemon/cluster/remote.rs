@@ -142,9 +142,9 @@ pub(crate) fn adjust_queue(sh: &Shared, st: &State, queue: &mut Vec<Queued>, now
         Some(s) => s,
         None => return,
     };
-    // In a cluster with users, only jobs a user this machine recognizes signed are taken from
-    // other machines (a grant is checked whole before the job runs: [`verify_grant`]).
-    let users = mesh.users_exist();
+    // Only jobs a user this machine recognizes signed are taken from other machines, with users
+    // or without (none then): a job queued before the cluster had users runs only on the machine
+    // it was dispatched on. A grant is checked whole before the job runs ([`verify_grant`]).
     let view = local.view();
     for s in cs.syncs.values_mut() {
         s.wants.clear();
@@ -192,7 +192,7 @@ pub(crate) fn adjust_queue(sh: &Shared, st: &State, queue: &mut Vec<Queued>, now
                     .as_ref()
                     .is_some_and(|a| mesh.recognized_user(&a.key))
             };
-            if users && !signed_by_user() {
+            if !signed_by_user() {
                 continue;
             }
             let q = queued_of(st, rec);
@@ -253,12 +253,13 @@ pub(crate) fn adjust_queue(sh: &Shared, st: &State, queue: &mut Vec<Queued>, now
         .retain(|id, (_, at)| queued.contains(id) || boot.saturating_sub(*at) < REFUSED_MS);
 
     // Locality: a machine without a workspace of the repository leaves the job to a live member
-    // with one that could start it within the wait, for that long.
+    // with one that could start it within the wait, for that long. Not its own job that no user
+    // signed: no other member takes that.
     let wait = c.opts.locality_wait_ms;
     let warm_here: BTreeSet<String> = st.records().into_iter().map(|w| w.repo_id).collect();
     let mut seen = BTreeSet::new();
     queue.retain(|q| {
-        if q.workspace.is_some() {
+        if q.workspace.is_some() || st.jobs.get(&q.job).is_some_and(|j| j.spec.auth.is_none()) {
             return true;
         }
         let Some(repo) = repos.get(&q.job) else {
@@ -526,9 +527,9 @@ fn claim(sh: &Arc<Shared>, id: &str, passed: Vec<JobId>) {
 
 /// What a runner checks of job `id` its owner granted, before it runs it: the spec granted asks
 /// for what the queue entry it claimed asked, the resources reserved here (`request`), `on` and
-/// `workspace` (`claimed`). In a cluster with users also: a user this machine recognizes signed
-/// it, for its owner, and the spec granted is the one signed as its owner holds it
-/// ([`crate::jobauth::verify_grant`]); and it runs in this machine's pool, on this machine's facts
+/// `workspace` (`claimed`); a user this machine recognizes signed it, for its owner, and the spec
+/// granted is the one signed as its owner holds it ([`crate::jobauth::verify_grant`]: so none is
+/// run until the cluster has users); and it runs in this machine's pool, on this machine's facts
 /// (`--on`).
 fn verify_grant(
     sh: &Shared,
@@ -556,9 +557,6 @@ fn verify_grant(
         ));
     }
     let mesh = c.mesh();
-    if !mesh.users_exist() {
-        return Ok(());
-    }
     let signed =
         crate::jobauth::verify_grant(&job.spec, owner_of(id), |k| mesh.recognized_user(k))?;
     let pool = c.pool_here();

@@ -2,9 +2,8 @@
 //! another machine, a workspace on another machine, or another machine's login environment
 //! (`potluck env NODE`), is relayed there over a `client` stream and answered from there, frame by
 //! frame (with this machine's reminders). Status, nodes and why cover every member; pairing,
-//! admission, removal and self-update go to the mesh. In a cluster without users, a removal goes
-//! to the oldest member up that was admitted before the machine removed, which makes it final; in
-//! one with users, a user signs it and no member signs one for another.
+//! admission, removal and self-update go to the mesh. A user signs each admission and removal,
+//! and no member signs one for another.
 //!
 //! In a cluster with users, a member answers a relayed request only when a user signed it
 //! ([`RequestAuth`]): a recognized user's key, signed within [`RequestAuth::WINDOW_MS`] of the
@@ -224,36 +223,6 @@ pub(crate) fn intercept<W: Write>(
         }
         Request::Status => answer(w, views::status(sh, &c)),
         Request::Nodes => answer(w, Ok(views::nodes(sh, &c))),
-        Request::Remove { node, .. } if !relayed && !c.removed() && !c.mesh().users_exist() => {
-            // Signed by the oldest member up that was admitted before `node`, the removal is
-            // final: `node` can't undo it by removing that member back. This machine signs it
-            // when none is up, or none that is signs it (saying the removal holds only until
-            // `node` contests it, and why they didn't).
-            let mut refused: Vec<(String, String)> = Vec::new();
-            for elder in c.mesh().admitted_before(node) {
-                if elder == me {
-                    break;
-                }
-                if !c.alive(&elder) {
-                    continue;
-                }
-                match ask(sh, &c, &elder, req) {
-                    Ok(Response::Error { message }) => refused.push((elder, message)),
-                    Ok(resp) => return answer(w, Ok(resp)),
-                    Err(_) => continue,
-                }
-            }
-            let done = membership(sh, &c, &req.req);
-            answer(
-                w,
-                match done {
-                    Ok(Response::Text { .. }) if !refused.is_empty() => Ok(Response::Text {
-                        text: not_signed_by(node, &refused),
-                    }),
-                    other => other,
-                },
-            )
-        }
         Request::PairRequest
         | Request::PairFinish { .. }
         | Request::Admit { .. }
@@ -496,54 +465,9 @@ fn dropped(sh: &Shared, node: &str, req: &ClientRequest, why: &str) -> String {
     what
 }
 
-/// A removal asked of `elder` ([`intercept`]): its answer, one frame; an error when none came.
-fn ask(
-    sh: &Arc<Shared>,
-    c: &Cluster,
-    elder: &str,
-    req: &ClientRequest,
-) -> Result<Response, String> {
-    // As [`relay`]: a restart in place waits for the answer.
-    let _relaying = (!sh.up.draining()).then(|| sh.up.relaying());
-    let header = serde_json::to_value(StreamHeader::Client {
-        req: Box::new(as_relayed(req)),
-    })
-    .map_err(|e| e.to_string())?;
-    let stream = c
-        .mesh()
-        .open_stream(elder, header)
-        .map_err(|e| e.to_string())?;
-    let _ = stream.set_read_timeout(Some(RELAY_IDLE));
-    let answered = read_msg_within::<_, ServerResponse>(&mut BufReader::new(stream), MAX_ANSWER);
-    match answered {
-        Ok(Some(frame)) => Ok(frame.resp),
-        Ok(None) => Err(format!("{elder} closed the connection without answering")),
-        Err(e) if TooLong::is(&e) => {
-            let why = format!("it sent {e}, longer than any answer a member gives");
-            Err(dropped(sh, elder, req, &why))
-        }
-        Err(e) => Err(e.to_string()),
-    }
-}
-
-/// What a removal of `node` signed here leaves open when the members admitted before it that
-/// are up didn't sign it (`refused`: each one and why): `node` can undo it.
-fn not_signed_by(node: &str, refused: &[(String, String)]) -> String {
-    let why: Vec<String> = refused
-        .iter()
-        .map(|(elder, message)| format!("{elder} did not sign it: {message}"))
-        .collect();
-    let elders: Vec<&str> = refused.iter().map(|(elder, _)| elder.as_str()).collect();
-    format!(
-        "{}; so {node} can undo this removal; run `potluck remove {node}` again when {} can sign it to make it final",
-        why.join("; "),
-        elders.join(" or ")
-    )
-}
-
-/// A removal of `node` another member (`requester`) relayed here, as [`intercept`] does: signed
-/// only when this machine was admitted before `node`, so that `node` can't undo it (never the
-/// founder's, which no member was admitted before, nor this machine's own).
+/// A removal of `node` another member (`requester`) relayed here: what a member on 0.1.1 asks of
+/// a member admitted before `node`, to sign it. Refused: this machine signs no removal with its
+/// machine key, and a user's signed removal removes a machine.
 fn serve_removal<W: Write>(
     sh: &Arc<Shared>,
     req: &ClientRequest,
@@ -552,42 +476,26 @@ fn serve_removal<W: Write>(
     w: &mut W,
 ) -> std::io::Result<()> {
     let _answering = sh.up.serving();
-    let result = match sh.cluster() {
-        None => Err("this machine is in no cluster".to_string()),
-        // A user signs every removal there: no member signs one for another.
-        Some(c) if c.mesh().users_exist() => Err(format!(
-            "this cluster has users, so {} signs no removal: a user's signed removal removes {node}",
-            c.node
-        )),
-        Some(c) if c.mesh().admitted_before(node).is_empty() && c.mesh().member(node).is_none() => {
-            Err(format!("{} does not know {node} (yet)", c.node))
-        }
-        Some(c) if !c.mesh().admitted_before(node).contains(&c.node) => Err(format!(
-            "{} was not admitted before {node}, so it signs no removal of {node} that {requester} relays",
-            c.node
-        )),
-        Some(c) => {
-            let r = membership(sh, &c, &req.req);
-            if r.is_ok() {
-                sh.log
-                    .log(format!("cluster: removal of {node} signed for {requester}"));
+    let message = match sh.cluster() {
+        None => "this machine is in no cluster".to_string(),
+        Some(c) => format!(
+            "{} signs no removal of {node} that {requester} relays: a user's signed removal removes a machine{}",
+            c.node,
+            match c.mesh().users_exist() {
+                true => "",
+                false => " (`potluck user init` makes the first user)",
             }
-            r
-        }
+        ),
     };
     let rem = reminders(sh, &req.ctx);
-    reply(
-        w,
-        &rem,
-        result.unwrap_or_else(|message| Response::Error { message }),
-    )
+    reply(w, &rem, Response::Error { message })
 }
 
 /// A request another member (`from`) relayed here: answered on the stream as on the socket, when
 /// [`may_answer`] lets it be. Only the requests [`intercept`] relays are answered (about a job or
-/// a workspace, this machine's login environment, and a removal, which it relays to a member
-/// admitted before the machine removed); anything else, such as an admission, is refused rather
-/// than done here on another member's word.
+/// a workspace, and this machine's login environment); a removal, which a member on 0.1.1 relays
+/// to one admitted before the machine removed, is refused ([`serve_removal`]), and so is anything
+/// else, such as an admission, rather than done here on another member's word.
 pub(super) fn serve(
     sh: &Arc<Shared>,
     c: &Cluster,

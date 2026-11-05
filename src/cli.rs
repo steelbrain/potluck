@@ -26,6 +26,9 @@ pub struct Cli {
 #[derive(Subcommand)]
 pub enum Command {
     /// Queue a job at the current commit; print its id, and its workspace's once it has started.
+    ///
+    /// The job is signed with this command line's user key, a user of the cluster (`potluck user
+    /// init` makes the first).
     Dispatch(DispatchArgs),
     /// Stream a job's output until it ends, and exit with its exit code.
     Wait {
@@ -114,18 +117,18 @@ pub enum Command {
     },
     /// Admit a machine: takes the request `potluck pair` printed, prints the reply to paste back.
     ///
-    /// In a cluster with users (`potluck user init`), the admission is signed with this command
-    /// line's user key.
+    /// The admission is signed with this command line's user key, a user of the cluster
+    /// (`potluck user init` makes the first).
     Admit {
         /// The request `potluck pair` printed on the new machine.
         request: String,
-        /// The machine's pool (a cluster with users only). Default: default.
+        /// The machine's pool. Default: default.
         #[arg(long, value_name = "POOL")]
         pool: Option<String>,
     },
     /// Remove a machine from the cluster.
     ///
-    /// In a cluster with users, the removal is signed with this command line's user key.
+    /// The removal is signed with this command line's user key, a user of the cluster.
     Remove {
         /// The machine's name, as `potluck nodes` lists it.
         node: String,
@@ -685,9 +688,10 @@ impl Cx<'_> {
             // stderr says where it goes next.
             Command::Pair { finish } => match finish {
                 None => self.text_request(Req::PairRequest, "pair").map(|r| Report {
-                    note: "paste this line into `potluck admit` on a member of the cluster (a \
-                           machine in no cluster founds one with it), then the reply into \
-                           `potluck pair --finish` here"
+                    note: "paste this line into `potluck admit` on a member of the cluster, \
+                           where a user's key is (on a machine in no cluster, `potluck user \
+                           init` founds one first), then the reply into `potluck pair --finish` \
+                           here"
                         .into(),
                     ..r
                 }),
@@ -696,7 +700,7 @@ impl Cx<'_> {
             Command::Admit { request, pool } => self.admit(request, pool),
             Command::User { action } => self.user(action),
             Command::Remove { node } => {
-                let removal = self.signed_removal(&node)?;
+                let removal = Some(self.signed_removal(&node)?);
                 // Text: the removal holds until the machine removed contests it, and why.
                 let warning = match self.call(Req::Remove {
                     node: node.clone(),
@@ -874,22 +878,17 @@ impl Cx<'_> {
         })
     }
 
-    /// The dispatch `spec`, signed with this command line's user key when it has one, for the
-    /// local daemon to own (its name, asked first, is the spec's `submitted_from`). Without a
-    /// key it goes unsigned, unless the cluster has users: then it is refused here.
+    /// The dispatch `spec`, signed with this command line's user key, for the local daemon to
+    /// own (its name, asked first, is the spec's `submitted_from`). Refused here until the
+    /// cluster has users, and without a key.
     fn signed(&mut self, mut spec: crate::types::JobSpec) -> anyhow::Result<crate::types::JobSpec> {
+        self.with_users("a dispatch")?;
         let path = crate::mesh::user::key_path(&self.env.paths);
         let Some(key) = UserKey::load(&path)? else {
-            if self
-                .membership_for_signing()?
-                .is_some_and(|m| m.users_exist)
-            {
-                anyhow::bail!(
-                    "this cluster has users, so a dispatch is signed with a user's key, and there is none at {} (dispatch from the machine where a user's key is; or make one here with `potluck user key` and have a user run `potluck user add NAME KEY`)",
-                    path.display()
-                );
-            }
-            return Ok(spec);
+            anyhow::bail!(
+                "this cluster has users, so a dispatch is signed with a user's key, and there is none at {} (dispatch from the machine where a user's key is; or make one here with `potluck user key` and have a user run `potluck user add NAME KEY`)",
+                path.display()
+            );
         };
         spec.submitted_from = match self.call(Req::Ping)? {
             Response::Pong { node, .. } => node,
@@ -1489,9 +1488,27 @@ impl Cx<'_> {
         }
     }
 
-    /// For `admit` and `remove`, whether to sign: [`Cx::membership`] if the daemon says, else
-    /// None. The daemon decides whether a request needs a user's signature, and says so when one
-    /// that has none does.
+    /// [`Cx::membership`] of a cluster that has users, for `what` ("a dispatch", "an admission",
+    /// "a removal"), which a user signs: refused, saying how to make the first user, until it
+    /// has one.
+    fn with_users(&mut self, what: &str) -> anyhow::Result<crate::mesh::MembershipView> {
+        let m = self.membership()?;
+        if m.users_exist {
+            return Ok(m);
+        }
+        if m.members.len() <= 1 {
+            anyhow::bail!(
+                "{what} is signed by a user of a cluster, and this machine is in none yet: `potluck user init` founds one, with this command line's key as its first user"
+            );
+        }
+        anyhow::bail!(
+            "{what} is signed by a user, and this cluster has no users yet: `potluck user init` makes this command line's key the first user"
+        )
+    }
+
+    /// For `resize`, whether to sign: [`Cx::membership`] if the daemon says, else None. The
+    /// daemon decides whether a request needs a user's signature, and says so when one that has
+    /// none does.
     fn membership_for_signing(&mut self) -> anyhow::Result<Option<crate::mesh::MembershipView>> {
         match self.membership_if_known() {
             Err(e) if !crate::client::is_disconnected(&e) => Ok(None),
@@ -1523,42 +1540,34 @@ impl Cx<'_> {
         }
     }
 
-    /// `potluck admit [--pool P] REQUEST`: in a cluster with users, the admission signed here.
+    /// `potluck admit [--pool P] REQUEST`: the admission signed here, with this command line's
+    /// user key.
     fn admit(&mut self, request: String, pool: Option<String>) -> anyhow::Result<Report> {
         use crate::mesh::trust::{self, DEFAULT_POOL};
-        let m = self.membership_for_signing()?;
         let pool = pool.unwrap_or_else(|| DEFAULT_POOL.to_string());
         if !trust::valid_pool(&pool) {
             anyhow::bail!(
                 "bad pool name {pool:?}: use letters, digits, '.', '_' and '-', not starting with '-'"
             );
         }
-        let admission = if let Some(m) = m.filter(|m| m.users_exist) {
-            let req = trust::PairRequest::from_text(&request)?;
-            let (key, by) = self.signing_user(&m, "an admission")?;
-            Some(Box::new(crate::mesh::Admission::sign_by_user(
-                &key,
-                &by,
-                &req.name,
-                req.key,
-                &req.address,
-                &pool,
-                &req.nonce,
-                m.next_clock,
-            )))
-        } else if pool != DEFAULT_POOL {
-            anyhow::bail!(
-                "this cluster has no users, and pools come with them: every machine is in pool {DEFAULT_POOL} until `potluck user init`"
-            );
-        } else {
-            None
-        };
-        let by_user = admission.is_some();
+        let m = self.with_users("an admission")?;
+        let req = trust::PairRequest::from_text(&request)?;
+        let (key, by) = self.signing_user(&m, "an admission")?;
+        let admission = Some(Box::new(crate::mesh::Admission::sign_by_user(
+            &key,
+            &by,
+            &req.name,
+            req.key,
+            &req.address,
+            &pool,
+            &req.nonce,
+            m.next_clock,
+        )));
         let reply = self.text_request(Req::Admit { request, admission }, "admit")?;
         let mut json = reply.json;
         if let Value::Object(map) = &mut json {
             map.insert("pool".into(), json!(pool));
-            map.insert("signed_by_user".into(), json!(by_user));
+            map.insert("signed_by_user".into(), json!(true));
         }
         Ok(Report {
             json,
@@ -1567,23 +1576,20 @@ impl Cx<'_> {
         })
     }
 
-    /// In a cluster with users, the removal of `node` signed with this command line's user key;
-    /// None without users (a member signs it).
-    fn signed_removal(&mut self, node: &str) -> anyhow::Result<Option<Box<crate::mesh::Removal>>> {
-        let Some(m) = self.membership_for_signing()?.filter(|m| m.users_exist) else {
-            return Ok(None);
-        };
+    /// The removal of `node`, signed with this command line's user key.
+    fn signed_removal(&mut self, node: &str) -> anyhow::Result<Box<crate::mesh::Removal>> {
+        let m = self.with_users("a removal")?;
         let Some(target) = m.members.iter().chain(&m.removed).find(|e| e.name == node) else {
             anyhow::bail!("{node} is not a member of this cluster");
         };
         let (key, by) = self.signing_user(&m, "a removal")?;
-        Ok(Some(Box::new(crate::mesh::Removal::sign_by_user(
+        Ok(Box::new(crate::mesh::Removal::sign_by_user(
             &key,
             &by,
             node,
             target.key,
             m.next_clock,
-        ))))
+        )))
     }
 
     fn user(&mut self, action: UserAction) -> anyhow::Result<Report> {
@@ -1633,7 +1639,7 @@ impl Cx<'_> {
                     })
                     .collect();
                 let human = match m.users_exist {
-                    false => "this cluster has no users: its members sign who joins and leaves it (`potluck user init` makes the first user)\n".to_string(),
+                    false => "this cluster has no users yet: dispatch, admit and remove need one, and `potluck user init` makes the first\n".to_string(),
                     true => table(&["NAME", "KEY", "ADDED BY", "THIS CLI"], &rows),
                 };
                 Ok(Report::new(
@@ -1665,27 +1671,7 @@ impl Cx<'_> {
                     );
                 }
                 let (key, made) = UserKey::load_or_create(&path)?;
-                let genesis = UserAdmission::genesis(&key, &name, &m.node, m.key, m.next_clock);
-                let admissions: Vec<crate::mesh::Admission> = m
-                    .members
-                    .iter()
-                    .map(|e| {
-                        crate::mesh::Admission::sign_by_user(
-                            &key,
-                            &name,
-                            &e.name,
-                            e.key,
-                            &e.address,
-                            crate::mesh::trust::DEFAULT_POOL,
-                            "",
-                            m.next_clock + 1,
-                        )
-                    })
-                    .collect();
-                match self.call(Req::UserInit {
-                    genesis: Box::new(genesis),
-                    admissions,
-                })? {
+                match self.call(first_user(&m, &key, &name))? {
                     Response::Ok => {}
                     other => return Err(unexpected("user init", &other)),
                 }
@@ -1924,6 +1910,33 @@ fn broken_pipe(e: &anyhow::Error) -> bool {
         c.downcast_ref::<std::io::Error>()
             .is_some_and(|io| io.kind() == std::io::ErrorKind::BrokenPipe)
     })
+}
+
+/// What `potluck user init` asks of the daemon whose cluster `m` describes (one without users):
+/// the admission of `key` as the first user, `name`, which that machine co-signs, and that user's
+/// admission of every member, in one batch.
+pub fn first_user(m: &crate::mesh::MembershipView, key: &UserKey, name: &str) -> Req {
+    let genesis = crate::mesh::UserAdmission::genesis(key, name, &m.node, m.key, m.next_clock);
+    let admissions = m
+        .members
+        .iter()
+        .map(|e| {
+            crate::mesh::Admission::sign_by_user(
+                key,
+                name,
+                &e.name,
+                e.key,
+                &e.address,
+                crate::mesh::trust::DEFAULT_POOL,
+                "",
+                m.next_clock + 1,
+            )
+        })
+        .collect();
+    Req::UserInit {
+        genesis: Box::new(genesis),
+        admissions,
+    }
 }
 
 fn unexpected(what: &str, resp: &Response) -> anyhow::Error {

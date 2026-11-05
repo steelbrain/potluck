@@ -554,24 +554,22 @@ fn check_carried(repo: &crate::types::RepoRef) -> Result<(), String> {
 /// value when it was taken (this machine's clock). Kept [`crate::jobauth::NONCE_KEEP_MS`].
 pub(crate) const NONCE_PREFIX: &str = "job-nonce/";
 
-/// Who signed a dispatch ([`crate::jobauth`]). In a cluster with users a dispatch is signed, by a
-/// user this machine recognizes, for this machine, within [`crate::jobauth::MAX_SKEW_MS`] of its
-/// clock, with a nonce not seen in the day before. Without users an unsigned dispatch is taken,
-/// and a signed one is checked the same way but for who signed it.
+/// Who signed a dispatch ([`crate::jobauth`]): a user this machine recognizes, for this machine,
+/// within [`crate::jobauth::MAX_SKEW_MS`] of its clock, with a nonce not seen in the day before.
+/// Until the cluster has users there is no user to recognize, and every dispatch is refused.
 fn check_signed(sh: &Shared, spec: &JobSpec) -> Result<(), String> {
     let mesh = sh.cluster().map(|c| c.mesh());
-    let users = mesh.as_ref().is_some_and(|m| m.users_exist());
+    if !mesh.as_ref().is_some_and(|m| m.users_exist()) {
+        return Err(NO_USERS.into());
+    }
     if spec.auth.is_none() {
-        return match users {
-            true => Err("this cluster has users, so a dispatch is signed with a user's key, and this one is unsigned (the command line signs with the key at $POTLUCK_USER_KEY, or user.key beside its node.toml)".into()),
-            false => Ok(()),
-        };
+        return Err("this cluster has users, so a dispatch is signed with a user's key, and this one is unsigned (the command line signs with the key at $POTLUCK_USER_KEY, or user.key beside its node.toml)".into());
     }
     let now = now_ms();
     let node = sh.lock().node.clone();
     let auth = crate::jobauth::check_dispatch(spec, &node, now)
         .map_err(|e| format!("the dispatch's signature is refused: {e}"))?;
-    if users && !mesh.as_ref().is_some_and(|m| m.recognized_user(&auth.key)) {
+    if !mesh.as_ref().is_some_and(|m| m.recognized_user(&auth.key)) {
         return Err(format!(
             "the dispatch is signed with key {0}, which is no user of this cluster; a user adds it with `potluck user add NAME {0}`",
             auth.key
@@ -579,6 +577,9 @@ fn check_signed(sh: &Shared, spec: &JobSpec) -> Result<(), String> {
     }
     take_nonce(&mut sh.lock(), &auth.nonce, now)
 }
+
+/// Why a dispatch is refused in a cluster without users.
+const NO_USERS: &str = "this cluster has no users yet, and a machine takes only a dispatch a user signed: `potluck user init` makes the first user (on a machine in no cluster, it founds one)";
 
 /// Takes the nonce of a signed dispatch: refused when it was taken before (a replay).
 pub(crate) fn take_nonce(

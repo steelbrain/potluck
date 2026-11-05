@@ -64,6 +64,10 @@ pub struct Waits<'a> {
     /// lack their commits, it leaves them to a warm machine, or it is catching up with their
     /// owner). Each machine's plan is made without them, as the machine makes it.
     pub held_out: &'a BTreeMap<NodeName, BTreeSet<JobId>>,
+    /// The one machine that may run the job, when only one may (no user signed it: it was
+    /// queued before the cluster had users, and runs only where it was dispatched). The job is
+    /// explained on that machine alone.
+    pub only: Option<&'a str>,
 }
 
 /// [`explain`], knowing which machines can't take a queued job yet because their mirrors lack its
@@ -81,6 +85,7 @@ pub fn explain_synced(
             locality: &BTreeMap::new(),
             catch_up: &BTreeMap::new(),
             held_out: &BTreeMap::new(),
+            only: None,
         },
     )
 }
@@ -93,6 +98,7 @@ pub fn explain_waits(job: &str, snap: &Snapshot, waits: &Waits) -> WhyView {
         locality: waits.locality,
         catch_up: waits.catch_up,
         held_out: waits.held_out,
+        only: waits.only,
         lines: Vec::new(),
         blockers: Vec::new(),
     };
@@ -197,6 +203,7 @@ struct Why<'s, 'a> {
     locality: &'s BTreeMap<NodeName, String>,
     catch_up: &'s BTreeMap<NodeName, String>,
     held_out: &'s BTreeMap<NodeName, BTreeSet<JobId>>,
+    only: Option<&'s str>,
     lines: Vec<String>,
     blockers: Vec<Blocker>,
 }
@@ -317,13 +324,18 @@ impl Why<'_, '_> {
             n => self.line(format!("{n} jobs are ahead of it in the queue")),
         }
 
-        let machines: Vec<&MachineView> = match &q.workspace {
-            Some((_, node, _)) => snap
+        let machines: Vec<&MachineView> = match (self.only, &q.workspace) {
+            (Some(only), _) => snap
+                .machines
+                .iter()
+                .filter(|m| m.facts.node == only)
+                .collect(),
+            (None, Some((_, node, _))) => snap
                 .machines
                 .iter()
                 .filter(|m| m.facts.node == *node)
                 .collect(),
-            None => snap.machines.iter().collect(),
+            (None, None) => snap.machines.iter().collect(),
         };
         if machines.is_empty() {
             match &q.workspace {
@@ -366,7 +378,7 @@ impl Why<'_, '_> {
         if behind > 0 && behind + cannot.len() == machines.len() {
             self.line("no machine that could run it has its commits yet (the sync is behind)");
         }
-        if cannot.len() == machines.len() && q.workspace.is_none() {
+        if cannot.len() == machines.len() && q.workspace.is_none() && self.only.is_none() {
             self.nowhere(q, &machines);
         }
         for (node, reason) in cannot {

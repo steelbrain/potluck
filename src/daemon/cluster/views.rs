@@ -821,6 +821,9 @@ pub(crate) fn why(sh: &Shared, c: &Cluster, id: &str) -> Result<Response, String
         })
         .collect();
     let queued = (job.state == JobState::Queued).then(|| st.queued(&job));
+    // A job of this machine's that no user signed (queued before the cluster had users) runs here
+    // or nowhere: no other member takes it.
+    let home_only = queued.is_some() && owner_of(id) == st.node && job.spec.auth.is_none();
     if job.state.is_done() {
         jobs.push(job);
     }
@@ -837,8 +840,15 @@ pub(crate) fn why(sh: &Shared, c: &Cluster, id: &str) -> Result<Response, String
         locality: &locality,
         catch_up: &catch_up,
         held_out: &held_out,
+        only: home_only.then_some(st.node.as_str()),
     };
     let mut why = sh.parts.scheduler.explain_waits(id, &snap, &waits);
+    if home_only {
+        why.lines.push(format!(
+            "it was queued before the cluster had users, and no user signed it: only {}, where it was dispatched, may run it (`potluck cancel {id}` ends it)",
+            st.node
+        ));
+    }
     if let Some(p) = cs.endings.get(id) {
         why.lines.push(format!(
             "it ended on {} ({}); its kept files have not arrived ({}): it ends without them at {} at the latest",
@@ -849,7 +859,7 @@ pub(crate) fn why(sh: &Shared, c: &Cluster, id: &str) -> Result<Response, String
         ));
     }
     // The members that could run it and aren't up, and what then becomes of it.
-    if let Some(q) = queued {
+    if let Some(q) = queued.filter(|_| !home_only) {
         let machines = super::capable::machines(&st, Some((c, &cs)));
         for o in machines.capable_others(sh, &q) {
             if !matches!(o.away, super::capable::Away::Unknown) {

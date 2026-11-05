@@ -191,12 +191,14 @@ pub(super) fn claim(
     }
 }
 
+/// Why another machine never takes a job no user signed.
+pub(crate) const UNSIGNED: &str = "it was dispatched unsigned, before the cluster had users: only the machine it was dispatched on runs it";
+
 /// A member that asks for this machine's queued jobs, as this machine knows it: its pool from its
-/// admission (None: no member has that name), and whether the cluster has users.
+/// admission (None: no member has that name).
 pub(super) struct Taker {
     pub name: NodeName,
     pub pool: Option<String>,
-    pub users: bool,
 }
 
 impl Taker {
@@ -204,7 +206,6 @@ impl Taker {
         Taker {
             name: peer.to_string(),
             pool: mesh.pool_of(peer),
-            users: mesh.users_exist(),
         }
     }
 }
@@ -216,18 +217,15 @@ pub(super) fn may_take(j: &JobRecord, t: &Taker) -> bool {
     why_not_take(j, t).is_none()
 }
 
-/// Why member `t` may not take queued job `j`: it isn't in one of the job's pools; or the cluster
-/// has users and the job is unsigned (dispatched before the first user: only this machine, its
-/// owner, runs it). None when it may.
+/// Why member `t` may not take queued job `j`: it isn't in one of the job's pools; or the job is
+/// unsigned (dispatched before the cluster had users: only this machine, its owner, runs it). None
+/// when it may.
 pub(super) fn why_not_take(j: &JobRecord, t: &Taker) -> Option<String> {
     let Some(pool) = &t.pool else {
         return Some(format!("{} is not a member", t.name));
     };
-    if t.users && j.spec.auth.is_none() {
-        return Some(
-            "it was dispatched unsigned, before the cluster had users: only the machine it was dispatched on runs it"
-                .into(),
-        );
+    if j.spec.auth.is_none() {
+        return Some(UNSIGNED.into());
     }
     if !j.spec.runs_in(pool) {
         return Some(format!(
@@ -524,8 +522,12 @@ fn lose(
     };
     let pinned = j.spec.workspace.is_some();
     let rerun = j.spec.rerun_if_lost;
-    // Queued again only if a machine that is up can run it (the runner, lost, can't).
-    let nowhere = {
+    // Queued again only if a machine that is up can run it (the runner, lost, can't); one no user
+    // signed (granted before the cluster had users) is queued again here, where alone it runs,
+    // and kept there.
+    let nowhere = if j.spec.auth.is_none() {
+        None
+    } else {
         let q = st.queued(j);
         match capable::machines(st, Some((c, cs))).verdict(sh, &q) {
             capable::Verdict::Up => None,
@@ -894,10 +896,16 @@ pub(super) fn tick(sh: &Arc<Shared>, c: &Arc<Cluster>, now: Millis, boot: u64) {
         }
         cs.overdue = overdue;
         // Queued jobs (not pinned) that no machine up can run, and whose every capable machine is
-        // lost, end: they would wait for machines that may never come back.
+        // lost, end: they would wait for machines that may never come back. A job no user signed
+        // (queued before the cluster had users) runs only here, if ever, and is kept until it
+        // does or is cancelled.
         let machines = capable::machines(st, Some((c, &*cs)));
         for j in st.jobs.values() {
-            if owner_of(&j.id) != me || j.state != JobState::Queued || j.spec.workspace.is_some() {
+            if owner_of(&j.id) != me
+                || j.state != JobState::Queued
+                || j.spec.workspace.is_some()
+                || j.spec.auth.is_none()
+            {
                 continue;
             }
             if let capable::Verdict::Lost(why) = machines.verdict(sh, &st.queued(j)) {
@@ -1418,51 +1426,45 @@ mod tests {
         crate::daemon::runner::new_record("a-1".into(), spec, now())
     }
 
-    fn taker(pool: Option<&str>, users: bool) -> Taker {
+    fn taker(pool: Option<&str>) -> Taker {
         Taker {
             name: "b".into(),
             pool: pool.map(str::to_string),
-            users,
         }
     }
 
     /// A member takes a queued job (sees it, fetches its repositories, is granted it) only in one
-    /// of the job's pools; once the cluster has users, only a signed one.
+    /// of the job's pools, and only a signed one (not one queued before the cluster had users).
     #[test]
-    fn a_member_takes_only_jobs_for_its_pool_and_signed_once_there_are_users() {
+    fn a_member_takes_only_signed_jobs_for_its_pool() {
         let cases = [
-            (queued(&[], false, &[]), taker(Some("default"), false), None),
-            (queued(&[], true, &[]), taker(Some("default"), true), None),
+            (queued(&[], true, &[]), taker(Some("default")), None),
             (
                 queued(&[], false, &[]),
-                taker(Some("default"), true),
+                taker(Some("default")),
                 Some(
                     "it was dispatched unsigned, before the cluster had users: only the machine it was dispatched on runs it",
                 ),
             ),
             (
                 queued(&[], true, &[]),
-                taker(Some("cloud"), true),
+                taker(Some("cloud")),
                 Some("it runs in pool default, and b is in pool cloud"),
             ),
-            (
-                queued(&["cloud"], true, &[]),
-                taker(Some("cloud"), true),
-                None,
-            ),
+            (queued(&["cloud"], true, &[]), taker(Some("cloud")), None),
             (
                 queued(&["cloud", "gpu"], true, &[]),
-                taker(Some("default"), true),
+                taker(Some("default")),
                 Some("it runs in pools cloud, gpu, and b is in pool default"),
             ),
             (
                 queued(&["default", "cloud"], true, &[]),
-                taker(Some("default"), true),
+                taker(Some("default")),
                 None,
             ),
             (
                 queued(&[], true, &[]),
-                taker(None, true),
+                taker(None),
                 Some("b is not a member"),
             ),
         ];
