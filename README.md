@@ -10,7 +10,7 @@ It is written to be driven by scripts and coding agents. Every command takes `--
 prompts. A dispatch with `--key` is idempotent. Jobs keep running when the client that dispatched
 them exits, and `potluck why` says what a queued job is waiting for and who holds it.
 
-potluck is at version 0.1.1.
+potluck is at version 0.1.2.
 
 ## What it leaves to projects
 
@@ -50,7 +50,7 @@ This installs the latest release, or a given version:
 
 ```sh
 curl -fsSL https://github.com/steelbrain/potluck/releases/latest/download/install.sh | sh
-curl -fsSL https://github.com/steelbrain/potluck/releases/latest/download/install.sh | sh -s -- 0.1.1
+curl -fsSL https://github.com/steelbrain/potluck/releases/latest/download/install.sh | sh -s -- 0.1.2
 ```
 
 `install.sh` checks the binary against the release's `SHA256SUMS`, installs it as
