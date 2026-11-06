@@ -3275,12 +3275,29 @@ fn status_lists_a_job_where_it_runs_now_not_where_a_lost_member_said() {
     d.done(&job);
 }
 
+/// The version after the potluck the tests run: its patch number plus one.
+fn above_this_version() -> String {
+    let mut parts: Vec<u64> = env!("CARGO_PKG_VERSION")
+        .split('.')
+        .map(|p| p.parse().unwrap())
+        .collect();
+    *parts.last_mut().unwrap() += 1;
+    parts
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
 /// A member on a newer version makes the older one update itself, from a local test release;
 /// `self-update` answers first, then updates.
 #[test]
 fn a_newer_member_makes_the_older_update() {
     let w = World::new();
-    let server = release::Server::start(&release::files("0.1.1"));
+    // Newer than the potluck the test runs (an update never installs an older one) and than the
+    // nodes' TEST_VERSION.
+    let newer = above_this_version();
+    let server = release::Server::start(&release::files(&newer));
     // The binary the older machine replaces: a stand-in that answers --version.
     let bin = w.dir.path().join("bin/potluck");
     std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
@@ -3308,14 +3325,20 @@ fn a_newer_member_makes_the_older_update() {
     let mut b = w.node("b").start();
     pair(&a, &b);
     b.stop();
-    b.version = "0.1.1".into();
+    b.version = newer.clone();
     b.start();
-    wait_until("a updated itself to 0.1.1", || {
-        asked.lock().unwrap().contains(&Some("0.1.1".into()))
+    wait_until(&format!("a updated itself to {newer}"), || {
+        asked.lock().unwrap().contains(&Some(newer.clone()))
     });
     let out = Command::new(&bin).arg("--version").output().unwrap();
-    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "potluck 0.1.1");
-    assert!(a.daemon_log().contains("UPDATING: b runs potluck 0.1.1"));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        format!("potluck {newer}")
+    );
+    assert!(
+        a.daemon_log()
+            .contains(&format!("UPDATING: b runs potluck {newer}"))
+    );
     // They refuse each other: neither counts the other as up (a's daemon still runs 0.1.0).
     let up = |n: &Node, other: &str| {
         n.cli_ok(&["nodes"])["nodes"]
@@ -3327,8 +3350,9 @@ fn a_newer_member_makes_the_older_update() {
     assert!(!up(&a, "b") && !up(&b, "a"));
     // b logs a's version when the two first meet, which may come after a's update.
     wait_until("b logged a's older version", || {
-        b.daemon_log()
-            .contains("a runs potluck 0.1.0, older than this machine's 0.1.1")
+        b.daemon_log().contains(&format!(
+            "a runs potluck 0.1.0, older than this machine's {newer}"
+        ))
     });
     std::thread::sleep(Duration::from_millis(500));
     assert_eq!(asked.lock().unwrap().len(), 1, "once per version");
