@@ -561,6 +561,15 @@ pub enum Handle {
         #[serde(default)]
         boot: String,
     },
+    /// Windows: a named job object holding the supervisor and everything it starts.
+    JobObject {
+        /// The job object's name in this session's namespace, new for every run (a job can come
+        /// back to a machine it ran on), and unique to the state directory.
+        name: String,
+        /// The invocation's status file, where its supervisor also records an ending over the
+        /// job's RAM limit and the job's last usage.
+        status: std::path::PathBuf,
+    },
 }
 
 /// The latest resource sample of a running invocation.

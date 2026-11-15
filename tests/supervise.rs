@@ -1,9 +1,10 @@
-//! `potluck _supervise` as its own process, for what needs a whole process: its signal handling.
-//! Its stdout is a log file, as the executors arrange.
+//! `potluck _supervise` as its own process, for what needs a whole process: its signal handling
+//! (on Windows, its console control handling). Its stdout is a log file, as the executors arrange.
 
 mod common;
 
 use potluck::types::ExitStatus;
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -41,6 +42,7 @@ fn wait_for(what: &str, mut f: impl FnMut() -> bool) {
 
 /// SIGTERM to the supervisor alone (as `systemctl kill` or the macOS executor send it to every
 /// process of the job) doesn't end it: the command runs on and its exit code is recorded.
+#[cfg(unix)]
 #[test]
 fn a_term_to_the_supervisor_alone_is_survived() {
     let dir = tempfile::tempdir().unwrap();
@@ -69,6 +71,7 @@ fn a_term_to_the_supervisor_alone_is_survived() {
 /// A SIGTERM that reaches the supervisor before its command exists (the macOS executor starts it
 /// with these signals blocked, so one sent right after the start waits) is passed on to the
 /// command once it runs, and recorded as what ended it.
+#[cfg(unix)]
 #[test]
 fn a_term_before_the_command_starts_is_passed_on() {
     let dir = tempfile::tempdir().unwrap();
@@ -91,6 +94,45 @@ fn a_term_before_the_command_starts_is_passed_on() {
     assert_eq!(exit.code(), Some(128 + libc::SIGTERM));
     let s = status(dir.path());
     assert_eq!((s.code, s.signal), (None, Some(libc::SIGTERM)));
+}
+
+/// CTRL_BREAK to the supervisor's process group alone (a process of the job can send it to the
+/// whole console) doesn't end it: the command runs on and its exit code is recorded. Skipped
+/// where this test has no console to share with it.
+#[cfg(windows)]
+#[test]
+fn a_ctrl_break_to_the_supervisor_alone_is_survived() {
+    use std::os::windows::process::CommandExt;
+    use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent};
+    use windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP;
+    let dir = tempfile::tempdir().unwrap();
+    let go = dir.path().join("go");
+    let script = format!(
+        "echo started; while [ ! -e '{}' ]; do sleep 0.02; done; exit 7",
+        go.display().to_string().replace('\\', "/")
+    );
+    let mut child = supervisor(dir.path(), &script)
+        .creation_flags(CREATE_NEW_PROCESS_GROUP)
+        .spawn()
+        .unwrap();
+    let log = dir.path().join("out.log");
+    wait_for("the command to start", || {
+        std::fs::read_to_string(&log).is_ok_and(|l| l.contains("started"))
+    });
+    // SAFETY: plain call; the group is the supervisor's alone (its command has one of its own).
+    let sent = unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, child.id()) } != 0;
+    if !sent {
+        eprintln!(
+            "skipped: no console to send CTRL_BREAK on ({})",
+            std::io::Error::last_os_error()
+        );
+    }
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(child.try_wait().unwrap().is_none(), "the supervisor ended");
+    std::fs::write(&go, "").unwrap();
+    let exit = child.wait().unwrap();
+    assert_eq!(exit.code(), Some(7));
+    assert_eq!(status(dir.path()).code, Some(7));
 }
 
 /// `--log-max` keeps the first bytes and the last 16 MiB, whatever the command writes.

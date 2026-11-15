@@ -103,13 +103,16 @@ day), and every dispatch while the cluster has no users.
 `--timeout` is required, on the command line or in the recipe. Durations need units: `600s`, `5m`,
 `2h5m10s`; a bare `600` is refused. At the limit every process of the job gets SIGTERM, then
 SIGKILL after `kill_grace_s` (10 seconds) of the machine being awake: time asleep gives the job no
-time to shut down. Processes that can't die don't keep the job's resources: those are released
+time to shut down. On Windows the command and the processes in its console process group get
+CTRL_BREAK in place of SIGTERM, and every process of the job is ended (`TerminateJobObject`) in
+place of SIGKILL. Processes that can't die don't keep the job's resources: those are released
 anyway, and `status` and `why` list the stuck pids.
 
 A job that uses under 1% of one CPU core and writes no output for `stall_minutes` (10) is marked
-stalled, and the stacks of its processes go into its log. `--kill-on-stall` ends it then. A thread
-that wakes now and then to poll doesn't keep a job from stalling. Time the machine spends asleep
-doesn't count toward a stall; it does count toward the run limit.
+stalled, and the stacks of its processes go into its log (on Windows, where potluck doesn't sample
+stacks, a list of its processes with their image, threads and CPU time). `--kill-on-stall` ends it
+then. A thread that wakes now and then to poll doesn't keep a job from stalling. Time the machine
+spends asleep doesn't count toward a stall; it does count toward the run limit.
 
 ## Resources
 
@@ -122,7 +125,9 @@ A job gets everything it asks for at once, or waits, so jobs can't deadlock on e
   them only as far as every slice above the unit has them too, and systemd sets none on
   `user.slice` or a user's manager unless root configures it.) On Linux the limit is the job's
   systemd unit's `MemoryMax`, with `MemorySwapMax=0`; on macOS potluck sums the memory
-  footprint of the job's processes and kills them over the limit. The job then ends as
+  footprint of the job's processes and kills them over the limit. On Windows the limit is the
+  commit limit of the job's job object: an allocation that would take the memory its processes
+  have committed past it fails, and potluck ends every process of the job. The job then ends as
   "over memory: used X of its Y" (`used 300 MiB of its 256 MiB`, `used 4.2 GiB of its 4 GiB`). On
   Linux, a job whose process the kernel's OOM killer or systemd-oomd ends while the machine runs
   short of memory, with the job under its own limit, fails as "killed because the machine ran
@@ -131,7 +136,7 @@ A job gets everything it asks for at once, or waits, so jobs can't deadlock on e
   counts as over memory: that systemd keeps no memory peak for an ended unit to tell the two
   apart by.
 - `--cpu N`: a weight in cores (default 1) that never keeps a job from starting. On Linux it sets
-  the unit's `CPUWeight` to 100 per core; on macOS it has no effect.
+  the unit's `CPUWeight` to 100 per core; on macOS and Windows it has no effect.
 - `--gpu SEL`, repeatable: one GPU each, held only by this job until it ends. A selector is `any`,
   a vendor (`nvidia`, `amd`, `intel`, `apple`, or a PCI vendor id such as `10de`), `vendor:device`
   in hex (`10de:2c19`), a GPU id from `potluck nodes` (`10de:2c19@0000:01:00.0` on Linux and
@@ -155,8 +160,9 @@ job studio-41 now asks for 2 GiB of RAM, not 16 GiB; it keeps its place in the q
 `peak memory 1.2 GiB of the 16 GiB it reserved`. On Linux that is the larger of the peak the
 kernel counted for the job's unit (`memory.peak`, from Linux 5.19) and potluck's samples, taken
 every half second; on macOS it is the largest sample of the memory footprint of the job's
-processes, so a climb between two samples can be missed. A job that ended before its first sample
-has no peak, and `why` gives none.
+processes, so a climb between two samples can be missed; on Windows it is the peak commit the
+job's job object counted (`PeakJobMemoryUsed`). A job that ended before its first sample has no
+peak, and `why` gives none.
 
 A job may have at most 16384 processes. On Linux that is its unit's `TasksMax`, which counts
 threads too, and a fork past it fails. On macOS it counts processes, potluck's supervisor
@@ -167,12 +173,14 @@ as failed, killed by SIGKILL (exit code 137): "too many processes: 5334, over it
 RLIMIT_NPROC holds it back: it starts at the user's process count plus the job's limit. macOS
 counts that limit per user, not per job, so other processes of the same user, other jobs
 included, take from the job's room while it runs: a job can be refused forks (EAGAIN) below its
-own limit when the user's other processes grow.
+own limit when the user's other processes grow. On Windows it is the job object's limit on active
+processes, which counts processes, potluck's supervisor included; starting a process past it
+fails.
 
 A job's limits on open files are the daemon's. At start the daemon raises its soft limit to its
 hard limit (on macOS at most `kern.maxfilesperproc`), and a job gets both: on macOS by
 inheriting them, on Linux as its unit's `LimitNOFILE`, in place of the user manager's default
-soft limit of 1024.
+soft limit of 1024. On Windows potluck sets no limit on open files.
 
 Processes a job hands to another service, such as containers run by `dockerd`, are outside the
 job: they are neither counted nor killed. On Linux a process of the job can also leave the job's
@@ -184,7 +192,8 @@ does, still counts as the job's if it was started with the job's `POTLUCK_LEASE`
 environment, a token potluck makes for each run of a job. That is best effort: macOS doesn't show
 the environment of its own programs, such as those in `/bin` and `/usr/bin`, so a daemon that is
 one of those programs, or one started with a cleared environment (`env -i`), is neither counted
-nor killed.
+nor killed. On Windows no process can leave the job object potluck runs a job in; a process that
+a service starts for the job, such as one the Task Scheduler runs, is outside it.
 
 ## Where it runs
 
@@ -298,33 +307,37 @@ directory, and are deleted with the job's other files after `retention_days`. On
 the `.ips` files that ReportCrash writes to `~/Library/Logs/DiagnosticReports`, moved from there
 when the crashed process, or its parent, was one of the job's. On Linux, when systemd-coredump
 recorded core dumps of the job's unit, the output of `coredumpctl info` for them is saved there as
-`coredumps.txt`; the dumps themselves stay where systemd-coredump keeps them.
+`coredumps.txt`; the dumps themselves stay where systemd-coredump keeps them. On Windows there are
+none: a process of a job that crashes ends at once, with no error report, and its exit code is
+the exception's code (0xC0000005 for an access violation).
 
 ## Output
 
 A job's stdout and stderr go through one pipe into its output log, `jobs/<job>/output.log` in
 the state directory of the machine that runs it, which streams it to the dispatching machine as
-it grows; stdin is `/dev/null`. `> /dev/stdout`, `2>/dev/stdout` and `tee /dev/stdout` in a job
-write to the pipe and never cut the log short. When the command exits, potluck reads
-what is left in the pipe before it records the exit status, so `wait` and `logs` end with all of
-it. Processes the command left running are read for at most one more second, while they keep
-writing; then potluck records the status and ends them.
+it grows; stdin is `/dev/null` (`NUL` on Windows). `> /dev/stdout`, `2>/dev/stdout` and
+`tee /dev/stdout` in a job write to the pipe and never cut the log short. When the command exits,
+potluck reads what is left in the pipe before it records the exit status, so `wait` and `logs` end
+with all of it. Processes the command left running are read for at most one more second, while
+they keep writing; then potluck records the status and ends them.
 
 A log keeps the first `log_max_mib` MiB of a job's output (1024 unless the config of the machine
 running the job says otherwise). Then a line says so, and the rest is dropped except its last
 16 MiB, which come at the end after a line saying how many bytes were dropped. The job runs on,
 and what it writes still counts as output for stall checks. potluck holds those 16 MiB in memory,
-counted in the job's RAM, and writes them out early when the job gets SIGTERM (at its run limit,
-or on `cancel`), so they outlast a SIGKILL after it. A job killed outright with SIGKILL, as one
-over its RAM limit can be, loses them.
+counted in the job's RAM, and writes them out early when the job gets SIGTERM, or CTRL_BREAK on
+Windows (at its run limit, or on `cancel`), so they outlast a SIGKILL after it. A job killed
+outright with SIGKILL, as one over its RAM limit can be on Linux and macOS, loses them.
 
 `logs --json` writes its document as the output arrives, so a log of any size takes little
 memory.
 
 ## How a job ends
 
-`potluck wait` exits with the job's own exit code, or 128 + N when signal N killed it. Endings
-potluck causes have fixed codes:
+`potluck wait` exits with the job's own exit code, or 128 + N when signal N killed it. On Windows
+the exit code is the command's own 32-bit code: a command that CTRL_BREAK ends exits with
+0xC000013A, which `status` and `why` show as -1073741510. Endings potluck causes have fixed
+codes:
 
 | Code | Ending |
 | --- | --- |
@@ -396,7 +409,9 @@ foreground, at the top of the repository (where a dispatch from outside would ru
 `dispatch` exits with its code. It runs in a process group of its own. At its `--timeout`, every
 process in that group gets SIGTERM, then SIGKILL after `kill_grace_s`, and `dispatch` exits
 with 124. A process that left the group (with `setsid`, for example) is not stopped then; it ends
-with the job, as do processes the command leaves running when it exits. Its environment is the job's
+with the job, as do processes the command leaves running when it exits. On Windows the group is a
+console process group with a job object of its own: CTRL_BREAK goes to the console process group,
+and every process in the job object is ended after `kill_grace_s`. Its environment is the job's
 with the request's env on top and without the variables it unsets (`--unset-env`, a recipe's
 `unset_env`), except potluck's own variables, which stay the job's. A request that
 doesn't fit fails at once with exit code 2, and so does one with `--keep`, `--hold`, `--key`,

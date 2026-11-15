@@ -188,6 +188,10 @@ pub enum Command {
         /// last 16 MiB (see [`crate::supervise`]). Without it, the log keeps everything.
         #[arg(long, value_name = "BYTES")]
         log_max: Option<u64>,
+        /// Windows: the job object the supervisor runs in, which the executor made for this run
+        /// (see [`crate::supervise`]).
+        #[arg(long, value_name = "NAME")]
+        job: Option<String>,
         status: PathBuf,
         #[arg(last = true, required = true)]
         cmd: Vec<String>,
@@ -433,11 +437,13 @@ pub fn main() -> i32 {
             status,
             env_file,
             log_max,
+            job,
             cmd,
         } => Some(crate::supervise::run(
             status,
             env_file.as_deref(),
             *log_max,
+            job.as_deref(),
             cmd,
         )),
         Command::Daemon => Some(daemon()),

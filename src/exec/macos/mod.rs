@@ -209,7 +209,7 @@ fn job_of(handle: &Handle) -> anyhow::Result<Job<'_>> {
             tag: lease,
             boot,
         }),
-        Handle::Systemd { .. } => anyhow::bail!("a systemd handle on macOS"),
+        other => anyhow::bail!("not a macOS handle: {other:?}"),
     }
 }
 
@@ -556,7 +556,7 @@ impl Executor for ProcessExecutor {
         if let Some(dir) = &self.reports_dir {
             let gone: HashMap<Key, u64> = match handle {
                 Handle::Process { gone, .. } => gone.iter().map(|&(p, s, t)| ((p, s), t)).collect(),
-                Handle::Systemd { .. } => HashMap::new(),
+                _ => HashMap::new(),
             };
             crash::move_reports(dir, job.leader.1, job.tracked, &gone, crash_dir)?;
         }

@@ -6,9 +6,11 @@ use crate::cli::DispatchArgs;
 use crate::config::{NodeConfig, Paths};
 use crate::recipe::{ProjectFile, Resolved};
 use crate::types::{Gpu, Grant, Request, fmt_ms};
+#[cfg(unix)]
 use std::os::fd::AsFd;
 use std::path::Path;
 use std::process::{Command, Stdio};
+#[cfg(unix)]
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -265,6 +267,7 @@ pub fn top_of(cwd: &Path) -> std::path::PathBuf {
 /// stdout for its one document). It runs in a process group of its own, which is ended at its
 /// run limit like a job: SIGTERM to every process in it, SIGKILL to what is left `grace` later
 /// (the machine's `kill_grace_s`), exit 124. Returns its exit code (128 + signal when killed).
+#[cfg(unix)]
 pub fn run_in_place(
     r: &Resolved,
     cwd: &Path,
@@ -327,7 +330,71 @@ pub fn run_in_place(
         .unwrap_or_else(|| 128 + status.signal().unwrap_or(0)))
 }
 
+/// As on Unix, with Windows' process groups ([`crate::sys::Group`]): the command runs in a
+/// console process group and a job object of its own; at its run limit the group gets
+/// CTRL_BREAK, and what is left of the job `grace` later is ended (exit 124).
+#[cfg(windows)]
+pub fn run_in_place(
+    r: &Resolved,
+    cwd: &Path,
+    stdout_to_stderr: bool,
+    grace: Duration,
+) -> anyhow::Result<i32> {
+    use std::os::windows::io::{AsHandle, AsRawHandle};
+    use windows_sys::Win32::Foundation::WAIT_TIMEOUT;
+    use windows_sys::Win32::System::Threading::WaitForSingleObject;
+    let (prog, args) = r
+        .cmd
+        .split_first()
+        .ok_or_else(|| anyhow::anyhow!("no command to run"))?;
+    let mut cmd = Command::new(prog);
+    let env = r
+        .env
+        .iter()
+        .filter(|(k, _)| !crate::daemon::is_job_variable(k));
+    cmd.args(args).current_dir(cwd).envs(env);
+    for k in &r.unset_env {
+        cmd.env_remove(k);
+    }
+    if stdout_to_stderr {
+        let err = std::io::stderr().as_handle().try_clone_to_owned()?;
+        cmd.stdout(Stdio::from(err));
+    }
+    let mut group = crate::sys::Group::spawn(&mut cmd)
+        .map_err(|e| anyhow::anyhow!("could not start {prog}: {e}"))?;
+    let child = group.child().as_raw_handle();
+    let deadline = std::time::Instant::now() + Duration::from_millis(r.timeout_ms);
+    let timed_out = loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        // Below INFINITE (u32::MAX ms); a longer limit takes more than one wait.
+        let ms = u32::try_from(left.as_millis()).map_or(u32::MAX - 1, |ms| ms.min(u32::MAX - 1));
+        // SAFETY: the child's process handle, valid until it is waited for below.
+        if unsafe { WaitForSingleObject(child, ms) } != WAIT_TIMEOUT {
+            break false;
+        }
+        if left.is_zero() {
+            break true;
+        }
+    };
+    if !timed_out {
+        let status = group.child().wait()?;
+        return Ok(status.code().unwrap_or(1));
+    }
+    group.interrupt();
+    // The grace is the whole group's, as on Unix.
+    let until = std::time::Instant::now() + grace;
+    while group.alive() && std::time::Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    if group.alive() {
+        group.kill();
+    }
+    let _ = group.child().wait();
+    Ok(crate::types::EXIT_TIMEOUT)
+}
+
 /// Whether process group `pgid` has a process left.
+#[cfg(unix)]
 fn group_alive(pgid: libc::pid_t) -> bool {
     // SAFETY: kill(2) with signal 0 only checks that the group exists and may be signalled.
     let rc = unsafe { libc::kill(-pgid, 0) };

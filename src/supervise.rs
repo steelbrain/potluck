@@ -1,5 +1,5 @@
-//! `potluck _supervise [--env-file FILE] [--log-max BYTES] STATUS -- CMD...`: the first process of
-//! every invocation.
+//! `potluck _supervise [--env-file FILE] [--log-max BYTES] [--job NAME] STATUS -- CMD...`: the
+//! first process of every invocation.
 //!
 //! Its stdout and stderr are the invocation's log, opened for appending by the executor. It starts
 //! CMD in a process group of its own, with stdin inherited (/dev/null) and stdout and stderr on one
@@ -43,18 +43,48 @@
 //! not that worked. An executor passes the environment this way when a command line would show it
 //! to other users (`/proc/PID/cmdline` is readable by everyone). A FILE that can't be read ends the
 //! invocation with 126 and the reason in the log.
+//!
+//! **On Windows** (`supervise::windows`) there are no signals and no `--env-file` (no other user can read a
+//! process's environment there, so the executor gives the supervisor the job's environment as its
+//! own, and CMD inherits it). CMD starts with stdin NUL, in a console process group and a job
+//! object of its own ([`crate::sys::Group`]), on the supervisor's console, which the executor
+//! makes hidden. With `--job NAME` the supervisor runs in the job object NAME, which the executor
+//! made for the invocation:
+//!
+//! - **Stopping.** The executor asks for a stop by setting the event `NAME.stop`; the supervisor
+//!   then writes the held tail of dropped output (as the first SIGTERM does on Unix) and sends
+//!   CTRL_BREAK to CMD's process group. CTRL_C and CTRL_BREAK don't end the supervisor itself,
+//!   so it records how CMD ended. A stop asked before CMD exists reaches it once it does.
+//! - **RAM.** The job object's commit limit makes an allocation past it fail. The supervisor
+//!   watches the job's completion port, and when the job reaches its limit it ends CMD and every
+//!   process it started, and records that in STATUS ([`JobStatus`]), with the job's peak memory
+//!   and CPU time.
+//! - **The end** is as on Unix: what is left in the pipe is read, for at most a second while
+//!   processes CMD left keep writing, before STATUS is written.
+
+#[cfg(windows)]
+mod windows;
 
 use crate::types::{ExitStatus, now_ms};
+use serde::{Deserialize, Serialize};
+#[cfg(unix)]
 use std::collections::BTreeMap;
+#[cfg(unix)]
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::Write;
+#[cfg(unix)]
 use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
+#[cfg(unix)]
 use std::os::unix::ffi::OsStringExt;
+#[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
+#[cfg(unix)]
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::Path;
+#[cfg(unix)]
 use std::process::Command;
+#[cfg(unix)]
 use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
@@ -70,14 +100,40 @@ const CHECK_EVERY: Duration = Duration::from_millis(250);
 /// The most read from the pipe at once.
 const READ_BUF: usize = 64 << 10;
 /// The signals that end an invocation, which the supervisor outlives.
+#[cfg(unix)]
 const ENDING_SIGNALS: [i32; 3] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
 
+/// What the supervisor writes to STATUS on Windows: the [`ExitStatus`] fields, which are all an
+/// `ExitStatus` reader takes, then what only the supervisor can tell once the job object is gone.
+/// A field at its default isn't written.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobStatus {
+    #[serde(flatten)]
+    pub exit: ExitStatus,
+    /// An allocation in the job failed at the job object's commit limit (its RAM), and the
+    /// supervisor ended the command and what it started.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub over_memory: bool,
+    /// The job object's peak commit (PeakJobMemoryUsed) when the command ended; 0: unknown.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub peak_mem_bytes: u64,
+    /// The CPU time of every process the job object ever held, when the command ended.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cpu_ms: u64,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
 /// The ending signals the supervisor has caught.
+#[cfg(unix)]
 struct Signals {
     count: AtomicUsize,
     last: AtomicI32,
 }
 
+#[cfg(unix)]
 impl Signals {
     const fn new() -> Signals {
         Signals {
@@ -88,18 +144,26 @@ impl Signals {
 }
 
 /// The process's: its handler counts here.
+#[cfg(unix)]
 static SIGNALS: Signals = Signals::new();
 /// The write end of the process's [`Wake`] pipe, for the handler; -1 when there is none.
+#[cfg(unix)]
 static WAKE_FD: AtomicI32 = AtomicI32::new(-1);
 
 /// Runs CMD as the invocation's first process (the entry point of `_supervise`): its output goes
-/// to this process's stdout.
+/// to this process's stdout. `job` names the Windows job object it runs in; there is none on
+/// Unix.
+#[cfg(unix)]
 pub fn run(
     status: &Path,
     env_file: Option<&Path>,
     log_max: Option<u64>,
+    job: Option<&str>,
     cmd: &[String],
 ) -> anyhow::Result<i32> {
+    if job.is_some() {
+        anyhow::bail!("--job names a Windows job object, and this system has none");
+    }
     let wake = Wake::new()?;
     WAKE_FD.store(wake.w.as_raw_fd(), Ordering::SeqCst);
     install_handlers()?;
@@ -114,6 +178,24 @@ pub fn run(
     result
 }
 
+/// Runs CMD as the invocation's first process (the entry point of `_supervise`): its output goes
+/// to this process's stdout. With `job`, in the job object of that name (`supervise::windows`).
+#[cfg(windows)]
+pub fn run(
+    status: &Path,
+    env_file: Option<&Path>,
+    log_max: Option<u64>,
+    job: Option<&str>,
+    cmd: &[String],
+) -> anyhow::Result<i32> {
+    if env_file.is_some() {
+        anyhow::bail!(
+            "--env-file is not used on Windows: the command gets the supervisor's environment"
+        );
+    }
+    windows::run(status, log_max, job, cmd)
+}
+
 /// How much output the log keeps: the first `max` bytes (0: all of it), then the last `tail`.
 #[derive(Clone, Copy)]
 struct Limit {
@@ -123,6 +205,7 @@ struct Limit {
 
 /// Runs CMD with its output copied to `out`. `signals` counts the ending signals caught (the
 /// handler wakes `wake` for each).
+#[cfg(unix)]
 fn supervise(
     mut out: File,
     status: &Path,
@@ -231,7 +314,7 @@ const STATUS_PATIENCE: Duration = Duration::from_secs(60);
 /// how the command ended, and until STATUS is written the daemon sees the invocation running.
 /// (Setting room aside for it doesn't work: on a full APFS volume even overwriting a file's own
 /// bytes can fail.)
-fn write_status(status: &Path, record: &ExitStatus) -> anyhow::Result<()> {
+fn write_status(status: &Path, record: &impl Serialize) -> anyhow::Result<()> {
     let bytes = serde_json::to_vec(record)?;
     let tmp = status.with_extension("json.tmp");
     let since = Instant::now();
@@ -239,10 +322,7 @@ fn write_status(status: &Path, record: &ExitStatus) -> anyhow::Result<()> {
     loop {
         match std::fs::write(&tmp, &bytes).and_then(|()| std::fs::rename(&tmp, status)) {
             Ok(()) => return Ok(()),
-            Err(e)
-                if matches!(e.raw_os_error(), Some(libc::ENOSPC | libc::EDQUOT))
-                    && since.elapsed() < STATUS_PATIENCE =>
-            {
+            Err(e) if no_space(&e) && since.elapsed() < STATUS_PATIENCE => {
                 if !told {
                     // Not eprintln: it panics when stderr can't be written, as on this full disk.
                     let _ = writeln!(
@@ -266,9 +346,26 @@ fn write_status(status: &Path, record: &ExitStatus) -> anyhow::Result<()> {
     }
 }
 
+/// Whether `e` says the disk, or the user's quota on it, is full.
+fn no_space(e: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    return matches!(e.raw_os_error(), Some(libc::ENOSPC | libc::EDQUOT));
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{
+            ERROR_DISK_FULL, ERROR_DISK_QUOTA_EXCEEDED, ERROR_HANDLE_DISK_FULL,
+        };
+        matches!(
+            e.raw_os_error().map(|c| c as u32),
+            Some(ERROR_DISK_FULL | ERROR_HANDLE_DISK_FULL | ERROR_DISK_QUOTA_EXCEEDED)
+        )
+    }
+}
+
 /// Writes `env` for `--env-file` to a new file at `path` that only this user can read: each
 /// `KEY=VALUE` ended by a NUL byte. A file already at `path` is replaced. Keys must be non-empty
 /// and hold no `=` or NUL, values no NUL.
+#[cfg(unix)]
 pub fn write_env_file(path: &Path, env: &BTreeMap<String, String>) -> std::io::Result<()> {
     let mut bytes = Vec::new();
     for (key, value) in env {
@@ -300,6 +397,7 @@ pub fn write_env_file(path: &Path, env: &BTreeMap<String, String>) -> std::io::R
 }
 
 /// Reads an env file and removes it, also when reading fails.
+#[cfg(unix)]
 fn read_env_file(path: &Path) -> std::io::Result<Vec<(OsString, OsString)>> {
     let read = std::fs::read(path);
     let removed = std::fs::remove_file(path);
@@ -323,11 +421,13 @@ fn read_env_file(path: &Path) -> std::io::Result<Vec<(OsString, OsString)>> {
 
 /// Wakes the copy loop: for each signal caught, and when the command exits (SIGCHLD).
 /// Both ends are non-blocking, so the handler never waits on a full pipe.
+#[cfg(unix)]
 struct Wake {
     r: OwnedFd,
     w: OwnedFd,
 }
 
+#[cfg(unix)]
 impl Wake {
     fn new() -> std::io::Result<Wake> {
         let (r, w) = std::io::pipe()?;
@@ -352,6 +452,7 @@ impl Wake {
     }
 }
 
+#[cfg(unix)]
 fn set_nonblocking(fd: RawFd) -> std::io::Result<()> {
     // SAFETY: F_GETFL and F_SETFL on a descriptor the caller owns.
     unsafe {
@@ -377,6 +478,7 @@ fn errno_ptr() -> *mut libc::c_int {
 
 /// Counts an ending signal and wakes the copier. Async-signal-safe: atomics and write(2), and
 /// errno is left as it was.
+#[cfg(unix)]
 extern "C" fn on_signal(sig: libc::c_int) {
     let errno = errno_ptr();
     // SAFETY: errno_ptr points at this thread's errno.
@@ -393,6 +495,7 @@ extern "C" fn on_signal(sig: libc::c_int) {
 }
 
 /// Wakes the copy loop when the command exits. Async-signal-safe, errno kept.
+#[cfg(unix)]
 extern "C" fn on_child(_sig: libc::c_int) {
     let errno = errno_ptr();
     // SAFETY: errno_ptr points at this thread's errno.
@@ -409,6 +512,7 @@ extern "C" fn on_child(_sig: libc::c_int) {
 /// Catches the ending signals (a caught signal is reset to its default by exec, so the command
 /// gets the default handling) and SIGCHLD, then lets through any ending signal the executor held
 /// back until now.
+#[cfg(unix)]
 fn install_handlers() -> std::io::Result<()> {
     // SAFETY: plain sigaction and sigset calls on local, initialized values; the handler is
     // async-signal-safe.
@@ -442,6 +546,7 @@ fn install_handlers() -> std::io::Result<()> {
 /// all: a thread that can't be created (process limits) must not cost the status. `seen` is how
 /// many signals had been caught before the command started: the first one after that which finds
 /// dropped output adds its tail at once.
+#[cfg(unix)]
 fn copy(
     pipe: &OwnedFd,
     wake: &Wake,
@@ -514,6 +619,7 @@ fn copy(
 
 /// After the command has exited: reads what is in the pipe until it is empty or at its end, or
 /// for at most [`DRAIN_LIMIT`] while processes it left keep writing.
+#[cfg(unix)]
 fn drain(pipe: &OwnedFd, sink: &mut Sink, buf: &mut [u8]) {
     let until = Instant::now() + DRAIN_LIMIT;
     loop {
@@ -542,6 +648,7 @@ fn drain(pipe: &OwnedFd, sink: &mut Sink, buf: &mut [u8]) {
 }
 
 /// Whether the pipe has data, without waiting.
+#[cfg(unix)]
 fn read_ready(pipe: &OwnedFd) -> bool {
     let mut fd = libc::pollfd {
         fd: pipe.as_raw_fd(),
@@ -552,6 +659,7 @@ fn read_ready(pipe: &OwnedFd) -> bool {
     unsafe { libc::poll(&raw mut fd, 1, 0) > 0 && fd.revents & libc::POLLIN != 0 }
 }
 
+#[cfg(unix)]
 fn read(fd: &OwnedFd, buf: &mut [u8]) -> std::io::Result<usize> {
     // SAFETY: reads into a live buffer of `buf.len()` bytes.
     let n = unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
@@ -693,8 +801,13 @@ impl Sink {
         self.ring.push(over);
         // So the daemon still sees output (stall checks).
         if self.touched.is_none_or(|t| t.elapsed() >= TOUCH_EVERY) {
+            #[cfg(unix)]
             // SAFETY: futimens on a descriptor we own; a null times pointer means now.
-            unsafe { libc::futimens(self.out.file.as_raw_fd(), std::ptr::null()) };
+            unsafe {
+                libc::futimens(self.out.file.as_raw_fd(), std::ptr::null())
+            };
+            #[cfg(windows)]
+            let _ = self.out.file.set_modified(std::time::SystemTime::now());
             self.touched = Some(Instant::now());
         }
     }
@@ -757,14 +870,19 @@ impl Ring {
         }
         if data.len() >= self.cap {
             self.buf.clear();
+            self.fit(self.cap);
             self.buf.extend_from_slice(&data[data.len() - self.cap..]);
             self.start = 0;
             return;
         }
         if self.buf.len() < self.cap {
+            self.fit((self.cap - self.buf.len()).min(data.len()));
             let n = (self.cap - self.buf.len()).min(data.len());
             self.buf.extend_from_slice(&data[..n]);
             data = &data[n..];
+            if self.cap == 0 {
+                return;
+            }
         }
         // Full: overwrite from the oldest byte on, wrapping.
         let first = (self.cap - self.start).min(data.len());
@@ -772,6 +890,22 @@ impl Ring {
         let second = data.len() - first;
         self.buf[..second].copy_from_slice(&data[first..]);
         self.start = (self.start + data.len()) % self.cap;
+    }
+
+    /// Makes room in `buf` for `n` more bytes, growing it at most to `cap`, by doubling. When
+    /// there is no memory for them (on Windows an allocation past the job's RAM limit fails), the
+    /// ring keeps no more from then on than it has room for already.
+    fn fit(&mut self, n: usize) {
+        let need = self.buf.len().saturating_add(n);
+        if need <= self.buf.capacity() {
+            return;
+        }
+        let want = need
+            .max(self.buf.capacity().saturating_mul(2))
+            .min(self.cap);
+        if self.buf.try_reserve_exact(want - self.buf.len()).is_err() {
+            self.cap = self.cap.min(self.buf.capacity());
+        }
     }
 
     /// The bytes, oldest first, in two pieces.
@@ -788,11 +922,14 @@ impl Ring {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::collections::BTreeSet;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     /// The supervisor's core, as `_supervise` runs it but with no signal handlers (they would
     /// stay in this test process): output into `out.log` beside `status`, no limit.
+    #[cfg(unix)]
     fn run(status: &Path, env_file: Option<&Path>, cmd: &[String]) -> i32 {
         let limit = Limit {
             max: 0,
@@ -801,6 +938,7 @@ mod tests {
         run_limited(status, env_file, limit, cmd)
     }
 
+    #[cfg(unix)]
     fn run_limited(status: &Path, env_file: Option<&Path>, limit: Limit, cmd: &[String]) -> i32 {
         let log = status.with_file_name("out.log");
         let out = std::fs::OpenOptions::new()
@@ -813,14 +951,17 @@ mod tests {
         supervise(out, status, env_file, limit, cmd, &wake, &signals).unwrap()
     }
 
+    #[cfg(unix)]
     fn sh(script: &str) -> Vec<String> {
         vec!["sh".into(), "-c".into(), script.into()]
     }
 
+    #[cfg(unix)]
     fn read(status: &std::path::Path) -> crate::types::ExitStatus {
         serde_json::from_slice(&std::fs::read(status).unwrap()).unwrap()
     }
 
+    #[cfg(unix)]
     #[test]
     fn records_exit_code_and_signal() {
         let dir = tempfile::tempdir().unwrap();
@@ -839,6 +980,7 @@ mod tests {
         assert_eq!((s.code, s.signal), (None, Some(9)));
     }
 
+    #[cfg(unix)]
     #[test]
     fn records_a_command_that_cannot_start() {
         let dir = tempfile::tempdir().unwrap();
@@ -855,6 +997,7 @@ mod tests {
 
     /// The command gets exactly the file's environment, not the supervisor's, and the file is
     /// gone once read.
+    #[cfg(unix)]
     #[test]
     fn the_environment_comes_from_the_env_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -891,6 +1034,7 @@ mod tests {
         assert_eq!(got, want);
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_bad_env_file_ends_the_invocation_and_is_removed() {
         let dir = tempfile::tempdir().unwrap();
@@ -910,6 +1054,7 @@ mod tests {
         assert!(!marker.exists(), "the command ran");
     }
 
+    #[cfg(unix)]
     #[test]
     fn env_files_refuse_what_an_environment_cannot_hold() {
         let dir = tempfile::tempdir().unwrap();
@@ -989,6 +1134,7 @@ mod tests {
     fn detach(_dir: &std::path::Path) {}
 
     /// On a full disk the exit status isn't lost: it is written once there is room.
+    #[cfg(unix)]
     #[test]
     fn the_status_waits_for_room_on_a_full_disk() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1023,6 +1169,7 @@ mod tests {
         assert_eq!((got.code, got.ended_at), (Some(3), 7));
     }
 
+    #[cfg(unix)]
     fn log_of(status: &Path) -> Vec<u8> {
         std::fs::read(status.with_file_name("out.log")).unwrap_or_default()
     }
@@ -1030,6 +1177,7 @@ mod tests {
     /// stdout and stderr reach the log through one pipe, in order. Opening /dev/stdout opens the
     /// pipe, not the log: on Linux, where it reopens the file behind descriptor 1, `> /dev/stdout`
     /// used to truncate the log.
+    #[cfg(unix)]
     #[test]
     fn output_reaches_the_log_through_a_pipe() {
         let dir = tempfile::tempdir().unwrap();
@@ -1046,6 +1194,7 @@ mod tests {
 
     /// The command leads a process group of its own, so `kill 0` in it doesn't reach the
     /// supervisor, which records how the command ended.
+    #[cfg(unix)]
     #[test]
     fn the_command_has_a_process_group_of_its_own() {
         let dir = tempfile::tempdir().unwrap();
@@ -1065,6 +1214,7 @@ mod tests {
 
     /// A process the command leaves running keeps the pipe open; the status comes anyway, and
     /// the log has what the command wrote.
+    #[cfg(unix)]
     #[test]
     fn a_process_left_holding_the_pipe_does_not_hold_up_the_status() {
         let dir = tempfile::tempdir().unwrap();
@@ -1083,6 +1233,7 @@ mod tests {
 
     /// The first `max` bytes, a line at the limit, then at the end a line with what was dropped
     /// and the last `tail` bytes.
+    #[cfg(unix)]
     #[test]
     fn the_log_keeps_its_first_bytes_and_the_last() {
         let dir = tempfile::tempdir().unwrap();
@@ -1136,6 +1287,42 @@ mod tests {
         );
     }
 
+    /// The Windows supervisor's STATUS is an [`ExitStatus`] to any reader of one, and without
+    /// its extras it is written exactly as one; a status written without them reads with their
+    /// defaults.
+    #[test]
+    fn a_job_status_reads_as_an_exit_status() {
+        let exit = ExitStatus {
+            code: Some(3),
+            signal: None,
+            ended_at: 7,
+        };
+        let plain = JobStatus {
+            exit: exit.clone(),
+            over_memory: false,
+            peak_mem_bytes: 0,
+            cpu_ms: 0,
+        };
+        assert_eq!(
+            serde_json::to_string(&plain).unwrap(),
+            serde_json::to_string(&exit).unwrap()
+        );
+        let full = JobStatus {
+            over_memory: true,
+            peak_mem_bytes: 64 << 20,
+            cpu_ms: 1500,
+            ..plain.clone()
+        };
+        let json = serde_json::to_vec(&full).unwrap();
+        let read: ExitStatus = serde_json::from_slice(&json).unwrap();
+        assert_eq!(read, exit);
+        let back: JobStatus = serde_json::from_slice(&json).unwrap();
+        assert_eq!(back, full);
+        let old: JobStatus =
+            serde_json::from_str(r#"{"code":3,"signal":null,"ended_at":7}"#).unwrap();
+        assert_eq!(old, plain);
+    }
+
     #[test]
     fn the_ring_keeps_the_last_bytes() {
         let mut r = Ring::new(5);
@@ -1176,6 +1363,7 @@ mod tests {
 
     /// While output is dropped the log doesn't grow, but its modification time moves (once a
     /// second at most), which the daemon's stall checks count as output.
+    #[cfg(unix)]
     #[test]
     fn dropped_output_still_moves_the_logs_time() {
         let dir = tempfile::tempdir().unwrap();
@@ -1210,6 +1398,7 @@ mod tests {
 
     /// Output that can't be written (here a full non-blocking pipe stands in for a full disk) is
     /// counted, and the next write that works says how much is missing.
+    #[cfg(unix)]
     #[test]
     fn output_that_cannot_be_written_is_counted() {
         let (mut r, w) = std::io::pipe().unwrap();
@@ -1251,6 +1440,7 @@ mod tests {
     }
 
     /// A log that can't be written at all doesn't stop the command: the pipe is still read.
+    #[cfg(unix)]
     #[test]
     fn a_log_that_cannot_be_written_still_lets_the_command_end() {
         let dir = tempfile::tempdir().unwrap();
@@ -1270,6 +1460,7 @@ mod tests {
 
     /// The first ending signal that finds dropped output adds its tail at once, so a job killed
     /// soon after (at its run limit) keeps it; the end adds what was dropped after that.
+    #[cfg(unix)]
     #[test]
     fn a_signal_adds_the_tail_at_once() {
         let dir = tempfile::tempdir().unwrap();

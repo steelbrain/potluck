@@ -1,6 +1,6 @@
 //! Running an invocation's processes: one executor per platform behind one trait.
 //!
-//! On both platforms the command runs under `potluck _supervise` ([`crate::supervise`]), which
+//! On every platform the command runs under `potluck _supervise` ([`crate::supervise`]), which
 //! copies its output into the log through a pipe and writes its exit status to the invocation's
 //! status file. When the command exits, anything it left
 //! running is killed: an invocation ends when its command does. Over its RAM limit it is ended and
@@ -10,6 +10,24 @@
 pub mod linux;
 #[cfg(target_os = "macos")]
 pub mod macos;
+#[cfg(windows)]
+pub mod windows;
+
+/// The signal [`Executor::signal`] takes to ask an invocation to stop: SIGTERM. Windows has no
+/// signals: its executor takes this number as "stop" (CTRL_BREAK to the command's process group,
+/// `exec::windows`).
+#[cfg(unix)]
+pub const SIGTERM: i32 = libc::SIGTERM;
+/// The signal [`Executor::signal`] takes to kill an invocation at once: SIGKILL. On Windows the
+/// executor takes this number as "kill" (`TerminateJobObject`).
+#[cfg(unix)]
+pub const SIGKILL: i32 = libc::SIGKILL;
+/// SIGTERM's number on Linux and macOS, which the Windows executor takes as "stop".
+#[cfg(windows)]
+pub const SIGTERM: i32 = 15;
+/// SIGKILL's number on Linux and macOS, which the Windows executor takes as "kill".
+#[cfg(windows)]
+pub const SIGKILL: i32 = 9;
 
 use crate::types::{Grant, Handle, JobRecord};
 use std::collections::BTreeMap;
@@ -23,29 +41,34 @@ pub struct Launch<'a> {
     pub cwd: PathBuf,
     /// The final environment (the daemon builds it; executors add nothing).
     pub env: BTreeMap<String, String>,
-    /// The supervisor's stdout and stderr (appended); stdin is /dev/null. The supervisor copies
-    /// the command's stdout and stderr here through a pipe ([`crate::supervise`]).
+    /// The supervisor's stdout and stderr (appended); stdin is /dev/null (NUL on Windows). The
+    /// supervisor copies the command's stdout and stderr here through a pipe
+    /// ([`crate::supervise`]).
     pub log: PathBuf,
     /// Where the supervisor writes the exit status.
     pub status: PathBuf,
     /// The `potluck` binary to run as `_supervise` (the daemon's own executable).
     pub potluck_bin: PathBuf,
-    /// A name unique on this machine, e.g. `potluck-studio-42` (the Linux unit name).
+    /// A name unique on this machine, e.g. `potluck-studio-42` (the Linux unit name; part of the
+    /// Windows job object's name).
     pub name: String,
     pub limits: Limits,
 }
 
 /// What an invocation is held to.
 pub struct Limits {
-    /// Linux MemoryMax; macOS polled footprint.
+    /// Linux MemoryMax; macOS polled footprint; Windows the job object's commit limit
+    /// (JOB_OBJECT_LIMIT_JOB_MEMORY).
     pub mem_max_bytes: u64,
-    /// Linux CPUWeight.
+    /// Linux CPUWeight. No effect on macOS and Windows.
     pub cpu_weight: u32,
     /// Linux TasksMax (threads count). macOS: the most processes, the supervisor included; the
-    /// monitor ends the job past it.
+    /// monitor ends the job past it. Windows: the job object's active process limit, the
+    /// supervisor included; starting a process past it fails.
     pub tasks_max: u32,
-    /// The grace between SIGTERM and SIGKILL (the daemon's kill_grace_s). Linux: the unit's
-    /// TimeoutStopSec, for what is left of the invocation once its command has ended.
+    /// The grace between SIGTERM and SIGKILL (the daemon's kill_grace_s; on Windows between
+    /// CTRL_BREAK and TerminateJobObject). Linux: the unit's TimeoutStopSec, for what is left of
+    /// the invocation once its command has ended.
     pub kill_grace_ms: u64,
     /// How many bytes of the command's output the log keeps before the supervisor drops the rest
     /// (all but the last 16 MiB, added when the command ends); 0: no limit.
@@ -63,7 +86,8 @@ pub struct Sample {
     /// count (Linux: the cgroup's peak); 0 when unknown. Samples a second apart miss a quick
     /// climb to the limit, so `mem_bytes` alone can say a job killed at its limit used far less.
     pub peak_mem_bytes: u64,
-    /// The kernel (Linux) or the monitor (macOS) ended it for going over its RAM limit.
+    /// The kernel (Linux), the monitor (macOS) or the supervisor (Windows: an allocation past the
+    /// job object's commit limit failed) ended it for going over its RAM limit.
     pub over_memory: bool,
     /// Linux: the kernel's OOM killer or systemd-oomd ended a process of it while it was under
     /// its own RAM limit, because the machine (or a group of units it runs in) ran short of
@@ -81,7 +105,9 @@ pub trait Executor: Send + Sync {
     /// limits (it ends the invocation and reports `over_memory` or `over_tasks`), so call this
     /// every second or so.
     fn sample(&self, handle: &mut Handle, mem_max_bytes: u64) -> anyhow::Result<Sample>;
-    /// Send `sig` to every process of the invocation.
+    /// Send `sig` to every process of the invocation. Windows has no signals: [`SIGKILL`] ends
+    /// every process of the invocation, and any other number asks it to stop (CTRL_BREAK to its
+    /// command's process group).
     fn signal(&self, handle: &Handle, sig: i32) -> anyhow::Result<()>;
     /// Stacks of the invocation's processes as text, for a stalled job's log. Best effort.
     fn stacks(&self, handle: &Handle) -> anyhow::Result<String>;
@@ -120,4 +146,6 @@ pub fn platform() -> Box<dyn Executor> {
     return Box::new(linux::SystemdExecutor);
     #[cfg(target_os = "macos")]
     return Box::new(macos::ProcessExecutor::default());
+    #[cfg(windows)]
+    return Box::new(windows::JobExecutor::default());
 }

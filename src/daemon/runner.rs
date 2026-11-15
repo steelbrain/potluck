@@ -1843,7 +1843,8 @@ pub(crate) fn finish(sh: &Arc<Shared>, id: &str) {
     let late_crash = match &job.handle {
         Some(Handle::Process { .. }) => true,
         Some(Handle::Systemd { .. }) => ending.signal.is_some_and(is_crash_signal),
-        None => false,
+        // Windows keeps no crash reports for potluck to collect.
+        Some(Handle::JobObject { .. }) | None => false,
     };
     if late_crash {
         sh.crash_pending
