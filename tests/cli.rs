@@ -2501,12 +2501,16 @@ fn nested_dispatch_gives_the_whole_group_its_grace() {
     std::fs::write(fake.home().join("node.toml"), "kill_grace_s = 5\n").unwrap();
     let cwd = tempfile::tempdir().unwrap();
     let marker = cwd.path().join("cleaned");
-    // TERM on Unix; on Windows the stop is CTRL_BREAK, which MSYS's sh takes as a signal of its
-    // own (INT or QUIT).
-    let script = format!(
-        "(trap 'sleep 1; touch \"{}\"; exit 0' TERM INT QUIT; while :; do sleep 0.1; done) & wait",
-        sh_path(&marker)
-    );
+    // On Unix a child in the background takes the stop (TERM) and cleans up. On Windows the stop
+    // is CTRL_BREAK, which MSYS's sh takes as INT or QUIT, and a background child of a
+    // non-interactive shell ignores those (POSIX), so the job's shell itself traps it there: its
+    // cleanup still runs in processes started after the stop.
+    let cleanup = format!("trap 'sleep 1; touch \"{}\"; exit 0'", sh_path(&marker));
+    let script = if cfg!(windows) {
+        format!("{cleanup} INT QUIT TERM; while :; do sleep 0.1; done")
+    } else {
+        format!("({cleanup} TERM; while :; do sleep 0.1; done) & wait")
+    };
     let started = std::time::Instant::now();
     let r = run(inside_job(&fake, cwd.path()).args([
         "dispatch",
