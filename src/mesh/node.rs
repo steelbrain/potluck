@@ -580,7 +580,8 @@ impl Mesh {
         inner.see(seen);
         if let Some(l) = &listener {
             // Kept for a handover; the accept loop has the listener itself.
-            *inner.kept.get_mut().unwrap_or_else(|e| e.into_inner()) = l.try_clone().ok();
+            *inner.kept.get_mut().unwrap_or_else(|e| e.into_inner()) =
+                l.try_clone().map(crate::sys::not_inherited).ok();
         }
         let inner = Arc::new(inner);
         if let Some(listener) = listener {
@@ -1847,7 +1848,7 @@ impl Inner {
 
     fn register(self: &Arc<Self>, key: Option<PublicKey>, sock: &TcpStream) -> Registration {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        if let Ok(clone) = sock.try_clone() {
+        if let Ok(clone) = sock.try_clone().map(crate::sys::not_inherited) {
             let conn = OpenConn {
                 key,
                 sock: clone,

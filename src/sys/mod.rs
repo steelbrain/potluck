@@ -51,6 +51,29 @@ pub fn path_str(path: &std::path::Path) -> std::io::Result<&str> {
 /// The executable suffix of this platform: `.exe` on Windows, nothing elsewhere.
 pub const EXE_SUFFIX: &str = std::env::consts::EXE_SUFFIX;
 
+/// `s`, a copy of a std socket (`try_clone` of a TCP listener or stream), made so that no child
+/// process inherits it. On Unix std's copy is close-on-exec already. On Windows it is
+/// inheritable whatever flag std asks for (WSASocketW from WSADuplicateSocketW's description), so
+/// every process started with inherited handles while it was open (`std::process::Command`
+/// starts each so) held the socket: a copy of the mesh's listener kept its port taken after the
+/// daemon closed it, as long as such a process ran. This clears the flag; a process another
+/// thread starts between the copy and this still inherits it.
+#[cfg(windows)]
+pub fn not_inherited<S: std::os::windows::io::AsRawSocket>(s: S) -> S {
+    use windows_sys::Win32::Foundation::{HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation};
+    // SAFETY: a socket is a handle, open while `s` lives; clearing its inherit flag only keeps it
+    // from child processes. Best effort: on failure it stays as std made it.
+    unsafe { SetHandleInformation(s.as_raw_socket() as HANDLE, HANDLE_FLAG_INHERIT, 0) };
+    s
+}
+
+/// `s`, a copy of a std socket made so that no child process inherits it: on Unix, as std makes
+/// it (close-on-exec).
+#[cfg(unix)]
+pub fn not_inherited<S>(s: S) -> S {
+    s
+}
+
 #[cfg(windows)]
 pub(crate) mod win {
     //! Small helpers for the Windows API.

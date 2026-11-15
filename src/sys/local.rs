@@ -194,7 +194,9 @@ mod win {
             if s == INVALID_SOCKET {
                 return Err(last_error());
             }
-            Ok(Socket(s))
+            // WSASocketW ignores WSA_FLAG_NO_HANDLE_INHERIT for a socket made from another's
+            // description: the copy would be inheritable ([`crate::sys::not_inherited`]).
+            Ok(Socket::owned(s))
         }
 
         fn set_timeout(&self, d: Option<Duration>, opt: i32) -> io::Result<()> {
@@ -686,6 +688,35 @@ mod tests {
         conn.set_nonblocking(false).unwrap();
         let clone = listener.try_clone().unwrap();
         drop(clone);
+    }
+
+    /// No child process gets a copy of a connection or of its clone: once this process lets go
+    /// of it, the other end reads its end, though a child started meanwhile runs on.
+    #[test]
+    fn a_child_process_holds_no_copy_of_a_connection() {
+        let d = sock_dir();
+        let path = d.path().join("s.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let c = UnixStream::connect(&path).unwrap();
+        // Before the other end closes: macOS refuses setsockopt on a socket whose peer is gone.
+        c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let (conn, _) = listener.accept().unwrap();
+        let clone = conn.try_clone().unwrap();
+        // Started with every inheritable handle of this process, as std starts a child.
+        let mut child = if cfg!(windows) {
+            std::process::Command::new("ping")
+                .args(["-n", "30", "127.0.0.1"])
+                .stdout(std::process::Stdio::null())
+                .spawn()
+        } else {
+            std::process::Command::new("sleep").arg("30").spawn()
+        }
+        .unwrap();
+        drop((conn, clone));
+        let read = (&c).read(&mut [0u8; 8]);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(read.unwrap(), 0);
     }
 
     #[cfg(windows)]

@@ -804,6 +804,29 @@ fn a_stopped_mesh_frees_its_port_at_once() {
     std::net::TcpListener::bind(addr).expect("the port is free once stop returns");
 }
 
+/// No child process gets a copy of the listener: a process started while the mesh listened
+/// (with every inheritable handle, as std starts one) doesn't keep the port taken after `stop`.
+#[test]
+fn a_stopped_mesh_frees_its_port_while_a_child_started_meanwhile_runs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = start("a", tmp.path());
+    let addr = a.local_addr().unwrap();
+    let mut child = if cfg!(windows) {
+        std::process::Command::new("ping")
+            .args(["-n", "30", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+    } else {
+        std::process::Command::new("sleep").arg("30").spawn()
+    }
+    .unwrap();
+    a.stop();
+    let bound = std::net::TcpListener::bind(addr);
+    let _ = child.kill();
+    let _ = child.wait();
+    bound.expect("the port is free once stop returns");
+}
+
 #[test]
 fn a_restarted_member_keeps_its_identity_and_membership() {
     let tmp = tempfile::tempdir().unwrap();
