@@ -214,8 +214,8 @@ impl Client {
         let fresh = Client::connect(&self.paths, self.ctx.clone())?;
         self.reader = fresh.reader;
         self.writer = fresh.writer;
-        if timeout.is_some() {
-            self.writer.set_read_timeout(timeout)?;
+        if let Some(t) = timeout {
+            self.set_read_timeout(t)?;
         }
         Ok(())
     }
@@ -324,9 +324,11 @@ impl Client {
         Ok(())
     }
 
-    /// How long to wait for an answer (default [`READ_TIMEOUT`]).
+    /// How long to wait for an answer (default [`READ_TIMEOUT`]). Set on the reader's socket too:
+    /// on Windows a socket's clone keeps the timeout it was cloned with.
     pub fn set_read_timeout(&mut self, timeout: Duration) -> anyhow::Result<()> {
         self.writer.set_read_timeout(Some(timeout))?;
+        self.reader.get_ref().set_read_timeout(Some(timeout))?;
         Ok(())
     }
 }
