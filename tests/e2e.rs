@@ -1,12 +1,13 @@
 //! End to end: the real `potluck` binary as daemon and CLI, this platform's real executor
-//! (systemd user units on Linux, process groups on macOS), real git repositories (one with a
-//! submodule) and real workspaces on a copy-on-write filesystem.
+//! (systemd user units on Linux, process groups on macOS, job objects on Windows), real git
+//! repositories (one with a submodule) and real workspaces on a copy-on-write filesystem.
 //!
 //! Each test runs its own daemon on a home under `CARGO_TARGET_TMPDIR`, on the target directory's
-//! filesystem, which must be copy-on-write (APFS on a Mac, btrfs or XFS with reflink on Linux),
-//! with a node name starting `test-`, so Linux units are named `potluck-test-...`. The daemon's
-//! login shell is a fake one that exports a marker variable, so environment capture is checked
-//! without depending on the runner's profile. GPU tests lease the machine's first GPU for jobs
+//! filesystem, which must be copy-on-write (APFS on a Mac, btrfs or XFS with reflink on Linux,
+//! ReFS on Windows), with a node name starting `test-`, so Linux units are named
+//! `potluck-test-...`. On Unix the daemon's login shell is a fake one that exports a marker
+//! variable, so environment capture is checked without depending on the runner's profile. On
+//! Windows every dispatch asks for Windows. GPU tests lease the machine's first GPU for jobs
 //! that only run `sleep`; they are skipped on a machine without a GPU.
 
 mod common;
@@ -17,6 +18,7 @@ use potluck::proto::{ClientContext, Request, Response};
 use potluck::types::{Facts, JobRecord, JobState};
 use serde_json::Value;
 use std::fs::File;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -51,6 +53,7 @@ fn helper_alloc() {
 }
 
 /// Leaves the job's session and ignores SIGTERM, then sleeps: a grandchild only SIGKILL ends.
+#[cfg(unix)]
 #[test]
 fn helper_setsid() {
     let Ok(pidfile) = std::env::var("E2E_PIDFILE") else {
@@ -68,6 +71,7 @@ fn helper_setsid() {
 /// starts a middle process and waits for it; the middle calls setsid, starts the daemon and exits
 /// at once, so the daemon's parent is launchd (init on Linux). The daemon writes its pid to
 /// `E2E_PIDFILE` and sleeps for 120 seconds.
+#[cfg(unix)]
 #[test]
 fn helper_daemon() {
     let Ok(pidfile) = std::env::var("E2E_PIDFILE") else {
@@ -102,11 +106,36 @@ fn helper_daemon() {
     }
 }
 
+/// The command line, for `sh -c`, that runs helper `name` (on Windows the binary's path with
+/// forward slashes, which sh takes as they are).
 fn helper_cmd(name: &str) -> String {
-    format!(
-        "{} --exact {name} --nocapture --test-threads=1",
-        std::env::current_exe().unwrap().display()
-    )
+    let exe = std::env::current_exe().unwrap().display().to_string();
+    #[cfg(windows)]
+    let exe = exe.replace('\\', "/");
+    format!("{exe} --exact {name} --nocapture --test-threads=1")
+}
+
+/// Writes its pid to `E2E_PIDFILE`, prints a line, waits until the file `E2E_UNTIL` exists (for
+/// two minutes at most), prints another and exits with `E2E_EXIT`: a job that runs until its test
+/// lets it end, without a shell.
+#[cfg(windows)]
+#[test]
+fn helper_until() {
+    let Ok(until) = std::env::var("E2E_UNTIL") else {
+        return;
+    };
+    let pidfile = PathBuf::from(std::env::var("E2E_PIDFILE").unwrap());
+    let tmp = pidfile.with_extension("tmp");
+    std::fs::write(&tmp, std::process::id().to_string()).unwrap();
+    std::fs::rename(&tmp, &pidfile).unwrap();
+    println!("waiting for {until}");
+    let start = Instant::now();
+    while !Path::new(&until).exists() && start.elapsed() < Duration::from_secs(120) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    println!("done waiting");
+    let code = std::env::var("E2E_EXIT").unwrap().parse().unwrap();
+    std::process::exit(code);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -133,6 +162,7 @@ fn first_gpu() -> Option<String> {
 
 /// The fake login shell, written once before any daemon starts (exec of a file another thread
 /// is still writing fails with ETXTBSY on Linux).
+#[cfg(unix)]
 fn fake_shell() -> PathBuf {
     static SHELL: OnceLock<PathBuf> = OnceLock::new();
     SHELL
@@ -153,6 +183,7 @@ fn fake_shell() -> PathBuf {
 
 /// The fake login shell by a name that makes it take 2 s (a symlink: no file is written that a
 /// daemon then runs).
+#[cfg(unix)]
 fn slow_shell() -> PathBuf {
     static SHELL: OnceLock<PathBuf> = OnceLock::new();
     SHELL
@@ -235,6 +266,7 @@ impl Node {
 
     fn with(opts: Opts) -> Node {
         static N: AtomicU32 = AtomicU32::new(0);
+        #[cfg(unix)]
         let shell = fake_shell();
         let dir = tempfile::Builder::new()
             .prefix("e2e")
@@ -307,6 +339,7 @@ impl Node {
             daemon_out,
             user_key: Mutex::new(None),
         };
+        #[cfg(unix)]
         let _ = shell;
         node.start_daemon();
         // A cluster of its own, with its command line's key as its first user, as `potluck user
@@ -354,11 +387,14 @@ impl Node {
 
     fn start_daemon_with(&mut self, stdout: Stdio, stderr: Stdio) {
         assert!(self.daemon.is_none());
-        let child = Command::new(&self.bin)
+        let mut daemon = Command::new(&self.bin);
+        // The login shell (Windows takes the login environment from the system instead).
+        #[cfg(unix)]
+        daemon.env("SHELL", fake_shell());
+        let child = daemon
             .arg("daemon")
             .env("POTLUCK_HOME", &self.paths.home)
             .env("POTLUCK_CONFIG", &self.paths.config)
-            .env("SHELL", fake_shell())
             // Set in the daemon's environment and the CLI's: no job may see it.
             .env("E2E_CALLER", "leaked")
             .envs(self.daemon_env.iter().map(|(k, v)| (k, v)))
@@ -388,6 +424,7 @@ impl Node {
     }
 
     /// Stops the daemon (SIGTERM, as a service manager would). Jobs keep running.
+    #[cfg(unix)]
     fn stop_daemon(&mut self) {
         if let Some(mut child) = self.daemon.take() {
             unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
@@ -401,12 +438,34 @@ impl Node {
         }
     }
 
+    /// Stops the daemon: its keeper is killed, and the daemon proper ends with the keeper's job
+    /// object; waits (10 s at most) until neither holds its lock any more. Jobs keep running.
+    #[cfg(windows)]
+    fn stop_daemon(&mut self) {
+        if let Some(mut keeper) = self.daemon.take() {
+            let _ = keeper.kill();
+            let _ = keeper.wait();
+            let start = Instant::now();
+            while potluck::daemon::running_here(&self.paths)
+                && start.elapsed() < Duration::from_secs(10)
+            {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+
     fn daemon_log(&self) -> String {
         std::fs::read_to_string(&self.daemon_out).unwrap_or_default()
     }
 
-    /// Runs the CLI with `--json` in `cwd` (the project by default).
+    /// Runs the CLI with `--json` in `cwd` (the project by default). On Windows a dispatch asks
+    /// for Windows (`--on windows`): a Windows machine runs only jobs that do.
     fn cli_in(&self, cwd: &Path, args: &[&str]) -> Out {
+        #[cfg(windows)]
+        let args = &match args.split_first() {
+            Some((&"dispatch", rest)) => [&["dispatch", "--on", "windows"][..], rest].concat(),
+            _ => args.to_vec(),
+        }[..];
         let out = self
             .command(cwd)
             .arg("--json")
@@ -540,8 +599,14 @@ impl Drop for Node {
     }
 }
 
+#[cfg(unix)]
 fn alive(pid: i32) -> bool {
     unsafe { libc::kill(pid, 0) == 0 }
+}
+
+#[cfg(windows)]
+fn alive(pid: i32) -> bool {
+    potluck::sys::pid_alive(pid as u32)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -580,6 +645,7 @@ fn cpu_ms(pid: u32) -> u64 {
 
 /// The cluster loop sleeps between ticks: a daemon with nothing to do uses almost no CPU. (Its
 /// loop once woke itself on every tick and kept a core busy.)
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn an_idle_daemon_uses_almost_no_cpu() {
     let node = Node::new();
@@ -595,6 +661,8 @@ fn an_idle_daemon_uses_almost_no_cpu() {
     );
 }
 
+/// Unix: the environment it checks comes from the fake login shell, and has `TMPDIR`.
+#[cfg(unix)]
 #[test]
 fn dispatch_wait_logs_env_status_why_cancel() {
     let n = Node::new();
@@ -672,6 +740,7 @@ fn dispatch_wait_logs_env_status_why_cancel() {
 
 /// `potluck env` prints the login environment the daemon captured from the fake login shell, and
 /// nothing from the daemon's own environment or the caller's.
+#[cfg(unix)]
 #[test]
 fn env_prints_the_login_environment_jobs_start_from() {
     let n = Node::new();
@@ -1183,6 +1252,7 @@ fn ram_limit_ends_the_job() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn run_limit_terms_then_kills_a_setsid_grandchild() {
     let n = Node::new();
@@ -1232,6 +1302,7 @@ fn run_limit_terms_then_kills_a_setsid_grandchild() {
 
 /// A daemon a job starts by a double fork ends with the job: on Linux it stays in the job's unit;
 /// on macOS it is found by the POTLUCK_LEASE in its environment, though no sample saw it leave.
+#[cfg(unix)]
 #[test]
 fn a_daemon_the_job_starts_ends_with_it() {
     let n = Node::new();
@@ -1277,6 +1348,7 @@ fn a_daemon_the_job_starts_ends_with_it() {
 
 /// A supervisor killed while its command runs (SIGKILL from outside) ends the job at once, with
 /// the processes it left: on Linux systemd stops the unit; on macOS the daemon does it.
+#[cfg(unix)]
 #[test]
 fn a_killed_supervisor_ends_its_job() {
     let n = Node::new();
@@ -1364,6 +1436,8 @@ fn a_log_keeps_its_first_mib_and_its_last_16() {
     assert!(tail.ends_with("xxx\nthe end\n"));
 }
 
+/// Unix: Windows doesn't sample a stalled job's stacks.
+#[cfg(unix)]
 #[test]
 fn stalls_are_sampled_into_the_log() {
     let n = Node::new();
@@ -1560,9 +1634,14 @@ fn priority_aging_and_holding_the_line() {
 #[test]
 fn nested_dispatch_runs_in_place_within_the_lease() {
     let n = Node::new();
+    #[cfg(unix)]
+    let bin = BIN;
+    // On Windows with forward slashes, which sh takes as they are.
+    #[cfg(windows)]
+    let bin = &BIN.replace('\\', "/");
     let script = format!(
-        "{BIN} dispatch --timeout 10s --ram 1G -- echo nested-in-place; echo rc=$?; \
-         {BIN} dispatch --timeout 10s --ram 4G -- echo too-big; echo rc=$?"
+        "{bin} dispatch --timeout 10s --ram 1G -- echo nested-in-place; echo rc=$?; \
+         {bin} dispatch --timeout 10s --ram 4G -- echo too-big; echo rc=$?"
     );
     let job = n.dispatch(&["--timeout", "1m", "--ram", "2G", "--", "sh", "-c", &script]);
     let (code, j, _) = n.wait(&job);
@@ -1622,6 +1701,7 @@ fn a_daemon_log_that_is_also_stderr_gets_each_line_once() {
 
 /// Makes the daemon log as long as it gets before it starts afresh (16 MiB), but for `short`
 /// bytes, with a hole (the next daemon only reads its length).
+#[cfg(unix)]
 fn fill_daemon_log(n: &Node, short: u64) {
     let f = File::options()
         .create(true)
@@ -1632,6 +1712,7 @@ fn fill_daemon_log(n: &Node, short: u64) {
 }
 
 /// The inode of the file process `pid` has open as descriptor `fd`.
+#[cfg(unix)]
 fn fd_inode(pid: u32, fd: i32) -> Option<u64> {
     use std::os::unix::fs::MetadataExt;
     if cfg!(target_os = "linux") {
@@ -1650,6 +1731,7 @@ fn fd_inode(pid: u32, fd: i32) -> Option<u64> {
         .find_map(|l| l.strip_prefix('i')?.parse().ok())
 }
 
+#[cfg(unix)]
 #[test]
 fn a_daemon_log_that_is_also_stderr_starts_afresh_with_it() {
     use std::os::unix::fs::MetadataExt;
@@ -1690,6 +1772,7 @@ fn a_daemon_log_that_is_also_stderr_starts_afresh_with_it() {
     assert!(new.contains(&format!("{job}: succeeded")), "{new}");
 }
 
+#[cfg(unix)]
 #[test]
 fn a_daemon_log_that_starts_afresh_keeps_sending_every_line_to_stderr() {
     use std::io::Read;
@@ -1799,6 +1882,7 @@ fn a_dispatch_after_user_init_is_signed_and_runs() {
 /// this machine doesn't have, is refused at dispatch with what this machine has; this OS at its
 /// own major version (macOS) or major.minor kernel (Linux) runs, from the command line and from
 /// a recipe.
+#[cfg(unix)]
 #[test]
 fn os_shorthands_choose_the_machine() {
     let n = Node::new();
@@ -2613,7 +2697,9 @@ fn a_runner_gets_only_its_jobs_commits_and_what_they_reach() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Restart in place (`potluck restart`; src/daemon/handover.rs)
+// Restart in place (`potluck restart`; src/daemon/handover.rs). On Unix the daemon runs the new
+// binary in its own process and hands it its connections; on Windows its keeper starts the binary
+// as a new process (src/daemon/keeper.rs), and the tests of that are at the end.
 
 /// `status` called in a loop on a thread of its own until it is finished: when each answer came,
 /// and each error.
@@ -2671,6 +2757,7 @@ impl Caller {
 }
 
 /// The longest time between two answers.
+#[cfg(unix)]
 fn longest_gap(answers: &[Instant]) -> Duration {
     answers
         .windows(2)
@@ -2694,6 +2781,7 @@ fn spawn_cli(n: &Node, args: &[&str]) -> Child {
 /// one throughout, never sees an error, and the daemon keeps its pid. Before, the socket closed
 /// while the new daemon started (connections refused, a kept one broken). The longest time
 /// between two answers is printed: the restart's gap as a client sees it.
+#[cfg(unix)]
 #[test]
 fn a_restart_in_place_loses_no_request_and_no_connection() {
     let n = Node::new();
@@ -2736,6 +2824,7 @@ fn a_restart_in_place_loses_no_request_and_no_connection() {
 /// Requests a client sends right behind `restart` on the same connection, before its answer,
 /// are answered after it, by the new binary. The daemon before had read them along with the
 /// `restart` and let them go with its exec: the client waited for answers that never came.
+#[cfg(unix)]
 #[test]
 fn requests_sent_behind_a_restart_on_its_connection_are_answered() {
     use std::io::{BufRead, Write};
@@ -2770,6 +2859,7 @@ fn requests_sent_behind_a_restart_on_its_connection_are_answered() {
 /// client's own `logs` long polls on one connection get every byte once. The same from inside
 /// another job: `logs -f`, `wait --max-wait` and a dispatch that runs in place within that job's
 /// lease. The job runs on across the restart and ends with its code and its whole log.
+#[cfg(unix)]
 #[test]
 fn wait_and_logs_follow_go_on_across_a_restart_in_place() {
     let n = Node::new();
@@ -2844,8 +2934,10 @@ fn wait_and_logs_follow_go_on_across_a_restart_in_place() {
 }
 
 /// Restores a directory's mode when dropped (a test that made it read-only may fail first).
+#[cfg(unix)]
 struct Mode(PathBuf, u32);
 
+#[cfg(unix)]
 impl Drop for Mode {
     fn drop(&mut self) {
         let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(self.1));
@@ -2858,6 +2950,7 @@ impl Drop for Mode {
 /// usage error) gets a plain restart on it, which `potluck restart` reports as done (exit 0),
 /// saying it was plain and why. Before, it exited 2 as if nothing had restarted, and install.sh
 /// reported an update that had worked as failed. Running jobs go on through both.
+#[cfg(unix)]
 #[test]
 fn a_broken_new_binary_leaves_the_daemon_serving_and_saying_why() {
     let mut n = Node::new();
@@ -2935,6 +3028,7 @@ fn a_broken_new_binary_leaves_the_daemon_serving_and_saying_why() {
 /// (...: No such file or directory)" for those 2 s. What is left is the exec itself: from the
 /// moment the old binary's exec lets go of `daemon.lock` to the new binary taking it first thing,
 /// a client finds no daemon (a few ms; the span is printed).
+#[cfg(unix)]
 #[test]
 fn clients_connecting_during_a_plain_restart_wait_for_the_new_daemon() {
     use std::sync::atomic::AtomicBool;
@@ -3017,6 +3111,7 @@ fn clients_connecting_during_a_plain_restart_wait_for_the_new_daemon() {
 /// runs. `potluck restart` says it failed and why, and exits 2. Before, it was told "Restarted
 /// plainly" as the daemon began to stop, and the failed exec then ended the daemon: nothing
 /// answered again.
+#[cfg(unix)]
 #[test]
 fn a_plain_restart_that_fails_at_the_exec_is_not_reported_as_done() {
     let mut n = Node::new();
@@ -3058,6 +3153,7 @@ fn a_plain_restart_that_fails_at_the_exec_is_not_reported_as_done() {
 /// on the binary it runs, from what it handed over. `potluck restart` says it failed and why, and
 /// exits 2; before, the daemon answered it as if the new binary had taken over ("Restarted in
 /// place"), so install.sh and `self-update --here` reported an update the daemon never ran.
+#[cfg(unix)]
 #[test]
 fn a_restart_in_place_that_fails_at_the_exec_is_not_reported_as_done() {
     let mut n = Node::new();
@@ -3101,6 +3197,7 @@ fn a_restart_in_place_that_fails_at_the_exec_is_not_reported_as_done() {
 /// (here the daemon's stderr, as journald's stream when journald restarts, or a `| tee` that
 /// ended) fails that write only. Before, the failed exec left SIGPIPE at its default (std sets it
 /// so for the program it executes), and the next log line killed the daemon.
+#[cfg(unix)]
 #[test]
 fn a_daemon_serving_on_after_a_failed_exec_outlives_its_stderr() {
     let mut n = Node::new();
@@ -3144,6 +3241,7 @@ fn a_daemon_serving_on_after_a_failed_exec_outlives_its_stderr() {
 }
 
 /// `ps -o stat=,ppid=` of `pid`: None once it is gone (reaped).
+#[cfg(unix)]
 fn proc_state(pid: i32) -> Option<String> {
     let out = Command::new("ps")
         .args(["-o", "stat=,ppid=", "-p", &pid.to_string()])
@@ -3159,6 +3257,7 @@ fn proc_state(pid: i32) -> Option<String> {
 /// other dispatch's thread, its fetch ended, tries the fetch again. That second fetch was started
 /// after the old binary ended its children: before, it ran on under the new binary, which knew
 /// nothing of it but its pid (to reap), writing into the mirror the new binary syncs.
+#[cfg(unix)]
 #[test]
 fn no_git_cut_short_by_a_restart_in_place_outlives_the_exec() {
     let mut n = Node::new();
@@ -3287,6 +3386,7 @@ fn no_git_cut_short_by_a_restart_in_place_outlives_the_exec() {
 /// daemon serves on and tries again every 10 s. A second `potluck restart` meanwhile joins the
 /// one that waits: once the directory can be written again, the daemon restarts once and
 /// answers it.
+#[cfg(unix)]
 #[test]
 fn a_restart_waits_while_the_state_directory_cant_be_written() {
     let n = Node::new();
@@ -3325,6 +3425,7 @@ fn a_restart_waits_while_the_state_directory_cant_be_written() {
 /// serves on and tries again every 10 s on its own, so once the file can be written it restarts
 /// in place without being asked again. Before, the failed write counted as a failed exec:
 /// "restarting in place failed: writing .../handover.json", and nothing tried again.
+#[cfg(unix)]
 #[test]
 fn a_restart_waits_while_its_handover_file_cant_be_written() {
     let n = Node::new();
@@ -3360,6 +3461,7 @@ fn a_restart_waits_while_its_handover_file_cant_be_written() {
 /// potluck daemon is not running" for each (Linux makes them wait instead). Here a copy read
 /// slowly keeps the restart waiting for it (a request in flight finishes first) while 300
 /// clients connect, then the copy is read to its end.
+#[cfg(unix)]
 #[test]
 fn clients_past_the_backlog_during_a_restart_in_place_get_answers() {
     const CLIENTS: usize = 300;
@@ -3517,6 +3619,7 @@ fn a_machine_named_by_its_hostname_keeps_its_name_when_the_hostname_changes() {
 /// path answers the check as if all were well, and node.toml renames the machine: the next
 /// daemon goes by its own node.toml, as a plain start does, and refuses the name. Before, it took
 /// the name in half and served on.
+#[cfg(unix)]
 #[test]
 fn a_binary_that_cannot_start_from_the_handover_exits_with_an_error() {
     let mut n = Node::new();
@@ -3633,6 +3736,7 @@ fn a_restart_in_place_listens_where_node_toml_now_says() {
 /// and on b (relayed to a, the owner) go on across both restarts. Right after its restart, each
 /// lists the other as up: it took the mesh's view of the members over (a plain restart knows no
 /// member as up until it hears from each).
+#[cfg(unix)]
 #[test]
 fn members_restarting_in_place_never_look_down_to_each_other() {
     let a = Node::with(Opts {
@@ -3733,6 +3837,7 @@ fn members_restarting_in_place_never_look_down_to_each_other() {
 /// Kept files a member sends after their owner restarted in place go into a directory of the
 /// new binary's own. One that a stream cut by the exec left (same pid) is removed, not written
 /// into, so no other run's half-delivered files reach the job's `keep/`.
+#[cfg(unix)]
 #[test]
 fn kept_files_after_a_restart_in_place_dont_mix_with_a_cut_streams() {
     let a = Node::with(Opts {
@@ -3788,4 +3893,196 @@ fn kept_files_after_a_restart_in_place_dont_mix_with_a_cut_streams() {
         .filter(|n| n.starts_with("keep.part"))
         .collect();
     assert!(left.is_empty(), "{left:?}");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Restart through the keeper (Windows; src/daemon/keeper.rs): `potluck daemon` is a keeper that
+// runs the daemon proper as its child and starts the binary again when the daemon exits to
+// restart.
+
+/// Dispatches [`helper_until`], which runs until `until` exists and then exits with `code`.
+/// Returns the job and the file its command writes its pid to.
+#[cfg(windows)]
+fn dispatch_until(n: &Node, until: &Path, code: i32) -> (String, PathBuf) {
+    let pidfile = until.with_extension("pid");
+    let exe = std::env::current_exe().unwrap();
+    let job = n.dispatch(&[
+        "--timeout",
+        "3m",
+        "--env",
+        &format!("E2E_UNTIL={}", until.display()),
+        "--env",
+        &format!("E2E_PIDFILE={}", pidfile.display()),
+        "--env",
+        &format!("E2E_EXIT={code}"),
+        "--",
+        exe.to_str().unwrap(),
+        "--exact",
+        "helper_until",
+        "--nocapture",
+        "--test-threads=1",
+    ]);
+    (job, pidfile)
+}
+
+/// The pid [`helper_until`] wrote to `pidfile`, once it has (a minute at most).
+#[cfg(windows)]
+fn helper_pid(n: &Node, job: &str, pidfile: &Path) -> u32 {
+    let start = Instant::now();
+    loop {
+        let text = std::fs::read_to_string(pidfile).unwrap_or_default();
+        if let Ok(pid) = text.trim().parse() {
+            return pid;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "{job} never started its command: {}\n{}",
+            n.output(job),
+            n.daemon_log()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// `potluck restart`, twice: each time the daemon exits and its keeper (the process `potluck
+/// daemon` started, running throughout) starts the binary again as a new daemon; `restart` says
+/// so, with the version the new daemon answers as. A job running throughout keeps running, its
+/// process the same, and ends with its code.
+#[cfg(windows)]
+#[test]
+fn a_restart_through_the_keeper_keeps_the_keeper_and_the_running_job() {
+    let mut n = Node::new();
+    let until = n.dir.path().join("until");
+    let (job, pidfile) = dispatch_until(&n, &until, 3);
+    n.running(&job);
+    let pid = helper_pid(&n, &job, &pidfile);
+    let version = potluck::VERSION;
+    for round in 1..=2 {
+        let o = n.cli(&["restart"]);
+        assert_eq!(o.code, 0, "{} {}\n{}", o.json, o.stderr, n.daemon_log());
+        let text = o.json["text"].as_str().unwrap_or_default();
+        assert!(
+            text.starts_with(&format!(
+                "Restarted: potluck {version} stopped, and its keeper started "
+            )) && text.contains(
+                " as the daemon in a new process. Its 1 running job kept running; open \
+                 connections were closed, and clients connect again."
+            ) && text.ends_with(&format!(" The daemon answers again, as potluck {version}.")),
+            "{text}"
+        );
+        let exited = n.daemon.as_mut().unwrap().try_wait().unwrap();
+        assert!(
+            exited.is_none(),
+            "the keeper exited ({exited:?}):\n{}",
+            n.daemon_log()
+        );
+        let log = n.daemon_log();
+        assert_eq!(
+            log.matches("restarting in place: exiting for the keeper to start ")
+                .count(),
+            round,
+            "{log}"
+        );
+        assert_eq!(log.matches(" serving ").count(), round + 1, "{log}");
+        let rec = n.get(&job);
+        assert_eq!(rec.state, JobState::Running, "{rec:#?}\n{log}");
+        assert!(
+            alive(pid as i32),
+            "the job's process {pid} ended with the restart:\n{log}"
+        );
+    }
+    std::fs::write(&until, "").unwrap();
+    let (code, j, _) = n.wait(&job);
+    assert_eq!(code, 3, "{j}\n{}", n.daemon_log());
+    assert!(
+        n.output(&job).contains("done waiting"),
+        "{}",
+        n.output(&job)
+    );
+}
+
+/// Clients across a restart through the keeper: `wait` and `logs -f` started before it connect
+/// again and go on, each printing the job's whole output once, and `wait` exits with the job's
+/// code. A client calling `status` in a loop, on a new connection each time, always connects:
+/// while no daemon serves it waits for the next one. Only a request the old daemon's closing
+/// connections cut off fails, as a broken connection.
+#[cfg(windows)]
+#[test]
+fn wait_logs_and_new_connections_go_on_across_a_restart_through_the_keeper() {
+    let n = Node::new();
+    let until = n.dir.path().join("until");
+    let (job, pidfile) = dispatch_until(&n, &until, 7);
+    n.running(&job);
+    helper_pid(&n, &job, &pidfile);
+    let waiting = spawn_cli(&n, &["wait", &job]);
+    let following = spawn_cli(&n, &["logs", "-f", &job]);
+    let fresh = Caller::start(&n.paths, false);
+    std::thread::sleep(Duration::from_millis(500));
+    let o = n.cli(&["restart"]);
+    let restarted = Instant::now();
+    std::thread::sleep(Duration::from_millis(500));
+    let (answers, errors) = fresh.finish();
+    assert_eq!(o.code, 0, "{} {}\n{}", o.json, o.stderr, n.daemon_log());
+    eprintln!(
+        "restart through the keeper: {} status answers, {} cut off: {errors:?}",
+        answers.len(),
+        errors.len()
+    );
+    let broken = [
+        "the daemon closed the connection",
+        "reading the daemon's answer: ",
+        "writing to the daemon: ",
+    ];
+    let other: Vec<&String> = errors
+        .iter()
+        .filter(|e| !broken.iter().any(|b| e.starts_with(b)))
+        .collect();
+    assert!(other.is_empty(), "{other:?}\n{}", n.daemon_log());
+    assert!(
+        answers.iter().any(|t| *t > restarted),
+        "no answer after the restart: {errors:?}\n{}",
+        n.daemon_log()
+    );
+    std::fs::write(&until, "").unwrap();
+    let w = waiting.wait_with_output().unwrap();
+    let f = following.wait_with_output().unwrap();
+    let out = n.output(&job);
+    assert!(out.contains("done waiting"), "{out}");
+    let say = |o: &std::process::Output| String::from_utf8_lossy(&o.stderr).into_owned();
+    assert_eq!(w.status.code(), Some(7), "{}", say(&w));
+    assert_eq!(String::from_utf8_lossy(&w.stdout), out, "{}", say(&w));
+    assert_eq!(f.status.code(), Some(0), "{}", say(&f));
+    assert_eq!(String::from_utf8_lossy(&f.stdout), out, "{}", say(&f));
+}
+
+/// The keeper killed (as when its task ends): the daemon proper ends with it, so no lock is held
+/// and nothing answers on the socket, while a running job runs on. The next daemon adopts the
+/// job, which ends with its code.
+#[cfg(windows)]
+#[test]
+fn a_killed_keeper_ends_the_daemon_and_its_jobs_run_on() {
+    let mut n = Node::new();
+    let until = n.dir.path().join("until");
+    let (job, pidfile) = dispatch_until(&n, &until, 4);
+    n.running(&job);
+    let pid = helper_pid(&n, &job, &pidfile);
+    n.stop_daemon();
+    assert!(
+        !potluck::daemon::running_here(&n.paths),
+        "the daemon outlived its keeper:\n{}",
+        n.daemon_log()
+    );
+    let answered =
+        Client::connect(&n.paths, ClientContext::default()).and_then(|mut c| c.call(Request::Ping));
+    assert!(answered.is_err(), "{answered:?}");
+    assert!(
+        alive(pid as i32),
+        "the job's process {pid} ended with the daemon"
+    );
+    n.start_daemon();
+    let rec = n.get(&job);
+    assert_eq!(rec.state, JobState::Running, "{rec:#?}\n{}", n.daemon_log());
+    std::fs::write(&until, "").unwrap();
+    let (code, j, _) = n.wait(&job);
+    assert_eq!(code, 4, "{j}\n{}", n.daemon_log());
 }
