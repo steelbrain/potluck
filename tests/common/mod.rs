@@ -74,6 +74,26 @@ fn git_tools_first() {
     }
 }
 
+/// The PATH of a test daemon's login environment: the usual Unix directories, or on Windows (which
+/// has none of them) this test process's PATH, with Git for Windows' tools first.
+pub static LOGIN_PATH: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    if cfg!(windows) {
+        std::env::var("PATH").unwrap_or_default()
+    } else {
+        "/usr/bin:/bin:/usr/sbin:/sbin".to_string()
+    }
+});
+
+/// What a test daemon's login environment needs on Windows beside PATH: `SystemRoot`, without
+/// which Windows programs fail in odd ways (sockets among them). Nothing elsewhere.
+pub fn windows_essentials() -> Vec<(String, String)> {
+    ["SystemRoot"]
+        .into_iter()
+        .filter(|_| cfg!(windows))
+        .filter_map(|k| Some((k.to_string(), std::env::var(k).ok()?)))
+        .collect()
+}
+
 /// One client connection, for the handler to answer on.
 pub struct Conn<'a> {
     stream: &'a mut UnixStream,

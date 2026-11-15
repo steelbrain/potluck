@@ -768,11 +768,12 @@ impl Node {
             scheduler: Arc::new(RealScheduler),
             facts: Box::new(move || Ok(facts.clone())),
             login_env: [
-                ("PATH", "/usr/bin:/bin:/usr/sbin:/sbin"),
+                ("PATH", common::LOGIN_PATH.as_str()),
                 ("HOME", self.dir.to_str().unwrap()),
             ]
             .into_iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
+            .chain(common::windows_essentials())
             .collect(),
             clock: self.clock.clone(),
         };

@@ -682,8 +682,8 @@ impl Fixture {
             facts_refresh_ms: 60_000,
             idle_ms: 600_000,
         };
-        let login_env: BTreeMap<String, String> = [
-            ("PATH", "/usr/bin:/bin:/usr/sbin:/sbin"),
+        let mut login_env: BTreeMap<String, String> = [
+            ("PATH", common::LOGIN_PATH.as_str()),
             ("HOME", dir.path().to_str().unwrap()),
             ("FROM_LOGIN", "login"),
             ("OVERRIDDEN", "login"),
@@ -691,6 +691,7 @@ impl Fixture {
         .into_iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
+        login_env.extend(common::windows_essentials());
         Fixture {
             exec: Arc::new(FakeExec::default()),
             ws: Arc::new(FakeWs {
