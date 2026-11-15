@@ -2505,14 +2505,14 @@ fn nested_dispatch_gives_the_whole_group_its_grace() {
     let marker = cwd.path().join("cleaned");
     // A child in the background takes the stop (TERM) and cleans up. On Windows the stop is
     // CTRL_BREAK, which MSYS's sh doesn't trap (it ends at once, and a background child of its
-    // lives on to the end of the grace): there a console program that Windows ends at the stop
-    // stands for the group.
+    // lives on to the end of the grace): there the group is a shell in the foreground, which
+    // ends at the stop.
     let script = format!(
         "(trap 'sleep 1; touch \"{}\"; exit 0' TERM; while :; do sleep 0.1; done) & wait",
         sh_path(&marker)
     );
     let cmd: &[&str] = if cfg!(windows) {
-        &["ping", "-n", "60", "127.0.0.1"]
+        &["sh", "-c", "while :; do sleep 0.1; done"]
     } else {
         &["sh", "-c", &script]
     };
