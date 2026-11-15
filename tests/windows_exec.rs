@@ -191,6 +191,17 @@ fn wait_for<T>(timeout: Duration, mut f: impl FnMut() -> Option<T>) -> Option<T>
     }
 }
 
+/// The image names of the processes among `pids` that still run, in lower case. Beside the
+/// supervisor and the command, a job holds the console host of the supervisor's console
+/// (conhost.exe).
+fn images(pids: &[u32]) -> Vec<String> {
+    process_info(pids)
+        .unwrap()
+        .into_iter()
+        .map(|p| p.image.to_lowercase())
+        .collect()
+}
+
 /// `ping` as a sleep that needs no console input (timeout.exe refuses a redirected stdin).
 fn sleep_cmd(secs: u32) -> String {
     format!("ping -n {} 127.0.0.1 >NUL", secs + 1)
@@ -244,17 +255,29 @@ fn environment_and_working_directory() {
 }
 
 /// Arguments reach the command as they were given: through the supervisor's command line and
-/// the one it gives the command.
+/// the one it gives the command, both quoted as the C runtime reads them. The command is git,
+/// which reads its command line as the C runtime does and prints its arguments back quoted
+/// (`rev-parse --sq-quote`); Git for Windows' sh would not do: an MSYS program reads a command
+/// line its own way (`q\"uote` there opens a quote).
 #[test]
 fn arguments_arrive_unchanged() {
-    let args = ["a b", "q\"uote", "back\\slash\\", "", "x"];
-    let mut cmd = vec!["sh", "-c", "for a; do echo \"[$a]\"; done", "sh"];
+    let args = [
+        "a b",
+        "q\"uote",
+        "back\\slash\\",
+        "",
+        "x",
+        "x\\\"y",
+        "sp ace\\",
+        "tab\there",
+    ];
+    let mut cmd = vec!["git", "rev-parse", "--sq-quote"];
     cmd.extend(args);
     let inv = Inv::start(&cmd);
     let st = inv.status(PATIENCE).expect("status file");
     assert_eq!(st.exit.code, Some(0), "{}", inv.log());
-    let want: String = args.iter().map(|a| format!("[{a}]\n")).collect();
-    assert_eq!(inv.log().replace("\r\n", "\n"), want);
+    let want: String = args.iter().map(|a| format!(" '{a}'")).collect();
+    assert_eq!(inv.log().replace("\r\n", "\n"), format!("{want}\n"));
 }
 
 /// A stop request reaches the command as CTRL_BREAK; the supervisor survives it and records how
@@ -305,7 +328,8 @@ fn kill_ends_every_process() {
 }
 
 /// An allocation past the job's RAM fails; the supervisor ends the command and records it, and
-/// `sample` says over memory, with the job's peak.
+/// `sample` says over memory, with the job's peak. That peak (PeakJobMemoryUsed) counts the
+/// allocation that failed: here about 1 GiB, past the limit.
 #[test]
 fn over_its_ram_the_job_ends_over_memory() {
     let exec = JobExecutor::default();
@@ -328,17 +352,16 @@ fn over_its_ram_the_job_ends_over_memory() {
         s.over_memory.then_some(s)
     })
     .unwrap_or_else(|| panic!("never over memory: {:?}\n{}", inv.sample(&exec), inv.log()));
-    assert!(
-        over.peak_mem_bytes > 0 && over.peak_mem_bytes <= 256 * MIB,
-        "{over:?}"
-    );
+    assert!(over.peak_mem_bytes > 0, "{over:?}");
     let st = inv.status(PATIENCE).expect("status file");
     assert!(st.over_memory, "{st:?}");
     assert!(st.peak_mem_bytes > 0, "{st:?}");
     inv.assert_all_gone(&exec);
 }
 
-/// At most `tasks_max` processes at once, the supervisor included: starting one more fails.
+/// At most `tasks_max` processes at once, the supervisor included: starting one more fails. The
+/// console host of the supervisor's console (conhost.exe) runs in the job too, but Windows
+/// doesn't count it against the job's limit, so it isn't counted here.
 #[test]
 fn the_process_limit_holds() {
     let exec = JobExecutor::default();
@@ -350,13 +373,19 @@ fn the_process_limit_holds() {
         sleep_cmd(3)
     );
     let mut inv = Inv::start_full(&exec, &["cmd", "/d", "/c", &cmd], base_env(), l);
-    let mut most = 0;
+    let mut most = Vec::new();
     let st = wait_for(PATIENCE, || {
-        most = most.max(inv.sample(&exec).pids.len());
+        let counted: Vec<String> = images(&inv.sample(&exec).pids)
+            .into_iter()
+            .filter(|i| i != "conhost.exe")
+            .collect();
+        if counted.len() > most.len() {
+            most = counted;
+        }
         inv.status(Duration::ZERO)
     });
     assert!(st.is_some(), "no status file: {}", inv.log());
-    assert!(most <= 3, "{most} processes");
+    assert!(most.len() <= 3, "{most:?}");
 }
 
 /// After a daemon restart (a fresh executor), `find` gives the running job back from its
@@ -400,18 +429,29 @@ fn find_after_a_restart() {
     assert!(gone.is_some());
     exec.finish(&found, &dir.path().join("crash"), since)
         .unwrap();
-    // Killed before its supervisor recorded anything, the job object gone: a start that left
-    // nothing running and no status counts as having started nothing.
-    assert_eq!(exec.find("potluck-test-1", &status, since).unwrap(), None);
+    // Killed before its supervisor recorded anything: once the job object is gone, a start that
+    // left nothing running and no status counts as having started nothing. The job object goes
+    // a moment after its processes have ended, when Windows has let go of the last of them.
+    let none = wait_for(Duration::from_secs(10), || {
+        exec.find("potluck-test-1", &status, since)
+            .unwrap()
+            .is_none()
+            .then_some(())
+    });
+    assert!(none.is_some(), "the job object outlived its processes");
 }
 
 /// A job that ended while no daemon ran is still found (its status was written since the
 /// claim), and its sample says it is over.
+///
+/// What counts is the time the start's files say, not when Windows says they were written: it
+/// stamps a file from a clock that advances once per timer tick (up to 15.6 ms), so one written
+/// just after the claim can look older than it. Here they look a minute older.
 #[test]
 fn find_of_a_job_that_ended() {
     let dir = tempfile::tempdir().unwrap();
     let since = now_ms();
-    start_in(
+    let started = start_in(
         &JobExecutor::default(),
         dir.path(),
         &["cmd", "/d", "/c", "exit /b 4"],
@@ -420,11 +460,24 @@ fn find_of_a_job_that_ended() {
     );
     let status = dir.path().join("status.json");
     wait_for(PATIENCE, || status.exists().then_some(())).expect("status file");
+    let Handle::JobObject { name, .. } = &started else {
+        panic!("{started:?}")
+    };
+    let gone = wait_for(Duration::from_secs(10), || {
+        (!job_object_exists(name)).then_some(())
+    });
+    assert!(gone.is_some(), "job object {name} outlived its processes");
+    let past = std::time::SystemTime::now() - Duration::from_secs(60);
+    for file in [status.with_extension("job"), status.clone()] {
+        let f = std::fs::File::options().write(true).open(&file).unwrap();
+        f.set_modified(past).unwrap();
+    }
     let exec = JobExecutor::default();
     let mut found = exec
         .find("potluck-test-1", &status, since)
         .unwrap()
         .expect("found");
+    assert_eq!(found, started);
     let gone = wait_for(Duration::from_secs(10), || {
         exec.sample(&mut found, 0)
             .unwrap()
@@ -446,7 +499,8 @@ fn the_job_ends_with_its_supervisor() {
     let mut inv = Inv::start(&["cmd", "/d", "/c", &cmd]);
     let pids = wait_for(PATIENCE, || {
         let s = inv.sample(&exec);
-        (s.pids.len() >= 3).then_some(s.pids)
+        let pings = images(&s.pids).iter().filter(|i| *i == "ping.exe").count();
+        (pings == 2).then_some(s.pids)
     })
     .expect("the job's processes");
     let sup = process_info(&pids)
@@ -465,7 +519,9 @@ fn stacks_list_the_processes() {
     let exec = JobExecutor::default();
     let mut inv = Inv::start(&["cmd", "/d", "/c", &sleep_cmd(60)]);
     wait_for(PATIENCE, || {
-        (inv.sample(&exec).pids.len() >= 3).then_some(())
+        images(&inv.sample(&exec).pids)
+            .contains(&"ping.exe".to_string())
+            .then_some(())
     })
     .expect("the job's processes");
     let text = exec.stacks(&inv.handle).unwrap();
@@ -590,6 +646,20 @@ fn the_job_outlives_the_daemons_job() {
         exec.signal(&handle, SIGKILL).unwrap();
         exec.finish(&handle, &dir.path().join("crash"), 0).unwrap();
     }
+}
+
+/// Whether a job object named `name` exists (a handle to it is open somewhere).
+fn job_object_exists(name: &str) -> bool {
+    use windows_sys::Win32::System::JobObjects::OpenJobObjectW;
+    use windows_sys::Win32::System::SystemServices::JOB_OBJECT_QUERY;
+    let wide: Vec<u16> = name.encode_utf16().chain([0]).collect();
+    // SAFETY: a NUL-terminated name.
+    let h = unsafe { OpenJobObjectW(JOB_OBJECT_QUERY, 0, wide.as_ptr()) };
+    if h.is_null() {
+        return false;
+    }
+    drop(Job(h));
+    true
 }
 
 /// A job object handle, closed on drop.
