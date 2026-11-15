@@ -2866,7 +2866,7 @@ fn the_owner_away_while_its_job_runs() {
 
 /// Dispatches on `a` a job that runs on b and keeps `k.txt`, and puts a file where `a` keeps
 /// kept files (its job's `keep`), so they can't be delivered there.
-fn dispatch_undeliverable_keep(a: &Node, exit: i32) -> String {
+fn dispatch_undeliverable_keep(a: &Node, exit: i32) -> (String, InTheWay) {
     let job = a.dispatch(&[
         "--on",
         "node=b",
@@ -2879,8 +2879,55 @@ fn dispatch_undeliverable_keep(a: &Node, exit: i32) -> String {
     ]);
     let dir = a.paths.job_dir(&job);
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("keep"), "in the way\n").unwrap();
-    job
+    let in_the_way = InTheWay::new(dir.join("keep"));
+    (job, in_the_way)
+}
+
+/// What keeps an owner from storing a job's kept files at `keep` until [`InTheWay::clear`]: on
+/// Unix a file of that name (a directory isn't renamed over a file). Windows renames a directory
+/// over a file (std's rename replaces it), so there it is a directory with a file in it that this
+/// process holds open, which no one can delete meanwhile.
+struct InTheWay {
+    keep: PathBuf,
+    #[cfg(windows)]
+    held: Option<std::fs::File>,
+}
+
+impl InTheWay {
+    fn new(keep: PathBuf) -> InTheWay {
+        #[cfg(unix)]
+        {
+            std::fs::write(&keep, "in the way\n").unwrap();
+            InTheWay { keep }
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            std::fs::create_dir(&keep).unwrap();
+            let held = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .share_mode(windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ)
+                .open(keep.join("in-the-way"))
+                .unwrap();
+            InTheWay {
+                keep,
+                held: Some(held),
+            }
+        }
+    }
+
+    /// Out of the way: kept files delivered from now on are stored.
+    #[cfg_attr(not(windows), allow(unused_mut))]
+    fn clear(mut self) {
+        #[cfg(unix)]
+        std::fs::remove_file(&self.keep).unwrap();
+        #[cfg(windows)]
+        {
+            drop(self.held.take());
+            std::fs::remove_dir_all(&self.keep).unwrap();
+        }
+    }
 }
 
 /// Whether job `job`'s notes say its kept files from b were not delivered.
@@ -2898,7 +2945,7 @@ fn kept_files_that_cannot_be_delivered_are_given_up_on() {
     let a = w.node("a").start();
     let b = w.node("b").keep_give_up(3_000).start();
     pair(&a, &b);
-    let job = dispatch_undeliverable_keep(&a, 3);
+    let (job, _in_the_way) = dispatch_undeliverable_keep(&a, 3);
     let o = a.cli(&["wait", &job]);
     assert_eq!(o.code, 3, "{}\n{}", o.stdout, a.daemon_log());
     let j = a.get(&job);
@@ -2927,13 +2974,13 @@ fn kept_files_delivered_after_a_failure_are_the_jobs() {
     let a = w.node("a").start();
     let b = w.node("b").start();
     pair(&a, &b);
-    let job = dispatch_undeliverable_keep(&a, 0);
+    let (job, in_the_way) = dispatch_undeliverable_keep(&a, 0);
     wait_until("a waits for the kept files", || {
         a.daemon_log().contains(&format!(
             "{job}: ended on b; its kept files have not arrived"
         ))
     });
-    std::fs::remove_file(a.paths.job_dir(&job).join("keep")).unwrap();
+    in_the_way.clear();
     let j = a.done(&job);
     assert_eq!((j.state, j.exit_code), (JobState::Succeeded, Some(0)));
     assert_eq!(
@@ -2952,7 +2999,7 @@ fn an_owner_gives_up_on_kept_files_from_a_runner_that_is_down() {
     let a = w.node("a").keep_give_up(6_000).start();
     let mut b = w.node("b").start();
     pair(&a, &b);
-    let job = dispatch_undeliverable_keep(&a, 0);
+    let (job, _in_the_way) = dispatch_undeliverable_keep(&a, 0);
     wait_until("a waits for the kept files", || {
         a.daemon_log().contains(&format!(
             "{job}: ended on b; its kept files have not arrived"
@@ -2982,7 +3029,7 @@ fn kept_files_from_a_removed_runner_are_given_up_on_at_once() {
     let a = w.node("a").start();
     let mut b = w.node("b").start();
     pair(&a, &b);
-    let job = dispatch_undeliverable_keep(&a, 0);
+    let (job, _in_the_way) = dispatch_undeliverable_keep(&a, 0);
     wait_until("a waits for the kept files", || {
         a.daemon_log().contains(&format!(
             "{job}: ended on b; its kept files have not arrived"
@@ -3662,7 +3709,7 @@ fn env_of_another_member_comes_from_its_daemon() {
         let there = asker.cli_ok(&["env", "b"]);
         assert_eq!(there["node"], "b");
         assert_eq!(there["env"]["HOME"], home(&b).as_str(), "{there}");
-        assert_eq!(there["env"]["PATH"], "/usr/bin:/bin:/usr/sbin:/sbin");
+        assert_eq!(there["env"]["PATH"], common::LOGIN_PATH.as_str());
     }
     let human = Command::new(BIN)
         .args(["env", "b"])
@@ -3671,9 +3718,20 @@ fn env_of_another_member_comes_from_its_daemon() {
         .output()
         .unwrap();
     assert_eq!(human.status.code(), Some(0));
+    // b's login environment as the test made it ([`Node::start`]), in order.
+    let login: BTreeMap<String, String> = [
+        ("HOME".to_string(), home(&b)),
+        ("PATH".to_string(), common::LOGIN_PATH.to_string()),
+    ]
+    .into_iter()
+    .chain(common::windows_essentials())
+    .collect();
     assert_eq!(
         String::from_utf8_lossy(&human.stdout),
-        format!("HOME={}\nPATH=/usr/bin:/bin:/usr/sbin:/sbin\n", home(&b))
+        login
+            .iter()
+            .map(|(k, v)| format!("{k}={v}\n"))
+            .collect::<String>()
     );
     let note = String::from_utf8_lossy(&human.stderr).into_owned();
     assert!(
@@ -6176,6 +6234,20 @@ fn unsigned_job(
     cmd: &[&str],
 ) -> JobRecord {
     let source = w.repo.join(".git");
+    #[cfg_attr(not(windows), allow(unused_mut))]
+    let mut on: BTreeMap<String, String> = on
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    // On Windows a job that names no system asks for Windows, as a dispatch here does
+    // ([`Node::cli_keyed`]): a Windows machine runs only jobs that do.
+    #[cfg(windows)]
+    if !["os", "linux", "macos", "windows"]
+        .iter()
+        .any(|k| on.contains_key(*k))
+    {
+        on.insert("windows".into(), String::new());
+    }
     let spec = potluck::types::JobSpec {
         priority,
         request: potluck::types::Request {
@@ -6184,10 +6256,7 @@ fn unsigned_job(
             gpus: Vec::new(),
             exclusive,
         },
-        on: on
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect(),
+        on,
         repo: RepoRef {
             id: potluck::types::repo_id(&source),
             commit: git(&w.repo, &["rev-parse", "HEAD"]),
@@ -6796,7 +6865,13 @@ fn a_grant_unlike_the_queue_entry_claimed_is_never_run() {
             held(&|_| {}),
             Box::new(|s| s.request.ram_mib = 1024),
         ),
-        ("c-912", held(&|_| {}), Box::new(|s| s.on.clear())),
+        // No `--on` but `windows` on Windows, which runs only jobs that ask for it: else b
+        // wouldn't claim it at all.
+        (
+            "c-912",
+            held(&|_| {}),
+            Box::new(|s| s.on.retain(|k, _| k == "windows")),
+        ),
         (
             "c-913",
             held(&|s| s.workspace = Some("b-w99".into())),
