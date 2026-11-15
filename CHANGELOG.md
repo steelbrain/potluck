@@ -12,7 +12,9 @@
   it may have at most its process limit, and at its run limit or on `cancel` its command gets
   CTRL_BREAK, then the job object is ended.
 - On Windows, workspaces are block clones on a Dev Drive or another ReFS volume, so `POTLUCK_HOME`
-  must be on one; jobs start from the user's environment as a new sign-in gets it.
+  must be on one, and hold the same bytes and symbolic links as on Linux and macOS. Jobs start
+  from the user's environment as a new sign-in gets it, with `TEMP` and `TMP` naming their
+  `TMPDIR`, and no crash or error dialog waits in the user's session for a job's process.
 - On Windows, `potluck service install` registers the Task Scheduler task `potluck`, which runs the
   daemon at your sign-in, in your session.
 - On Windows, `potluck restart` starts the daemon again as a new process: running and queued jobs
