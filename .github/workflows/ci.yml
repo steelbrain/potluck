@@ -1,10 +1,11 @@
-# Checks every push to a branch and every pull request, on macOS (arm64) and Linux (x86_64 and
-# arm64): formatting, clippy, the test suite with the pinned nightly, and `cargo check` on stable
-# Rust.
+# Checks every push to a branch and every pull request, on macOS (arm64), Linux (x86_64 and
+# arm64) and Windows (x86_64 and arm64): formatting, clippy, the test suite with the pinned
+# nightly, and `cargo check` on stable Rust.
 #
 # The tests need what a potluck machine needs (docs/development.md): the target directory on a
 # copy-on-write filesystem, and on Linux the systemd user manager with lingering. macOS runners
-# have APFS; .github/ci-linux-setup.sh provides both on the Ubuntu runners.
+# have APFS; .github/ci-linux-setup.sh provides both on the Ubuntu runners, and
+# .github/ci-windows-setup.ps1 a ReFS target directory on the Windows runners.
 
 name: ci
 
@@ -46,6 +47,11 @@ jobs:
           # libc's types differ there (c_char is unsigned), and so may cgroups and systemd.
           - name: Linux arm64
             runner: ubuntu-24.04-arm
+          - name: Windows x86_64
+            runner: windows-2025
+          # The release ships an arm64 Windows binary too.
+          - name: Windows arm64
+            runner: windows-11-arm
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     steps:
@@ -57,6 +63,11 @@ jobs:
       - name: Prepare the runner (btrfs target directory, systemd user manager)
         if: runner.os == 'Linux'
         run: bash .github/ci-linux-setup.sh
+
+      - name: Prepare the runner (ReFS target directory)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: .github/ci-windows-setup.ps1
 
       # The toolchain rust-toolchain.toml pins (a nightly; .cargo/config.toml adds -Zthreads=8),
       # and the latest stable for the stable check.

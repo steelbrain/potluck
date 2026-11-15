@@ -75,10 +75,12 @@ A few tests skip themselves, with a note on stderr, when the machine lacks somet
 ## CI
 
 `.github/workflows/ci.yml` runs the four checks on macOS arm64 (`macos-15`), Linux x86_64
-(`ubuntu-24.04`) and Linux arm64 (`ubuntu-24.04-arm`). On Linux it first runs
-`.github/ci-linux-setup.sh`, which mounts a btrfs filesystem (a loopback file) over `./target`,
-enables lingering, and starts the user manager and its bus. That script uses sudo and changes
-the machine, so don't run it on a machine you use.
+(`ubuntu-24.04`), Linux arm64 (`ubuntu-24.04-arm`), Windows x86_64 (`windows-2025`) and Windows
+arm64 (`windows-11-arm`). On Linux it first runs `.github/ci-linux-setup.sh`, which mounts a btrfs
+filesystem (a loopback file) over `./target`, enables lingering, and starts the user manager and
+its bus. On Windows it first runs `.github/ci-windows-setup.ps1`, which mounts a ReFS volume (a
+sparse virtual disk; a Dev Drive on Windows 11) over `./target` and excludes it from Defender's
+scanning. Both scripts change the machine, so don't run them on a machine you use.
 
 `.github/workflows/release.yml` builds the binaries for a pushed `v*` tag and publishes them as
 that tag's GitHub release, with `install.sh` and `SHA256SUMS`. Before a binary is handed on, it
