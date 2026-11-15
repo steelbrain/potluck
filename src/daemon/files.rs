@@ -488,7 +488,7 @@ fn copy_into(
         let to = dest.join(&rel);
         if meta.is_dir() {
             if let Err(e) = std::fs::create_dir_all(&to) {
-                failed.push(format!("{}: {e}", rel.display()));
+                failed.push(format!("{}: {e}", slashed(&rel)));
                 any = true;
                 continue;
             }
@@ -510,11 +510,11 @@ fn copy_into(
             // first: copying onto it fails when it is read-only.
             let _ = std::fs::remove_file(&to);
             match std::fs::copy(&src, &to) {
-                Ok(_) => kept.push(Path::new(KEEP).join(&rel).to_string_lossy().into_owned()),
+                Ok(_) => kept.push(format!("{KEEP}/{}", slashed(&rel))),
                 Err(e) => {
                     // A copy cut short must not pass for the file (it would be shipped as kept).
                     let _ = std::fs::remove_file(&to);
-                    failed.push(format!("{}: {e}", rel.display()));
+                    failed.push(format!("{}: {e}", slashed(&rel)));
                 }
             }
         }
@@ -522,10 +522,41 @@ fn copy_into(
     any
 }
 
+/// A path in the workspace as the job's record lists it: its components joined by `/`, on Windows
+/// too (the record goes to the dispatching machine, which may run another system).
+fn slashed(rel: &Path) -> String {
+    rel.components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::proto::read_msg;
+
+    /// The record lists kept files with `/` between components on every system.
+    #[test]
+    fn kept_files_are_listed_with_slashes() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().join("ws");
+        std::fs::create_dir_all(root.join("out").join("sub")).unwrap();
+        std::fs::write(root.join("out").join("a.txt"), b"a").unwrap();
+        std::fs::write(root.join("out").join("sub").join("b.txt"), b"b").unwrap();
+        let dest = d.path().join("keep");
+        let log = Logger::open(&d.path().join("log"));
+        let kept = keep(&root, &["out/**".into()], &dest, &log, "j");
+        assert_eq!(
+            kept.kept,
+            [format!("{KEEP}/out/a.txt"), format!("{KEEP}/out/sub/b.txt")]
+        );
+        assert!(kept.failed.is_empty(), "{:?}", kept.failed);
+        assert_eq!(
+            std::fs::read(dest.join("out").join("sub").join("b.txt")).unwrap(),
+            b"b"
+        );
+    }
     use std::io::BufRead;
 
     /// A tree with symlinks (Unix: on Windows making one takes a privilege a test can't count on).
