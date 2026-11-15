@@ -134,8 +134,8 @@ A job gets everything it asks for at once, or waits, so jobs can't deadlock on e
   the unit's `CPUWeight` to 100 per core; on macOS it has no effect.
 - `--gpu SEL`, repeatable: one GPU each, held only by this job until it ends. A selector is `any`,
   a vendor (`nvidia`, `amd`, `intel`, `apple`, or a PCI vendor id such as `10de`), `vendor:device`
-  in hex (`10de:2c19`), a GPU id from `potluck nodes` (`10de:2c19@0000:01:00.0` on Linux, `mac0`
-  on macOS), or an alias from the machine's config. The job finds its GPU ids in `POTLUCK_GPUS`.
+  in hex (`10de:2c19`), a GPU id from `potluck nodes` (`10de:2c19@0000:01:00.0` on Linux and
+  Windows, `mac0` on macOS), or an alias from the machine's config. The job finds its GPU ids in `POTLUCK_GPUS`.
 - `--exclusive`: the job starts only when nothing else runs on the machine, nothing starts beside
   it, and it holds every GPU there. Nothing is paused or killed to make room. While it waits, other
   jobs that fit start on the machine until it holds the line (see [Order](#order)).
@@ -191,21 +191,37 @@ nor killed.
 `--on`, repeatable, names a fact the machine must have, and every one must hold. Facts aren't
 reserved.
 
-- `--on macos` or `--on linux`: that OS, any version. Only these two stand without a value.
-- `--on macos=27`: macOS 27.x. `--on linux=7.2`: Linux with kernel 7.2.x.
+- `--on macos`, `--on linux` or `--on windows`: that OS, any version. Only these three stand
+  without a value.
+- `--on macos=27`: macOS 27.x. `--on linux=7.2`: Linux with kernel 7.2.x. `--on windows=11`:
+  Windows 11, and `--on windows=11-24h2` its 24H2 release.
 - `--on KEY=VALUE`, for these facts:
 
 | Key | Matches |
 | --- | --- |
-| `os` | `linux` or `macos`, case ignored (`macOS`) |
-| `os_version` | the macOS version (`27.0.1`), or the Linux distribution as os-release names it (`Ubuntu 24.04`) |
-| `kernel` | `uname -r` on Linux (`7.2.8-2-cachyos`), the Darwin version on macOS |
+| `os` | `linux`, `macos` or `windows`, case ignored (`macOS`) |
+| `os_version` | the macOS version (`27.0.1`), the Linux distribution as os-release names it (`Ubuntu 24.04`), or the Windows version and release (`11 24H2`, `10 22H2`, `Server 2025 24H2`) |
+| `kernel` | `uname -r` on Linux (`7.2.8-2-cachyos`), the Darwin version on macOS, the build on Windows (`10.0.26100.4652`) |
 | `arch` | `x86_64` or `aarch64`, case ignored; `arm64` is `aarch64` and `amd64` is `x86_64` |
 | `gpu` | a GPU selector, as for `--gpu`, without leasing the GPU |
-| `gpu_driver` | a GPU whose kernel driver has that name (`nvidia`, `amdgpu`, `i915`; Linux only) |
+| `gpu_driver` | a GPU whose driver has that name, case ignored: the kernel driver on Linux (`nvidia`, `amdgpu`, `i915`), the display driver's service name on Windows (`nvlddmkm` for NVIDIA, `amdkmdag` for AMD); never on macOS |
 | `ram_gib` | at least that much RAM (`32`, `15.5`) |
 | `cpus`, `cpu_model`, `node` | exactly |
-| `display` | `true` when a graphical session is up for the user |
+| `display` | `true` when a graphical session is up for the user; on Windows, a connected session of the user, at the screen or over Remote Desktop |
+
+A Windows machine runs only jobs that ask for Windows: `--on windows`, `--on windows=V`, `--on
+os=windows`, or a recipe's `on` that says one of these. A job that names no OS runs on the Linux and
+macOS machines only, since the commands of such jobs are Unix commands, and a job asking for
+Windows runs on Windows machines only. A refusal says so for each Windows machine:
+
+```console
+$ potluck dispatch --timeout 10m --on gpu=nvidia -- cargo test
+potluck: no machine could ever run this job (studio: needs gpu=nvidia (this machine: Apple M3 Max); win1: runs only jobs that ask for --on windows)
+```
+
+On Windows, a GPU is a display adapter on PCI that Windows lists as present, with its id read
+like Linux's: the PCI vendor and device, then the PCI bus, device and function (in domain 0).
+Its name is the adapter's description in Device Manager.
 
 Versions match by leading parts. A value is split into parts at `.`, `-`, `_`, `+` and spaces, case
 is ignored, and a requirement matches when its parts are the first parts of the machine's value:
@@ -333,7 +349,10 @@ A job's environment is built in this order, later entries winning:
 
 1. the user's login environment, which the daemon captures from a login shell (`$SHELL -l`) when it
    starts. A login shell doesn't read `.zshrc` or `.bashrc`, so what jobs need belongs in a login
-   profile. A variable whose name or value isn't UTF-8 is left out, and `daemon.log` names it;
+   profile. On Windows it is the environment Windows gives a new sign-in of the user, read when
+   the daemon starts: the system environment variables, then the user's (with `Path` joined from
+   both), and the profile's own (`USERPROFILE`, `APPDATA`, `LOCALAPPDATA`); no shell runs. A
+   variable whose name or value isn't UTF-8 is left out, and `daemon.log` names it;
 2. the `env` of each `[[gpu]]` entry of the machine's config whose GPU the job holds;
 3. `[env]` of the `potluck.toml` committed at the dispatched commit, then the recipe's `env`;
 4. `--env K=V`;
@@ -358,7 +377,8 @@ potluck: --unset-env: TMPDIR is one of potluck's own variables, which every job 
 ```
 
 The daemon captures the login environment when it starts, so a change to a login profile, or to
-anything else the login shell reads, reaches jobs only after `potluck restart` on that machine
+anything else the login shell reads (on Windows, to the environment variables in Settings),
+reaches jobs only after `potluck restart` on that machine
 (or a restart of the daemon's service). A restart in place captures it again in the background:
 a job that starts before that capture ends gets the environment from before the restart, and so
 do all jobs if the capture fails (`daemon.log` says why). `potluck env NODE` prints the login
@@ -431,8 +451,8 @@ patterns), `env`, `unset_env` (a list of variable names, as `--unset-env` takes 
 (a list of pools, as `--pool` takes them; `--pool` replaces it). Unknown fields are refused, so a
 misspelled option can't be dropped silently. `on` is a table, as above, or a list in `--on`'s form: `on = ["macos=27", "gpu=apple"]`.
 Options on the command line replace the recipe's; `on` and `env` merge key by key, the command line
-last, with `os`, `macos` and `linux` counting as one key, so `--on macos` replaces a recipe's
-`os = "linux"`. `env` and `unset_env` merge the same way, as one set of keys: the recipe's
+last, with `os`, `macos`, `linux` and `windows` counting as one key, so `--on macos` replaces a
+recipe's `os = "linux"`. `env` and `unset_env` merge the same way, as one set of keys: the recipe's
 `unset_env` removes what `[env]` sets, `--env K=V` sets K although the recipe's `unset_env` names
 it, and `--unset-env K` removes K although `[env]` or the recipe's `env` sets it. A recipe that
 names one variable in both its `env` and its `unset_env` is refused. A recipe's

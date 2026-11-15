@@ -1,6 +1,7 @@
 # Configuration
 
-Each machine reads `~/.config/potluck/node.toml`, or `$POTLUCK_CONFIG`; the daemon reads it when it
+Each machine reads `~/.config/potluck/node.toml` (on Windows
+`%USERPROFILE%\.config\potluck\node.toml`), or `$POTLUCK_CONFIG`; the daemon reads it when it
 starts. The file is optional, and unknown keys are an error.
 
 | Key | Default | Meaning |
@@ -12,7 +13,7 @@ starts. The file is optional, and unknown keys are an error.
 | `ram_gib` | total RAM minus 4 GiB or 10%, whichever is more | what RAM reservations may add up to, more than 0 and at most 1048576 |
 | `workspace_budget_percent` | `10` | the share of the disk workspaces may use, 0 to 100 |
 | `workspace_budget_min_gib` | `50` | the smallest workspace budget, in GiB |
-| `kill_grace_s` | `10` | seconds from SIGTERM to SIGKILL, at most 86400 |
+| `kill_grace_s` | `10` | seconds from SIGTERM to SIGKILL (on Windows from CTRL_BREAK to ending the job's processes), at most 86400 |
 | `stall_minutes` | `10` | under 1% of a CPU core and no output this long is a stall, at most 10080; `0` turns stall checks off |
 | `retention_days` | `14` | how long job records, output logs and kept files are kept after the job ends, counted from when this machine learned of the end, on its own clock |
 | `log_max_mib` | `1024` | how much of a job's output its log keeps before it drops the rest but the last 16 MiB (see [Output](jobs.md#output)); `0`: no limit |

@@ -35,6 +35,17 @@ one when it starts, unless it names one with `--workspace`.
   `workspace_budget_percent` of the disk (10), but at least `workspace_budget_min_gib` (50).
   A workspace that is held, or has a job queued or running, is never removed.
 
+On Windows, workspaces are block clones on ReFS, so potluck's state directory must be on a Dev
+Drive or another ReFS volume. A workspace holds the commit's files with the line endings the
+repository's `.gitattributes` ask for: potluck's mirrors set `core.autocrlf=false`, where Git for
+Windows sets it to `true` for the whole machine when it is installed, and files under `* text=auto`
+get CRLF there. NTFS and ReFS treat names that differ only in case (`README` and `readme`) as one,
+and Windows refuses some names (`aux.c`, `a:b`, a name ending in a dot); a commit that has either
+can't be seeded there, and the job fails at start saying which paths. Git for Windows checks a
+commit's symbolic links out as symbolic links only with `core.symlinks=true`, which needs
+Developer Mode on (or the Create symbolic links privilege), and otherwise as small files that hold
+each link's target.
+
 `potluck release W` ends the hold and removes the workspace at once; if a job is queued or running
 in it, only the hold ends, and the job running in it then doesn't hold it again when it ends.
 `potluck cp W:PATH DEST` copies a file or directory out of a workspace, from any member, with
