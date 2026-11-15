@@ -62,6 +62,7 @@ pub fn run(
     cmd: &[String],
 ) -> anyhow::Result<i32> {
     ignore_ctrl_events();
+    no_error_boxes();
     keep_std_handles();
     let out = File::from(std::io::stdout().as_handle().try_clone_to_owned()?);
     let limit = Limit {
@@ -69,6 +70,21 @@ pub fn run(
         tail: LOG_TAIL_BYTES,
     };
     supervise(out, status, job, limit, cmd)
+}
+
+/// No message box waits for a click: not for a crash (Windows Error Reporting is not invoked, so
+/// a crashed process ends at once instead of staying alive behind a "stopped working" dialog in
+/// the user's session), a drive that isn't ready, or a file that can't be opened. CMD and what it
+/// starts inherit this error mode; the job object also forces the crash part on every process in
+/// it (JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION).
+fn no_error_boxes() {
+    use windows_sys::Win32::System::Diagnostics::Debug::{
+        SEM_FAILCRITICALERRORS, SEM_NOGPFAULTERRORBOX, SEM_NOOPENFILEERRORBOX, SetErrorMode,
+    };
+    // SAFETY: plain call; it only sets this process's error mode.
+    unsafe {
+        SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX)
+    };
 }
 
 /// CTRL_C and CTRL_BREAK meant for CMD's process group, or sent to the whole console by a

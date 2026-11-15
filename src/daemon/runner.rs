@@ -1653,6 +1653,12 @@ fn prepare_and_start(sh: &Arc<Shared>, id: &str) -> Result<(), NotStarted> {
     let mut env = JobEnv::default();
     env.extend(login);
     env.extend(gpu_env(&sh.config, &facts, &lease.grant.gpus));
+    // Windows programs take their temporary directory from TEMP and TMP, not TMPDIR: there both
+    // name the job's TMPDIR too, unless the dispatch sets or unsets them.
+    #[cfg(windows)]
+    for k in ["TEMP", "TMP"] {
+        env.insert(k.into(), tmp.display().to_string());
+    }
     env.extend(job.spec.env.clone());
     for k in &job.spec.unset_env {
         env.remove(k);

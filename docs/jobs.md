@@ -308,8 +308,9 @@ the `.ips` files that ReportCrash writes to `~/Library/Logs/DiagnosticReports`, 
 when the crashed process, or its parent, was one of the job's. On Linux, when systemd-coredump
 recorded core dumps of the job's unit, the output of `coredumpctl info` for them is saved there as
 `coredumps.txt`; the dumps themselves stay where systemd-coredump keeps them. On Windows there are
-none: a process of a job that crashes ends at once, with no error report, and its exit code is
-the exception's code (0xC0000005 for an access violation).
+none: a process of a job that crashes ends at once, with no error report and no dialog waiting in
+the user's session, and its exit code is the exception's code (0xC0000005 for an access
+violation). Neither do dialogs for a drive that isn't ready or a file that can't be opened appear.
 
 ## Output
 
@@ -373,6 +374,9 @@ A job's environment is built in this order, later entries winning:
    `POTLUCK_HOME`, `POTLUCK_CONFIG`, `TMPDIR`, a directory beside the workspace that is removed
    with it, and `POTLUCK_MIRROR_<name>` for each `--carry`. A `POTLUCK_MIRROR_` variable from the
    steps above is dropped, so a job has only those of its own `--carry`.
+
+On Windows, `TEMP` and `TMP` name the same directory as `TMPDIR`, after the first two steps, so
+`[env]`, `--env` and `--unset-env` can change them.
 
 Nothing comes from the shell that ran `dispatch`.
 

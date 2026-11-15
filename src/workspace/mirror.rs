@@ -56,6 +56,15 @@ const WINDOWS_CONFIG: &[(&str, &str)] = &[
     // CRLF line endings into every text file of a tree: a tree holds the commit's files as the
     // repository's own attributes (`.gitattributes`) check them out, as on Linux and macOS.
     ("core.autocrlf", "false"),
+    // Files the attributes mark as text (`* text=auto`) with no `eol` of their own are written
+    // with LF, as on Linux and macOS, not Windows' CRLF: a tree holds the same bytes on every
+    // machine. A file whose attributes say `eol=crlf` still gets CRLF.
+    ("core.eol", "lf"),
+    // Symbolic links checked out as symbolic links, as on Linux and macOS (Git for Windows writes
+    // them as small text files holding the target unless this is on). Making them needs Developer
+    // Mode or the Create symbolic links privilege; without either, seeding a commit that has one
+    // fails, naming it.
+    ("core.symlinks", "true"),
     // Paths longer than 260 characters (deep trees under a state directory's own path).
     ("core.longpaths", "true"),
 ];
