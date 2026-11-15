@@ -24,8 +24,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{
-    DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_OPERATION_ABORTED, HANDLE, HANDLE_FLAG_INHERIT,
-    INVALID_HANDLE_VALUE, SetHandleInformation, WAIT_OBJECT_0,
+    DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_INVALID_NAME, ERROR_OPERATION_ABORTED, HANDLE,
+    HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation, WAIT_OBJECT_0,
 };
 use windows_sys::Win32::System::Console::{
     CTRL_BREAK_EVENT, CTRL_C_EVENT, GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE,
@@ -242,11 +242,7 @@ fn supervise(
     let mut group = match spawned {
         Ok(group) => group,
         Err(e) => {
-            let code = if e.kind() == std::io::ErrorKind::NotFound {
-                127
-            } else {
-                126
-            };
+            let code = if not_found(&e) { 127 } else { 126 };
             let _ = writeln!(lock(&shared.sink).out.file, "{}", start_error(prog, &e));
             stop_reading(&shared, reading);
             drop(watching);
@@ -552,13 +548,19 @@ fn duplicate(h: HANDLE) -> Option<Owned> {
     if ok == 0 { None } else { Owned::new(dup) }
 }
 
-/// What the log says when `prog` couldn't start. Windows says only "The system cannot find the
-/// path specified" for a program that names its arguments too (`-- "bash -lc 'make'"`): the
-/// whole string is taken for a path. So a program not found whose name holds a space or tab
-/// gets told that the program and its arguments are separate arguments.
+/// Whether a start failed for want of the program: no such file or directory, or a name no file
+/// can have (`ping -n 1 ::1` taken whole for a program's name, `:` and all).
+fn not_found(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::NotFound || e.raw_os_error() == Some(ERROR_INVALID_NAME as i32)
+}
+
+/// What the log says when `prog` couldn't start. For a program that names its arguments too
+/// (`-- "bash -lc 'make'"`) Windows says only that it can't find the path, or that the name is
+/// wrong: the whole string is taken for a path. So a program not found whose name holds a space
+/// or tab gets told that the program and its arguments are separate arguments.
 fn start_error(prog: &str, e: &std::io::Error) -> String {
     let mut msg = format!("potluck: could not start {prog}: {e}");
-    if e.kind() == std::io::ErrorKind::NotFound && prog.contains([' ', '\t']) {
+    if not_found(e) && prog.contains([' ', '\t']) {
         msg.push_str(
             "; the program is the command's first argument and each of its arguments one of \
              their own: `potluck dispatch -- PROGRAM ARG...`",
