@@ -247,13 +247,16 @@ fn refs(dir: &Path, prefixes: &[&str]) -> BTreeMap<String, String> {
         .collect()
 }
 
-/// Paths of the worktrees git lists for a mirror, besides the bare repository itself.
-fn worktrees(mirror: &Path) -> Vec<String> {
+/// Paths of the worktrees git lists for a mirror, besides the bare repository itself. (Git for
+/// Windows writes them with forward slashes, `C:/state/bases/x`: a path compares by its
+/// components, so that equals `C:\state\bases\x`, though not the verbatim `\\?\C:\state\bases\x`
+/// that `std::fs::canonicalize` gives: compare with `potluck::sys::canonicalize`.)
+fn worktrees(mirror: &Path) -> Vec<PathBuf> {
     git(mirror, &["worktree", "list", "--porcelain"])
         .lines()
         .filter_map(|l| l.strip_prefix("worktree "))
-        .map(String::from)
         .filter(|p| !p.ends_with(".git"))
+        .map(PathBuf::from)
         .collect()
 }
 
@@ -334,7 +337,10 @@ fn inspect_ids_stable_across_worktrees() {
     assert_eq!(main.id, agent.id);
     assert!(main.id.starts_with("proj-"), "{}", main.id);
     assert_eq!(main.source, agent.source);
-    assert_eq!(main.source, std::fs::canonicalize(r.join(".git")).unwrap());
+    assert_eq!(
+        main.source,
+        potluck::sys::canonicalize(&r.join(".git")).unwrap()
+    );
     assert_eq!(
         (main.commit.as_str(), main.branch.as_deref()),
         (c1.as_str(), Some("main"))
@@ -528,7 +534,7 @@ fn inspect_submodules_nested() {
     assert!(lib_ref.repo_id.starts_with("lib-"), "{}", lib_ref.repo_id);
     assert_eq!(
         lib_ref.source,
-        std::fs::canonicalize(app.join(".git/modules/vendor/lib")).unwrap()
+        potluck::sys::canonicalize(&app.join(".git/modules/vendor/lib")).unwrap()
     );
     assert!(repo.submodules[1].repo_id.starts_with("inner-"));
     assert_ne!(repo.submodules[0].repo_id, repo.id);
@@ -1281,12 +1287,7 @@ fn seeding_writes_only_what_differs_from_the_base() {
     let mirror = e.mirror(&repo1.id);
     assert_eq!(
         worktrees(&mirror),
-        vec![
-            std::fs::canonicalize(&base)
-                .unwrap()
-                .to_string_lossy()
-                .into_owned()
-        ]
+        vec![potluck::sys::canonicalize(&base).unwrap()]
     );
     assert!(e.workspace_pins(&repo1.id).is_empty());
     assert!(refs(&mirror, &["refs/potluck"]).contains_key("refs/potluck/base"));
@@ -1375,12 +1376,8 @@ fn seeding_with_nested_submodules() {
     ids.extend(repo1.submodules.iter().map(|s| s.repo_id.clone()));
     for id in ids {
         let m = e.mirror(&id);
-        let base = std::fs::canonicalize(e.ws.paths.base(&id)).unwrap();
-        assert_eq!(
-            worktrees(&m),
-            vec![base.to_string_lossy().into_owned()],
-            "{id}"
-        );
+        let base = potluck::sys::canonicalize(&e.ws.paths.base(&id)).unwrap();
+        assert_eq!(worktrees(&m), vec![base], "{id}");
         let wt_dirs: Vec<_> = std::fs::read_dir(m.join("worktrees")).unwrap().collect();
         assert_eq!(wt_dirs.len(), 1, "{id}");
         assert!(e.workspace_pins(&id).is_empty(), "{id}");
@@ -1593,8 +1590,8 @@ fn create_refuses_commits_the_mirror_lacks_and_leaves_nothing() {
 #[test]
 fn relative_state_directory() {
     let t = tmp();
-    let cwd = std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
-    let dir = std::fs::canonicalize(t.path()).unwrap();
+    let cwd = potluck::sys::canonicalize(&std::env::current_dir().unwrap()).unwrap();
+    let dir = potluck::sys::canonicalize(t.path()).unwrap();
     let (a, b): (Vec<_>, Vec<_>) = (cwd.components().collect(), dir.components().collect());
     let common = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
     // Up and back into the current directory first, so the path always has a `..` in it.
@@ -1618,19 +1615,13 @@ fn relative_state_directory() {
     assert!(report.created, "{report:?}");
     let root = ws.create(&"t-w1".to_string(), &repo).unwrap();
     assert!(root.is_absolute(), "{}", root.display());
-    let root = std::fs::canonicalize(root).unwrap();
+    let root = potluck::sys::canonicalize(&root).unwrap();
     assert_eq!(root, dir.join("state/workspaces/t-w1"));
     ws.verify(&root, &repo).unwrap();
     assert_eq!(std::fs::read_to_string(root.join("a")).unwrap(), "1\n");
     let mirror = dir.join(format!("state/mirrors/{}.git", repo.id));
     let base = dir.join(format!("state/bases/{}", repo.id));
-    assert_eq!(
-        worktrees(&mirror),
-        vec![
-            base.to_string_lossy().into_owned(),
-            root.to_string_lossy().into_owned()
-        ]
-    );
+    assert_eq!(worktrees(&mirror), vec![base.clone(), root.clone()]);
     let record = WorkspaceRecord {
         id: "t-w1".into(),
         node: "test".into(),
@@ -1648,10 +1639,7 @@ fn relative_state_directory() {
     };
     ws.remove(&record).unwrap();
     assert!(!root.exists());
-    assert_eq!(
-        worktrees(&mirror),
-        vec![base.to_string_lossy().into_owned()]
-    );
+    assert_eq!(worktrees(&mirror), vec![base]);
 }
 
 #[test]
@@ -2173,7 +2161,8 @@ fn files_git_itself_normalises_seed_clean_and_blame_nothing() {
     for autocrlf in [false, true] {
         let e = env();
         let (repo2, repo3) = normalised_fixture(&e, autocrlf);
-        // What a plain checkout of each commit writes, with the same config.
+        // What a plain checkout of each commit writes, with the same config. (A mirror sets
+        // core.eol=lf on Windows, where the native line end is CRLF; LF is native elsewhere.)
         let fresh = |repo: &RepoRef| -> BTreeMap<String, Vec<u8>> {
             let dir = e.path(&format!("fresh-{}", &repo.commit[..8]));
             if !dir.exists() {
@@ -2182,9 +2171,10 @@ fn files_git_itself_normalises_seed_clean_and_blame_nothing() {
                     "filter.upper.smudge=tr a-z A-Z",
                     "filter.upper.clean=cat",
                     "filter.strip.clean=sed -e 's/ *$//'",
+                    "core.eol=lf",
                     "core.autocrlf=true",
                 ];
-                for c in &cfg[..if autocrlf { 4 } else { 3 }] {
+                for c in &cfg[..if autocrlf { 5 } else { 4 }] {
                     args.extend(["-c", c]);
                 }
                 let url = repo.source.to_str().unwrap();
@@ -2406,12 +2396,9 @@ fn a_gitattributes_change_rewrites_only_the_files_it_concerns() {
             ..repo2.clone()
         };
         let what = format!("autocrlf {autocrlf}");
-        // `text=auto` checks out with the native line end (core.eol): CRLF on Windows.
-        let eol = if autocrlf || cfg!(windows) {
-            "\r\n"
-        } else {
-            "\n"
-        };
+        // `text=auto` checks out with core.eol: LF, which mirrors set on Windows too (where the
+        // native line end is CRLF).
+        let eol = if autocrlf { "\r\n" } else { "\n" };
         let base = e.ws.paths.base(&repo1.id);
         let w1 = e.ws.create(&"t-w1".to_string(), &repo1).unwrap();
         let inodes = || -> Vec<u128> {
