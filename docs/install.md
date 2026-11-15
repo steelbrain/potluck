@@ -175,8 +175,8 @@ systemd user unit `~/.config/systemd/user/potluck.service`; on macOS the LaunchA
 `~/Library/LaunchAgents/potluck.daemon.plist`, with `AbandonProcessGroup` so that stopping the
 daemon doesn't stop its jobs. On Windows it registers the Task Scheduler task `potluck`, which
 runs the daemon in your session from when you sign in (with your sign-in's token: no stored
-password, no elevation), with no time limit, on battery too, at normal priority, and set to
-restart a minute after a failure. It starts the task at once when you are signed in; otherwise it
+password, no elevation), with no time limit, on battery too, at normal priority; a daemon that
+fails is started again 5 seconds later. It starts the task at once when you are signed in; otherwise it
 says the daemon starts when you sign in. The task is hidden in Task Scheduler unless View > Show
 Hidden Tasks is on; `schtasks /query /tn potluck /v` shows it, and
 `%USERPROFILE%\.config\potluck\potluck.task.xml` is a copy of its definition. The service runs

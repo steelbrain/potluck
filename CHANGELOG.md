@@ -15,8 +15,11 @@
   must be on one, and hold the same bytes and symbolic links as on Linux and macOS. Jobs start
   from the user's environment as a new sign-in gets it, with `TEMP` and `TMP` naming their
   `TMPDIR`, and no crash or error dialog waits in the user's session for a job's process.
+- On Windows a job's command gets its arguments quoted as the C runtime reads them, except
+  `cmd /c LINE`, where cmd gets LINE as typed, quotes included. See
+  [Jobs](docs/jobs.md#dispatching).
 - On Windows, `potluck service install` registers the Task Scheduler task `potluck`, which runs the
-  daemon at your sign-in, in your session.
+  daemon at your sign-in, in your session, and starts it again 5 seconds after it fails.
 - On Windows, `potluck restart` starts the daemon again as a new process: running and queued jobs
   keep going, open connections close and clients connect again.
 - Windows release binaries (`potluck-x86_64-pc-windows-msvc.exe`,
