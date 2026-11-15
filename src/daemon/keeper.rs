@@ -18,7 +18,10 @@
 //! - While it runs it holds [`LOCK_FILE`] in the state directory, so a command line that finds no
 //!   socket meanwhile waits for the daemon ([`super::running_here`]) rather than report none.
 //! - A console's Ctrl+C or Ctrl+Break reaches the daemon too, which shares the keeper's console
-//!   and ends; the keeper lets them pass and exits with the daemon's code.
+//!   and ends; the keeper lets them pass and exits with the daemon's code. A keeper without a
+//!   console (the service's task, which lets go of the window Windows opens for it) starts the
+//!   daemon with `CREATE_NO_WINDOW`: a console program started without a console gets a new
+//!   window otherwise.
 //!
 //! The keeper itself runs the code it started with until it is started again (its service
 //! restarted); it does only this.
@@ -31,7 +34,9 @@ use std::path::Path;
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{FALSE, STATUS_CONTROL_C_EXIT, TRUE};
-use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, CTRL_C_EVENT, SetConsoleCtrlHandler};
+use windows_sys::Win32::System::Console::{
+    CTRL_BREAK_EVENT, CTRL_C_EVENT, GetConsoleWindow, SetConsoleCtrlHandler,
+};
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_BREAKAWAY_OK,
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
@@ -39,7 +44,7 @@ use windows_sys::Win32::System::JobObjects::{
     JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
     TerminateJobObject,
 };
-use windows_sys::Win32::System::Threading::{CREATE_SUSPENDED, ExitProcess};
+use windows_sys::Win32::System::Threading::{CREATE_NO_WINDOW, CREATE_SUSPENDED, ExitProcess};
 
 /// What the daemon exits with to be restarted by its keeper.
 pub const RESTART_EXIT: i32 = 75;
@@ -124,14 +129,17 @@ fn new_job() -> std::io::Result<Owned> {
 }
 
 /// Starts the daemon proper from `exe` in `job`: suspended until it is in the job, so everything
-/// it starts is in the job too.
+/// it starts is in the job too; in the keeper's console, or without a window if it has none.
 fn start(job: &Owned, exe: &Path) -> anyhow::Result<Child> {
     use std::os::windows::io::AsRawHandle;
     use std::os::windows::process::CommandExt;
+    // SAFETY: a plain query.
+    let console = !unsafe { GetConsoleWindow() }.is_null();
+    let window = if console { 0 } else { CREATE_NO_WINDOW };
     let mut child = Command::new(exe)
         .args(std::env::args_os().skip(1))
         .env(MARKER, std::process::id().to_string())
-        .creation_flags(CREATE_SUSPENDED)
+        .creation_flags(CREATE_SUSPENDED | window)
         .spawn()
         .with_context(|| format!("starting the daemon ({})", exe.display()))?;
     // SAFETY: both handles are valid; the child hasn't run an instruction yet.

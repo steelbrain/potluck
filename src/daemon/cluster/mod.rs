@@ -3073,6 +3073,7 @@ mod tests {
     /// process another thread is starting holds a copy of every descriptor until it execs (here
     /// half a second): the handed listener listened on in it, and the port couldn't be bound
     /// ("Address already in use"). (macOS binds the one address beside the other anyway.)
+    #[cfg(unix)]
     #[test]
     fn a_handed_listener_let_go_frees_its_port_while_a_child_being_started_holds_it() {
         use std::io::Read;

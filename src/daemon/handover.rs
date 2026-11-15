@@ -684,7 +684,7 @@ fn children_of(parent: i32) -> Vec<i32> {
     buf.into_iter().filter(|&p| p > 0).collect()
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 fn children_of(_parent: i32) -> Vec<i32> {
     Vec::new()
 }
@@ -1447,6 +1447,7 @@ mod tests {
 
     /// `POTLUCK_HANDOVER` set by hand on a plain `potluck daemon`, naming a file that isn't a
     /// handover file: the daemon refuses to start, and leaves the file alone (it removed it).
+    #[cfg(unix)]
     #[test]
     fn a_file_that_isnt_a_handover_file_is_refused_and_left_alone() {
         let d = tempfile::tempdir().unwrap();
@@ -1489,9 +1490,12 @@ mod tests {
             drained_ms: 7,
         };
         f.write(&p).unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(&p).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o600, "{mode:o}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&p).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "{mode:o}");
+        }
         let back = HandoverFile::read(&p).unwrap();
         assert_eq!(back.conns[0].fd, 6);
         assert_eq!(back.conns[0].asked.as_ref().unwrap().sent_behind, b"{}\n");
@@ -1499,6 +1503,7 @@ mod tests {
         assert_eq!(back.login_env["PATH"], "/bin");
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_child_left_running_is_ended_and_reaped() {
         // A child nobody waits for (as one whose thread stopped waiting): SIGTERM ignored, so it
@@ -2085,6 +2090,7 @@ mod tests {
         /// binary seeds it again and runs it. Before, the thread had 500 ms to write "could not
         /// seed workspace lone-w1: git worktree add: signal: 15 (SIGTERM)" before the store
         /// closed, and the job was failed by the upgrade.
+        #[cfg(unix)]
         #[test]
         fn a_seeding_cut_short_by_a_restart_in_place_is_done_again_not_failed() {
             let dir = tempfile::tempdir().unwrap();
@@ -2143,7 +2149,6 @@ mod tests {
         /// process ended with what it held.
         #[test]
         fn the_daemon_started_again_starts_while_its_store_takes_no_writes() {
-            use std::os::unix::fs::PermissionsExt;
             let dir = tempfile::tempdir().unwrap();
             let lone = Lone::new(dir.path());
             let d = lone.start();
@@ -2169,7 +2174,14 @@ mod tests {
             // Still full: the store opens and reads, and takes no writes (a connection opened so
             // stays read-only).
             let db = sh.paths.db();
-            let mode = |m| std::fs::set_permissions(&db, std::fs::Permissions::from_mode(m));
+            let mode = |m: u32| {
+                let mut p = std::fs::metadata(&db)?.permissions();
+                #[cfg(unix)]
+                std::os::unix::fs::PermissionsExt::set_mode(&mut p, m);
+                #[cfg(windows)]
+                p.set_readonly(m & 0o200 == 0);
+                std::fs::set_permissions(&db, p)
+            };
             mode(0o444).unwrap();
             let again = Daemon::start_from(
                 &lone.paths,
@@ -2452,7 +2464,6 @@ mod tests {
         /// waited for the loop with every connection in the backlog, for the rest of the sync.
         #[test]
         fn the_loop_goes_on_while_a_mirror_sync_holds_up_an_unpin() {
-            use std::os::fd::AsRawFd;
             let dir = tempfile::tempdir().unwrap();
             let lone = Lone::new(dir.path());
             let d = lone.start();
@@ -2467,7 +2478,10 @@ mod tests {
             // A sync of the mirror holds its lock, as `sync_mirror` does while it fetches.
             let sync = std::fs::File::create(mirror.with_extension("lock")).unwrap();
             // SAFETY: flock on a file this test holds open.
+            #[cfg(unix)]
             assert_eq!(unsafe { libc::flock(sync.as_raw_fd(), libc::LOCK_EX) }, 0);
+            #[cfg(windows)]
+            sync.lock().unwrap();
             let orphan = "lone-90".to_string();
             {
                 let mut st = sh.lock();
@@ -2540,6 +2554,7 @@ mod tests {
         }
 
         /// A `potluck restart` on a raw connection, asked: (the connection, why it was asked).
+        #[cfg(unix)]
         fn ask_restart(d: &Daemon) -> (UnixStream, String) {
             let mut asker = UnixStream::connect(d.shared.paths.socket()).unwrap();
             asker
@@ -2550,6 +2565,7 @@ mod tests {
         }
 
         /// Whether anything was sent on `conn` yet (looked at, not read).
+        #[cfg(unix)]
         fn told_yet(conn: &UnixStream) -> bool {
             let mut b = 0u8;
             // SAFETY: recv(2) into one byte this function owns.
@@ -2564,6 +2580,7 @@ mod tests {
             n != -1 || std::io::Error::last_os_error().kind() != std::io::ErrorKind::WouldBlock
         }
 
+        #[cfg(unix)]
         fn processes_tracked(j: &JobRecord) -> usize {
             match &j.handle {
                 Some(Handle::Process { tracked, .. }) => tracked.len(),
@@ -2579,6 +2596,7 @@ mod tests {
         /// stopped and executed the binary whatever its writes did, and the next daemon started
         /// from the record saved earlier (1 process tracked of 9), having told the asker it
         /// restarted plainly before it stopped.
+        #[cfg(unix)]
         #[test]
         fn a_write_that_fails_before_a_plain_restart_holds_it_back_and_is_kept() {
             use std::io::{BufRead, BufReader};
@@ -2647,6 +2665,7 @@ mod tests {
         /// One whose binary can't be executed any more by then is told that instead, and the
         /// daemon serves on. Before, it was told as the stop began, and an exec that failed then
         /// ended the daemon.
+        #[cfg(unix)]
         #[test]
         fn the_asker_of_a_plain_restart_is_told_once_it_goes_ahead() {
             use std::io::{BufRead, BufReader};
@@ -2740,16 +2759,26 @@ mod tests {
 
     #[test]
     fn wait_readable_sees_data_the_wake_and_the_time() {
+        use crate::sys::local::AsRawSock;
         let up = Upgrade::new().unwrap();
+        #[cfg(unix)]
         let (a, mut b) = UnixStream::pair().unwrap();
+        #[cfg(windows)]
+        let (_dir, a, mut b) = {
+            let dir = tempfile::tempdir().unwrap();
+            let l = UnixListener::bind(dir.path().join("s")).unwrap();
+            let b = UnixStream::connect(dir.path().join("s")).unwrap();
+            let (a, _) = l.accept().unwrap();
+            (dir, a, b)
+        };
         let t = Some(Duration::from_millis(50));
         assert_eq!(
-            wait_readable(a.as_raw_fd(), up.wake_fd(), t),
+            wait_readable(a.as_raw_sock(), up.wake_fd(), t),
             Ready::TimedOut
         );
         b.write_all(b"x").unwrap();
-        assert_eq!(wait_readable(a.as_raw_fd(), up.wake_fd(), t), Ready::Fd);
+        assert_eq!(wait_readable(a.as_raw_sock(), up.wake_fd(), t), Ready::Fd);
         up.wake();
-        assert_eq!(wait_readable(a.as_raw_fd(), up.wake_fd(), t), Ready::Wake);
+        assert_eq!(wait_readable(a.as_raw_sock(), up.wake_fd(), t), Ready::Wake);
     }
 }

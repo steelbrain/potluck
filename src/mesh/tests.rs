@@ -199,13 +199,17 @@ fn pairing_lets_two_machines_talk() {
     assert!(!mb.this_machine && a.member("a").unwrap().this_machine);
 
     // The key file and the records are private.
-    use std::os::unix::fs::PermissionsExt;
     for f in ["keys/node.key", "keys/members.json"] {
-        let mode = std::fs::metadata(b.dir.join(f))
-            .unwrap()
-            .permissions()
-            .mode();
-        assert_eq!(mode & 0o777, 0o600, "{f}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(b.dir.join(f))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "{f}");
+        }
+        assert!(crate::sys::is_private(&b.dir.join(f)).unwrap(), "{f}");
     }
 }
 
@@ -1080,6 +1084,7 @@ fn a_fixed_port_stays_claimed_while_its_member_is_down() {
 /// start again on its port ("Address already in use"). On msi, tests that restart a member in
 /// their own process failed so while other tests started processes. Here the child holds its
 /// copies for half a second; the port is free once the member has stopped all the same.
+#[cfg(unix)]
 #[test]
 fn a_stopped_members_port_is_free_while_a_child_being_started_holds_its_listener() {
     use std::os::fd::AsRawFd;
@@ -1383,6 +1388,7 @@ fn a_record_turned_away_is_taken_with_the_record_that_makes_it_count() {
 }
 
 /// Makes `dir` read-only (true) or writable again (false) for its owner.
+#[cfg(unix)]
 fn read_only(dir: &Path, yes: bool) {
     use std::os::unix::fs::PermissionsExt;
     let mode = if yes { 0o500 } else { 0o700 };
@@ -1391,6 +1397,7 @@ fn read_only(dir: &Path, yes: bool) {
 
 /// A membership change whose records this machine can't save is undone, so the error the user
 /// sees and what the cluster is told agree.
+#[cfg(unix)]
 #[test]
 fn a_membership_change_that_cant_be_saved_is_undone() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1422,6 +1429,7 @@ fn a_membership_change_that_cant_be_saved_is_undone() {
 
 /// Records a member sends that this machine couldn't save (a full or read-only disk) are saved
 /// once it can, not only at the next change: a restart before that would forget them.
+#[cfg(unix)]
 #[test]
 fn records_that_couldnt_be_saved_are_saved_later() {
     let tmp = tempfile::tempdir().unwrap();

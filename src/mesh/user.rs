@@ -124,6 +124,7 @@ impl Signer for UserKey {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
@@ -133,8 +134,12 @@ mod tests {
         assert!(UserKey::load(&path).unwrap().is_none());
         let (a, made) = UserKey::load_or_create(&path).unwrap();
         assert!(made);
-        let mode = fs::metadata(&path).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o600);
+        #[cfg(unix)]
+        {
+            let mode = fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        assert!(crate::sys::is_private(&path).unwrap());
         let (b, made) = UserKey::load_or_create(&path).unwrap();
         assert!(!made);
         assert_eq!(a.public(), b.public());
@@ -142,10 +147,13 @@ mod tests {
         assert!(b.public().verify(b"hello", &sig));
         assert!(!b.public().verify(b"hellO", &sig));
         // A key file others can read is tightened when loaded.
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
-        UserKey::load(&path).unwrap().unwrap();
-        let mode = fs::metadata(&path).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o600);
+        #[cfg(unix)]
+        {
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+            UserKey::load(&path).unwrap().unwrap();
+            let mode = fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
         // A machine's key file is the same format.
         let id = super::super::identity::Identity::load_or_create(tmp.path()).unwrap();
         let der = fs::read(tmp.path().join(super::super::identity::KEY_FILE)).unwrap();

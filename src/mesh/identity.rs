@@ -315,15 +315,20 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("keys");
         let a = Identity::load_or_create(&dir).unwrap();
-        let mode = fs::metadata(dir.join(KEY_FILE))
-            .unwrap()
-            .permissions()
-            .mode();
-        assert_eq!(mode & 0o777, 0o600);
-        assert_eq!(
-            fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
-            0o700
-        );
+        #[cfg(unix)]
+        {
+            let mode = fs::metadata(dir.join(KEY_FILE))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+            assert_eq!(
+                fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+        assert!(crate::sys::is_private(&dir.join(KEY_FILE)).unwrap());
+        assert!(crate::sys::is_private(&dir).unwrap());
         let b = Identity::load_or_create(&dir).unwrap();
         assert_eq!(a.public(), b.public());
         assert_eq!(PublicKey::from_certificate(&b.cert()), Some(b.public()));

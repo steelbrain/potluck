@@ -1163,6 +1163,47 @@ fn mib(bytes: u64) -> u64 {
     bytes.saturating_add(1 << 19) >> 20
 }
 
+/// A job's environment while it is put together. On Windows, whose variable names ignore case, a
+/// name replaces or removes the variable whatever its spelling: a spec's `PATH` replaces the login
+/// environment's `Path`, `--unset-env path` removes it, and potluck's own variables replace any
+/// spelling of theirs. The map holds one spelling of each name: with both `PATH` and `Path`,
+/// which one the job saw would depend on the order they are passed in. On Unix names are exact.
+#[derive(Default)]
+struct JobEnv(BTreeMap<String, String>);
+
+impl JobEnv {
+    fn insert(&mut self, k: String, v: String) {
+        self.remove(&k);
+        self.0.insert(k, v);
+    }
+
+    fn extend(&mut self, vars: impl IntoIterator<Item = (String, String)>) {
+        for (k, v) in vars {
+            self.insert(k, v);
+        }
+    }
+
+    fn remove(&mut self, k: &str) {
+        #[cfg(unix)]
+        self.0.remove(k);
+        #[cfg(windows)]
+        self.0.retain(|e, _| !e.eq_ignore_ascii_case(k));
+    }
+
+    /// Removes every variable whose name starts with `prefix`.
+    fn remove_prefixed(&mut self, prefix: &str) {
+        let starts = |k: &str| {
+            #[cfg(unix)]
+            return k.starts_with(prefix);
+            #[cfg(windows)]
+            return k
+                .get(..prefix.len())
+                .is_some_and(|p| p.eq_ignore_ascii_case(prefix));
+        };
+        self.0.retain(|k, _| !starts(k));
+    }
+}
+
 /// The `[[gpu]]` env of `gpus` (ids).
 pub(crate) fn gpu_env(
     config: &NodeConfig,
@@ -1617,7 +1658,8 @@ fn prepare_and_start(sh: &Arc<Shared>, id: &str) -> Result<(), NotStarted> {
     // The machine's (its login environment, then the env of each `[[gpu]]` entry for a GPU the
     // job holds), then the dispatch's (the committed potluck.toml, then `--env`), less what the
     // dispatch unsets, then potluck's own variables, which nothing overrides or unsets.
-    let mut env = login;
+    let mut env = JobEnv::default();
+    env.extend(login);
     env.extend(gpu_env(&sh.config, &facts, &lease.grant.gpus));
     env.extend(job.spec.env.clone());
     for k in &job.spec.unset_env {
@@ -1625,7 +1667,7 @@ fn prepare_and_start(sh: &Arc<Shared>, id: &str) -> Result<(), NotStarted> {
     }
     // The mirror holding each carried commit, where the job fetches it from; the job has no
     // other POTLUCK_MIRROR_ variable.
-    env.retain(|k, _| !k.starts_with(super::MIRROR_VARIABLE_PREFIX));
+    env.remove_prefixed(super::MIRROR_VARIABLE_PREFIX);
     for c in &job.spec.repo.carried {
         env.insert(
             format!("{}{}", super::MIRROR_VARIABLE_PREFIX, c.name),
@@ -1672,7 +1714,7 @@ fn prepare_and_start(sh: &Arc<Shared>, id: &str) -> Result<(), NotStarted> {
         job: &job,
         grant: &lease.grant,
         cwd: root,
-        env,
+        env: env.0,
         log,
         status,
         potluck_bin: sh.helpers.path(),
@@ -2460,6 +2502,43 @@ pub(crate) fn new_record(id: JobId, spec: crate::types::JobSpec, now: Millis) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A job's environment, put together as `prepare_and_start` does: on Windows a name stands for
+    /// every spelling of it, on Unix only for itself.
+    #[test]
+    fn a_job_environment_matches_names_as_the_system_does() {
+        let vars = |v: &[(&str, &str)]| {
+            v.iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect::<BTreeMap<_, _>>()
+        };
+        let mut env = JobEnv::default();
+        env.extend(vars(&[
+            ("Path", "login"),
+            ("SystemRoot", "C:\\Windows"),
+            ("TmpDir", "login"),
+            ("potluck_mirror_old", "login"),
+            ("KEEP", "login"),
+        ]));
+        env.extend(vars(&[("PATH", "spec"), ("keep", "spec")]));
+        env.remove("systemroot");
+        env.remove_prefixed(crate::daemon::MIRROR_VARIABLE_PREFIX);
+        env.insert("TMPDIR".into(), "potluck".into());
+        #[cfg(windows)]
+        let want = vars(&[("PATH", "spec"), ("TMPDIR", "potluck"), ("keep", "spec")]);
+        #[cfg(unix)]
+        let want = vars(&[
+            ("KEEP", "login"),
+            ("PATH", "spec"),
+            ("Path", "login"),
+            ("SystemRoot", "C:\\Windows"),
+            ("TMPDIR", "potluck"),
+            ("TmpDir", "login"),
+            ("keep", "spec"),
+            ("potluck_mirror_old", "login"),
+        ]);
+        assert_eq!(env.0, want);
+    }
 
     #[test]
     fn over_memory_messages() {

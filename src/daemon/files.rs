@@ -528,6 +528,8 @@ mod tests {
     use crate::proto::read_msg;
     use std::io::BufRead;
 
+    /// A tree with symlinks (Unix: on Windows making one takes a privilege a test can't count on).
+    #[cfg(unix)]
     fn tree() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("ws");
@@ -563,6 +565,7 @@ mod tests {
         out
     }
 
+    #[cfg(unix)]
     #[test]
     fn copies_a_tree_without_leaving_it() {
         let (_d, root) = tree();
@@ -601,6 +604,7 @@ mod tests {
         assert_eq!(entries(&buf)[0].2, b"two");
     }
 
+    #[cfg(unix)]
     #[test]
     fn keep_copies_matches_inside_only() {
         let (d, root) = tree();
@@ -636,8 +640,13 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let root = d.path().join("ws");
         let dest = d.path().join("kp");
-        // Room for the deepest file's name and the longer of the two prefixes.
-        let room = libc::PATH_MAX as usize - root.as_os_str().len() - 16;
+        // Room for the deepest file's name and the longer of the two prefixes. (Windows takes
+        // paths of up to 32,767 characters; 4,096 bytes are about Linux's 2,000 levels.)
+        #[cfg(unix)]
+        let path_max = libc::PATH_MAX as usize;
+        #[cfg(windows)]
+        let path_max = 4096;
+        let room = path_max - root.as_os_str().len() - 16;
         let levels = room / 2;
         let mut rel = PathBuf::from("t");
         for _ in 1..levels {
@@ -742,6 +751,7 @@ mod tests {
     /// A glob's wildcards don't go through symlinks to directories, as `cp` doesn't inside a
     /// directory: two links to `.` made `**` walk 2^40 paths (until ELOOP), and one made it copy
     /// each file once per level. The glob's start may go through a link that stays inside.
+    #[cfg(unix)]
     #[test]
     fn keep_globs_dont_follow_symlinked_directories() {
         let (d, root) = tree();
