@@ -18,8 +18,9 @@
 //!   repository if one of its jobs that the asker may run or runs names it, and calls
 //!   [`serve_upload_pack`] through [`crate::daemon::GitTunnel`]; an unknown id gets
 //!   [`refuse_upload_pack`], which git shows as `fatal: remote error: <message>`. `git
-//!   upload-pack` runs in a process group of its own and is killed with its children if either
-//!   side goes away; it is always reaped before the call returns.
+//!   upload-pack` runs in a process group of its own (a job object on Windows,
+//!   [`crate::sys::Group`]) and is killed with its children if either side goes away; it is
+//!   always reaped before the call returns.
 //! - **What is served.** `git upload-pack` speaks protocol v0, whatever the client asks for, of a
 //!   [`View`] of the mirror made for that one fetch, whose refs are those jobs' commits by id and
 //!   the mirror's branches and tags that they reach. A fetch can want only those refs' tips
@@ -35,10 +36,8 @@ use serde_json::{Value, json};
 use std::collections::{BTreeSet, HashSet};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::os::fd::AsFd;
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Stdio};
+use std::process::{ChildStdin, Stdio};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
@@ -229,7 +228,7 @@ impl View {
         git_dir: &Path,
         commits: impl IntoIterator<Item = impl AsRef<str>>,
     ) -> io::Result<View> {
-        let objects = git_dir.join("objects").canonicalize().map_err(|e| {
+        let objects = crate::sys::canonical(&git_dir.join("objects")).map_err(|e| {
             io::Error::new(e.kind(), format!("can't read {}: {e}", git_dir.display()))
         })?;
         let alternate = objects
@@ -241,6 +240,9 @@ impl View {
                     objects.display()
                 ))
             })?;
+        // Git for Windows reads `/` everywhere a path goes.
+        #[cfg(windows)]
+        let alternate = alternate.replace('\\', "/");
         let asked: BTreeSet<String> = commits
             .into_iter()
             .map(|c| c.as_ref().to_ascii_lowercase())
@@ -569,19 +571,19 @@ pub fn serve_upload_pack(mut stream: Stream, view: &View) -> io::Result<()> {
         .env_remove("GIT_PROTOCOL")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0);
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
+        .stderr(Stdio::piped());
+    let mut group = match crate::sys::Group::spawn(&mut cmd) {
+        Ok(g) => g,
         Err(e) => {
             let _ = refuse_upload_pack(stream, &format!("can't run git upload-pack: {e}"));
             return Err(e);
         }
     };
+    let child = group.child();
     let stdin = child.stdin.take().expect("piped stdin");
     let mut stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
-    let proc = Arc::new(Proc::new(child));
+    let proc = Arc::new(Proc::new(group));
 
     let (err_tx, err_rx) = mpsc::channel();
     thread::spawn(move || {
@@ -723,27 +725,24 @@ fn pump_in(
     }
 }
 
-/// A child process in a process group of its own, killed (group and all) only while it hasn't
-/// been reaped, so a recycled pid is never signalled.
+/// A child process in a process group of its own ([`crate::sys::Group`]), killed (group and
+/// all) only while it hasn't been reaped, so a recycled pid is never signalled.
 struct Proc {
-    child: Mutex<Child>,
-    pgid: libc::pid_t,
+    group: Mutex<crate::sys::Group>,
 }
 
 impl Proc {
-    fn new(child: Child) -> Proc {
-        let pgid = child.id() as libc::pid_t;
+    fn new(group: crate::sys::Group) -> Proc {
         Proc {
-            child: Mutex::new(child),
-            pgid,
+            group: Mutex::new(group),
         }
     }
 
     fn kill(&self) {
-        let mut child = self.child.lock().unwrap_or_else(|e| e.into_inner());
-        if let Ok(None) = child.try_wait() {
-            // SAFETY: the group's leader is our unreaped child, so the id names its group.
-            unsafe { libc::kill(-self.pgid, libc::SIGKILL) };
+        let mut group = self.group.lock().unwrap_or_else(|e| e.into_inner());
+        if let Ok(None) = group.child().try_wait() {
+            // The group's leader is our unreaped child, so its id names its group.
+            group.kill();
         }
     }
 
@@ -752,14 +751,14 @@ impl Proc {
         let start = Instant::now();
         loop {
             {
-                let mut child = self.child.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(status) = child.try_wait()? {
+                let mut group = self.group.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(status) = group.child().try_wait()? {
                     return Ok(status);
                 }
                 if start.elapsed() >= limit {
-                    // SAFETY: as in kill: not reaped yet.
-                    unsafe { libc::kill(-self.pgid, libc::SIGKILL) };
-                    return child.wait();
+                    // As in kill: not reaped yet.
+                    group.kill();
+                    return group.child().wait();
                 }
             }
             thread::sleep(Duration::from_millis(5));
@@ -830,7 +829,11 @@ fn tunnel(node: &str, repo_id: &str) -> anyhow::Result<()> {
 /// for stdin to end.
 fn pipe(stream: Stream, node: &str, repo_id: &str) -> anyhow::Result<()> {
     // Unbuffered: git's protocol, as it arrives.
-    let mut out = File::from(io::stdout().as_fd().try_clone_to_owned()?);
+    #[cfg(unix)]
+    let mut out = File::from(std::os::fd::AsFd::as_fd(&io::stdout()).try_clone_to_owned()?);
+    #[cfg(windows)]
+    let mut out =
+        File::from(std::os::windows::io::AsHandle::as_handle(&io::stdout()).try_clone_to_owned()?);
     let mut writer = stream.try_clone()?;
     thread::spawn(move || {
         let mut stdin = io::stdin().lock();

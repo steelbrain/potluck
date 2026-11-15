@@ -50,6 +50,18 @@
 //!    A new binary that can't start from the handover exits
 //!    non-zero; its service starts it again plainly.
 //!
+//! **Windows** has no exec, and a socket can't be carried into a process that doesn't exist yet:
+//! `potluck daemon` there is a keeper running the daemon as its child ([`super::keeper`]). Steps
+//! 1 to 3 are the same (the check, the drain, the quiesce); in 4 the connections handed over
+//! are closed instead (those that asked for the restart are told first that it goes ahead), the
+//! store is closed with the state locked, and the daemon exits with
+//! [`super::keeper::RESTART_EXIT`]: the keeper ends what the daemon left running in its job
+//! (work cut short) and starts the binary at its path as a new daemon, which starts as any
+//! daemon does and adopts the running jobs. Members dial again; clients connect again, waiting
+//! meanwhile on the keeper's lock. A plain restart is the same there. What 4 and 6 say of
+//! records that can't be written holds as on Unix: the daemon then starts again in its own
+//! process and tries again.
+//!
 //! Running jobs go on under the supervisors of the binary that started them, so the daemon after
 //! a restart in place (or an update) reads what an older version left: the status file
 //! ([`crate::types::ExitStatus`]), on macOS the supervisor's record beside it, the job records'
@@ -57,16 +69,24 @@
 //! tests here pin today's formats.
 
 use super::{Daemon, Shared};
+use crate::sys::local::{RawSock, UnixListener, UnixStream};
 use crate::types::Facts;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
+#[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+#[cfg(windows)]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
+
+/// A descriptor number in the handover file. Windows has no handover across processes: there the
+/// file is only the sample a new binary is checked with, and names none.
+#[cfg(windows)]
+pub type RawFd = i32;
 
 /// The variable naming the handover file a daemon starts from.
 pub const ENV: &str = "POTLUCK_HANDOVER";
@@ -161,13 +181,12 @@ impl HandoverFile {
 
     /// Writes it as a new 0600 file at `path`, replacing one there.
     pub fn write(&self, path: &Path) -> std::io::Result<()> {
-        use std::os::unix::fs::OpenOptionsExt;
         let _ = std::fs::remove_file(path);
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(path)?;
+        let mut f = crate::sys::file_mode(
+            std::fs::OpenOptions::new().write(true).create_new(true),
+            0o600,
+        )
+        .open(path)?;
         f.write_all(&serde_json::to_vec(self)?)?;
         f.sync_all()
     }
@@ -236,8 +255,14 @@ pub(crate) struct Upgrade {
     phase: AtomicU8,
     /// Readable once something changed (a restart began, or the daemon stops): the accept loop
     /// and connections waiting for a request look at the flags then. Never read from.
+    #[cfg(unix)]
     wake_r: UnixStream,
+    #[cfg(unix)]
     wake_w: UnixStream,
+    /// Set once something changed, for good: Windows' [`wait_readable`] looks at it between
+    /// waits of [`WAKE_SLICE`].
+    #[cfg(windows)]
+    woken: AtomicBool,
     ask: Mutex<Ask>,
     ask_cv: Condvar,
     /// Connections handed over by their threads.
@@ -254,11 +279,16 @@ pub(crate) struct Upgrade {
 
 impl Upgrade {
     pub fn new() -> std::io::Result<Upgrade> {
+        #[cfg(unix)]
         let (wake_r, wake_w) = UnixStream::pair()?;
         Ok(Upgrade {
             phase: AtomicU8::new(SERVING),
+            #[cfg(unix)]
             wake_r,
+            #[cfg(unix)]
             wake_w,
+            #[cfg(windows)]
+            woken: AtomicBool::new(false),
             ask: Mutex::new(Ask::default()),
             ask_cv: Condvar::new(),
             handed: Mutex::new(Vec::new()),
@@ -280,13 +310,24 @@ impl Upgrade {
     }
 
     /// The descriptor that turns readable when something changed.
+    #[cfg(unix)]
     pub fn wake_fd(&self) -> RawFd {
         self.wake_r.as_raw_fd()
     }
 
-    /// Makes [`Upgrade::wake_fd`] readable, for good.
+    /// The flag set when something changed (Windows' [`wait_readable`] takes it where Unix's
+    /// takes a descriptor).
+    #[cfg(windows)]
+    pub fn wake_fd(&self) -> &AtomicBool {
+        &self.woken
+    }
+
+    /// Makes [`Upgrade::wake_fd`] readable (on Windows: sets it), for good.
     pub fn wake(&self) {
+        #[cfg(unix)]
         let _ = (&self.wake_w).write(&[1]);
+        #[cfg(windows)]
+        self.woken.store(true, Ordering::SeqCst);
     }
 
     /// Asks for a restart in place (once; asking again while one is pending changes nothing).
@@ -462,7 +503,8 @@ pub(crate) enum Ready {
 }
 
 /// Waits until `fd` is readable (or closed, or in error) or `wake` is, at most `timeout`.
-pub(crate) fn wait_readable(fd: RawFd, wake: RawFd, timeout: Option<Duration>) -> Ready {
+#[cfg(unix)]
+pub(crate) fn wait_readable(fd: RawSock, wake: RawFd, timeout: Option<Duration>) -> Ready {
     let deadline = timeout.map(|t| Instant::now() + t);
     loop {
         let ms = match deadline {
@@ -506,7 +548,42 @@ pub(crate) fn wait_readable(fd: RawFd, wake: RawFd, timeout: Option<Duration>) -
     }
 }
 
+/// How long Windows' [`wait_readable`] waits on the socket at a time before it looks at the wake
+/// flag again (Winsock can't wait on a socket and a flag at once).
+#[cfg(windows)]
+const WAKE_SLICE: Duration = Duration::from_millis(50);
+
+/// Waits until `sock` is readable (or closed, or in error) or `wake` is set, at most `timeout`.
+/// The wake is seen within [`WAKE_SLICE`].
+#[cfg(windows)]
+pub(crate) fn wait_readable(sock: RawSock, wake: &AtomicBool, timeout: Option<Duration>) -> Ready {
+    let deadline = timeout.map(|t| Instant::now() + t);
+    loop {
+        if wake.load(Ordering::SeqCst) {
+            return Ready::Wake;
+        }
+        let slice = match deadline {
+            None => WAKE_SLICE,
+            Some(d) => {
+                let left = d.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Ready::TimedOut;
+                }
+                left.min(WAKE_SLICE)
+            }
+        };
+        if crate::sys::local::wait_readable(&[sock], Some(slice))[0] {
+            // As on Unix, the wake comes first when both are there.
+            if wake.load(Ordering::SeqCst) {
+                return Ready::Wake;
+            }
+            return Ready::Fd;
+        }
+    }
+}
+
 /// Sets or clears FD_CLOEXEC on `fd`.
+#[cfg(unix)]
 pub(crate) fn set_cloexec(fd: RawFd, on: bool) -> std::io::Result<()> {
     // SAFETY: fcntl on a descriptor the caller owns.
     unsafe {
@@ -527,6 +604,7 @@ pub(crate) fn set_cloexec(fd: RawFd, on: bool) -> std::io::Result<()> {
 }
 
 /// Whether `fd` is an open socket.
+#[cfg(unix)]
 fn is_socket(fd: RawFd) -> bool {
     // SAFETY: fstat fills `st`; a descriptor that isn't open only makes it fail.
     unsafe {
@@ -535,7 +613,21 @@ fn is_socket(fd: RawFd) -> bool {
     }
 }
 
+/// Which connection `s` is: the same for every handle on it (a clone, or a descriptor of it
+/// kept elsewhere), and for no other.
+#[cfg(unix)]
+pub(crate) fn conn_id(s: &UnixStream) -> Option<(libc::dev_t, libc::ino_t)> {
+    socket_id(s.as_raw_fd())
+}
+
+/// Which connection `s` is: the same for every clone of it, and for no other.
+#[cfg(windows)]
+pub(crate) fn conn_id(s: &UnixStream) -> Option<u64> {
+    Some(s.id())
+}
+
 /// Which socket `fd` is (its device and inode): the same for every descriptor of it.
+#[cfg(unix)]
 pub(crate) fn socket_id(fd: RawFd) -> Option<(libc::dev_t, libc::ino_t)> {
     // SAFETY: fstat fills `st`; a descriptor that isn't open only makes it fail.
     unsafe {
@@ -548,6 +640,7 @@ pub(crate) fn socket_id(fd: RawFd) -> Option<(libc::dev_t, libc::ino_t)> {
 }
 
 /// The daemon's child processes now (zombies too).
+#[cfg(unix)]
 pub(crate) fn own_children() -> Vec<i32> {
     // SAFETY: getpid has no preconditions.
     let me = unsafe { libc::getpid() };
@@ -598,6 +691,7 @@ fn children_of(_parent: i32) -> Vec<i32> {
 
 /// Reaps those of `pids` that ended (they are this process's children nobody waits for any
 /// more); returns those still running.
+#[cfg(unix)]
 pub(crate) fn reap(pids: &[i32]) -> Vec<i32> {
     pids.iter()
         .copied()
@@ -610,10 +704,17 @@ pub(crate) fn reap(pids: &[i32]) -> Vec<i32> {
         .collect()
 }
 
+/// Windows has no zombies: nothing to reap, and nothing is left to reap later.
+#[cfg(windows)]
+pub(crate) fn reap(_pids: &[i32]) -> Vec<i32> {
+    Vec::new()
+}
+
 /// Ends the daemon's child processes still running (git, tools: work cut short): SIGTERM, which
 /// lets git remove its lock files, then SIGKILL after `grace` to those left. The threads that
 /// started them reap them; returns the children still there after (zombies of threads that
 /// stopped waiting, or processes that can't die).
+#[cfg(unix)]
 pub(crate) fn end_children(grace: Duration) -> Vec<i32> {
     let first = own_children();
     if first.is_empty() {
@@ -623,8 +724,19 @@ pub(crate) fn end_children(grace: Duration) -> Vec<i32> {
     own_children()
 }
 
+/// On Windows the daemon's child processes (git, tools: work cut short) are in its keeper's job
+/// object, as everything the daemon starts but a job's supervisor: the keeper ends them once the
+/// daemon has exited for a restart ([`super::keeper`]), before it starts the next one. Ending
+/// them here would need the job's process list, and a daemon run without a keeper (in a test)
+/// would end its test runner's processes with it.
+#[cfg(windows)]
+pub(crate) fn end_children(_grace: Duration) -> Vec<i32> {
+    Vec::new()
+}
+
 /// [`end_children`] for children `pids`: SIGTERM, SIGKILL after `grace` to those still running,
 /// then a short wait for them to go.
+#[cfg(unix)]
 fn end(pids: &[i32], grace: Duration) {
     for &pid in pids {
         // SAFETY: a signal to a child of this process.
@@ -647,6 +759,7 @@ fn end(pids: &[i32], grace: Duration) {
 }
 
 /// Whether child `pid` still runs (not a zombie).
+#[cfg(unix)]
 fn running(pid: i32) -> bool {
     #[cfg(target_os = "linux")]
     {
@@ -732,10 +845,16 @@ fn run_limited(
         .stderr(std::process::Stdio::piped());
     // Retried while the file is busy: a new binary just written may still be open in a child
     // another thread forked meanwhile, until that child execs.
+    // On Windows a file just written may be held a moment longer by something scanning it
+    // (ERROR_SHARING_VIOLATION).
+    #[cfg(unix)]
+    const BUSY: i32 = libc::ETXTBSY;
+    #[cfg(windows)]
+    const BUSY: i32 = windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION as i32;
     let mut tries = 0;
     let mut child = loop {
         match cmd.spawn() {
-            Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) && tries < 50 => {
+            Err(e) if e.raw_os_error() == Some(BUSY) && tries < 50 => {
                 tries += 1;
                 std::thread::sleep(Duration::from_millis(20));
             }
@@ -800,19 +919,8 @@ impl Came {
             };
         }
         let waited = crate::daemon::clock::boot_ms().saturating_sub(self.quiesced_at);
-        let jobs = match self.running_jobs {
-            0 => "No job was running".to_string(),
-            1 => "Its 1 running job kept running".to_string(),
-            n => format!("Its {n} running jobs kept running"),
-        };
-        let drained = if self.drained_ms >= 1000 {
-            format!(
-                " It waited {:.1} s for work already going to finish first.",
-                self.drained_ms as f64 / 1000.0
-            )
-        } else {
-            String::new()
-        };
+        let jobs = jobs_kept(self.running_jobs);
+        let drained = drain_waited(self.drained_ms);
         let _ = sh;
         crate::proto::Response::Text {
             text: format!(
@@ -824,6 +932,27 @@ impl Came {
                 std::process::id()
             ),
         }
+    }
+}
+
+/// What a restart says of the `n` jobs running when it went ahead.
+pub(crate) fn jobs_kept(n: usize) -> String {
+    match n {
+        0 => "No job was running".to_string(),
+        1 => "Its 1 running job kept running".to_string(),
+        n => format!("Its {n} running jobs kept running"),
+    }
+}
+
+/// What a restart says of a drain that took `ms`: nothing under a second.
+pub(crate) fn drain_waited(ms: u64) -> String {
+    if ms >= 1000 {
+        format!(
+            " It waited {:.1} s for work already going to finish first.",
+            ms as f64 / 1000.0
+        )
+    } else {
+        String::new()
     }
 }
 
@@ -861,6 +990,7 @@ pub struct Inherited {
     pub(crate) unwritten: super::state::Unwritten,
 }
 
+#[cfg(unix)]
 impl Inherited {
     /// The file naming its descriptors, which stay open across an exec from now on.
     pub fn into_file(self) -> std::io::Result<HandoverFile> {
@@ -943,8 +1073,21 @@ impl Inherited {
     }
 }
 
+/// On Windows a daemon never starts from a handover: a restart starts a new process, which
+/// starts as any daemon does ([`super::keeper`]). A `POTLUCK_HANDOVER` set by hand is taken out
+/// of the environment all the same, so no child sees it. Call before any thread starts.
+#[cfg(windows)]
+pub fn take() -> anyhow::Result<Option<Inherited>> {
+    if std::env::var_os(ENV).is_some() {
+        // SAFETY: called first thing in `potluck daemon`, before the daemon starts any thread.
+        unsafe { std::env::remove_var(ENV) };
+    }
+    Ok(None)
+}
+
 /// The handover a daemon starting now was given (`POTLUCK_HANDOVER`), taken out of the
 /// environment (so no child sees it) and its file removed. Call before any thread starts.
+#[cfg(unix)]
 pub fn take() -> anyhow::Result<Option<Inherited>> {
     let Some(path) = std::env::var_os(ENV) else {
         return Ok(None);
@@ -957,6 +1100,7 @@ pub fn take() -> anyhow::Result<Option<Inherited>> {
 /// [`take`] from the file at `path`. It is removed once read, and when it is a handover file of
 /// another format; a file that isn't a handover file at all (the variable set by hand, naming
 /// some other file) is left alone.
+#[cfg(unix)]
 fn take_from(path: &Path) -> anyhow::Result<Inherited> {
     let read = HandoverFile::read(path);
     if read.is_ok() || of_some_format(path) {
@@ -968,6 +1112,7 @@ fn take_from(path: &Path) -> anyhow::Result<Inherited> {
 
 /// Whether the file at `path` is a handover file of some format: a JSON object with a number
 /// `format`.
+#[cfg(unix)]
 fn of_some_format(path: &Path) -> bool {
     std::fs::read(path)
         .ok()
@@ -975,7 +1120,8 @@ fn of_some_format(path: &Path) -> bool {
         .is_some_and(|v| v.get("format").is_some_and(serde_json::Value::is_u64))
 }
 
-/// Where the daemon writes the handover file, and the sample it checks a binary with.
+/// Where the daemon writes the handover file.
+#[cfg(unix)]
 pub fn file_path(home: &Path) -> PathBuf {
     home.join("handover.json")
 }
@@ -986,6 +1132,7 @@ fn sample_path(home: &Path) -> PathBuf {
 
 /// Starts `bin` in this process with the same arguments and `POTLUCK_HANDOVER=file`, or with no
 /// handover (`None`: a plain restart). Returns only if the exec failed.
+#[cfg(unix)]
 pub fn exec(bin: &Path, file: Option<&Path>) -> std::io::Error {
     use std::os::unix::process::CommandExt;
     let mut cmd = std::process::Command::new(bin);

@@ -6,6 +6,7 @@
 use crate::client::Client;
 use crate::proto::{Request, Response};
 use std::fs;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 
@@ -119,10 +120,14 @@ pub fn copy_out(
         frame = client.next_frame()?;
     }
     dir_modes.sort_by_key(|(p, _)| std::cmp::Reverse(p.components().count()));
+    // Windows has no modes for directories: they stay as they are made.
+    #[cfg(unix)]
     for (dir, mode) in dir_modes {
         fs::set_permissions(&dir, fs::Permissions::from_mode(mode & PERMISSIONS))
             .map_err(|e| anyhow::anyhow!("{}: {e}", dir.display()))?;
     }
+    #[cfg(windows)]
+    drop(dir_modes);
     Ok(stats)
 }
 
@@ -146,8 +151,16 @@ fn write_file(client: &mut Client, target: &Path, mode: u32, len: u64) -> anyhow
             anyhow::anyhow!("{}: {e:#}", target.display())
         }
     })?;
+    #[cfg(unix)]
     file.set_permissions(fs::Permissions::from_mode(mode & PERMISSIONS))
         .map_err(|e| anyhow::anyhow!("{}: {e}", target.display()))?;
+    // Windows: read-only when it has no write bit.
+    #[cfg(windows)]
+    {
+        drop(file);
+        crate::daemon::set_copy_mode(target, mode & PERMISSIONS)
+            .map_err(|e| anyhow::anyhow!("{}: {e}", target.display()))?;
+    }
     Ok(())
 }
 

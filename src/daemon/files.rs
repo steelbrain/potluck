@@ -22,6 +22,7 @@ use crate::proto::{Response, ServerResponse, write_msg};
 use crate::types::{ExitStatus, Reminder};
 use std::fs::{File, Metadata};
 use std::io::{Read, Write};
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 
@@ -33,6 +34,45 @@ pub(crate) const STATUS: &str = "status.json";
 pub(crate) const KEEP: &str = "keep";
 /// In a job's directory: crash reports of its processes.
 pub(crate) const CRASH: &str = "crash";
+
+/// A file's or directory's permission bits as a copy sends them. Windows has no modes: a file
+/// there goes as 0644 (0444 when read-only) and a directory as 0755, as a Unix receiver writes
+/// them.
+pub(crate) fn copy_mode(meta: &Metadata) -> u32 {
+    #[cfg(unix)]
+    {
+        meta.permissions().mode() & 0o7777
+    }
+    #[cfg(windows)]
+    {
+        match (meta.is_dir(), meta.permissions().readonly()) {
+            (true, _) => 0o755,
+            (false, true) => 0o444,
+            (false, false) => 0o644,
+        }
+    }
+}
+
+/// Gives a copied file the permission bits `mode`. Windows has no modes: a file without a write
+/// bit is made read-only there, and a directory is left as it is.
+#[cfg(any(windows, test))]
+pub(crate) fn set_copy_mode(path: &Path, mode: u32) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+    }
+    #[cfg(windows)]
+    {
+        let meta = std::fs::metadata(path)?;
+        let readonly = mode & 0o222 == 0;
+        if meta.is_dir() || meta.permissions().readonly() == readonly {
+            return Ok(());
+        }
+        let mut perms = meta.permissions();
+        perms.set_readonly(readonly);
+        std::fs::set_permissions(path, perms)
+    }
+}
 
 pub(crate) fn read_status(path: &Path) -> Option<ExitStatus> {
     serde_json::from_slice(&std::fs::read(path).ok()?).ok()
@@ -191,7 +231,7 @@ fn walk<W: Write>(
             rem,
             Response::CopyEntry {
                 path: rel.clone(),
-                mode: meta.permissions().mode() & 0o7777,
+                mode: copy_mode(&meta),
                 dir: true,
                 len: 0,
             },
@@ -248,7 +288,7 @@ fn send_file<W: Write>(w: &mut W, rem: &[Reminder], path: &Path, rel: &str) -> s
         rem,
         Response::CopyEntry {
             path: rel.to_string(),
-            mode: meta.permissions().mode() & 0o7777,
+            mode: copy_mode(&meta),
             dir: false,
             len,
         },
@@ -666,6 +706,7 @@ mod tests {
 
     /// A match that can't be copied (here into a directory that can't be written; on a full disk
     /// the same) is reported as such, not as matching nothing, and leaves nothing behind.
+    #[cfg(unix)]
     #[test]
     fn keep_reports_what_it_could_not_copy() {
         let (d, root) = tree();
@@ -813,7 +854,7 @@ mod tests {
         std::fs::create_dir_all(root.join("out/sub/deeper")).unwrap();
         let file = root.join("out/sub/deeper/r.txt");
         std::fs::write(&file, b"r").unwrap();
-        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o444)).unwrap();
+        set_copy_mode(&file, 0o444).unwrap();
         let dest = d.path().join("job/keep");
         for globs in [
             &["out/**"][..],

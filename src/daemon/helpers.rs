@@ -7,13 +7,14 @@
 //! may read its arguments, env file or status file differently, or speak another mesh version.
 //! So the daemon keeps the file it started from open. While the path still names that file,
 //! helpers run from the path; once it names another file (or none), the daemon copies the file
-//! it kept to `bin/potluck` in its state directory, once, and runs helpers from the copy until it
-//! restarts. A starting daemon removes the copy an earlier one left (helpers started from it run
+//! it kept to `bin/potluck` (`bin\potluck.exe` on Windows) in its state directory, once, and runs
+//! helpers from the copy until it restarts. A starting daemon removes the copy an earlier one left (helpers started from it run
 //! on without their file).
 
 use super::Logger;
 use std::fs::File;
 use std::io::{Seek, SeekFrom};
+#[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock, PoisonError};
@@ -133,6 +134,14 @@ impl Helpers {
 }
 
 /// Whether `path` names the file `f` is open on.
+#[cfg(windows)]
+fn same_file(f: &File, path: &Path) -> bool {
+    use crate::sys::FileId;
+    matches!((FileId::of(f), FileId::of_path(path)), (Ok(a), Ok(b)) if a == b)
+}
+
+/// Whether `path` names the file `f` is open on.
+#[cfg(unix)]
 fn same_file(f: &File, path: &Path) -> bool {
     match (f.metadata(), std::fs::metadata(path)) {
         (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
@@ -140,20 +149,34 @@ fn same_file(f: &File, path: &Path) -> bool {
     }
 }
 
-/// Copies `kept` to `<dir>/potluck` (a new file renamed into place), executable by this user.
+/// Copies `kept` to `<dir>/potluck` (`potluck.exe` on Windows; a new file renamed into place),
+/// executable by this user.
 fn make_copy(kept: &File, dir: &Path) -> std::io::Result<PathBuf> {
+    #[cfg(unix)]
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
         .create(dir)?;
-    let dst = dir.join("potluck");
-    let tmp = dir.join(format!(".potluck.{}", std::process::id()));
+    #[cfg(windows)]
+    crate::sys::create_dir_all(dir, 0o700)?;
+    let dst = dir.join(format!("potluck{}", crate::sys::EXE_SUFFIX));
+    let tmp = dir.join(format!(
+        ".potluck.{}{}",
+        std::process::id(),
+        crate::sys::EXE_SUFFIX
+    ));
     let _ = std::fs::remove_file(&tmp);
     let written = (|| {
+        #[cfg(unix)]
         let mut out = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o700)
+            .open(&tmp)?;
+        #[cfg(windows)]
+        let mut out = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
             .open(&tmp)?;
         let mut src = kept.try_clone()?;
         src.seek(SeekFrom::Start(0))?;
@@ -230,13 +253,16 @@ mod tests {
         std::fs::write(&new, b"the new one").unwrap();
         std::fs::rename(&new, &bin).unwrap();
         let p = h.path();
-        assert_eq!(p, dir.join("potluck"));
+        assert_eq!(p, dir.join(format!("potluck{}", crate::sys::EXE_SUFFIX)));
         assert_eq!(
             std::fs::read(&p).unwrap(),
             b"the binary the daemon started from"
         );
-        let mode = std::fs::metadata(&p).unwrap().mode();
-        assert_eq!(mode & 0o777, 0o700, "{mode:o}");
+        #[cfg(unix)]
+        {
+            let mode = std::fs::metadata(&p).unwrap().mode();
+            assert_eq!(mode & 0o777, 0o700, "{mode:o}");
+        }
         // Made once.
         assert_eq!(h.path(), p);
         let log = std::fs::read_to_string(d.path().join("daemon.log")).unwrap();

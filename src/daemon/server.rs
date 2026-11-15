@@ -10,13 +10,13 @@ use super::{Shared, panic_text};
 use crate::gitinfo::short;
 use crate::proto::{ClientContext, ClientRequest, Request, Response, StatusView, read_msg};
 use crate::sched::{MachineView, Queued};
+use crate::sys::local::{AsRawSock, UnixListener, UnixStream};
 use crate::types::{
     EXIT_CANCELLED, JobRecord, JobSpec, JobState, MAX_HOLD_MS, Millis, Reminder, WorkspaceRecord,
     WorkspaceState, now_ms,
 };
 use crate::why::Snapshot;
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -27,7 +27,6 @@ const DEFAULT_LOG_CHUNK: u64 = 64 << 10;
 const RECENT: usize = 20;
 
 pub(crate) fn accept_loop(sh: Arc<Shared>, listener: UnixListener) {
-    use std::os::fd::AsRawFd;
     // Not blocking in accept: a connection that goes between the wait and the accept would block
     // it. Accepted connections are made blocking again (macOS hands them the listener's flag).
     let waits = listener.set_nonblocking(true).is_ok();
@@ -38,7 +37,7 @@ pub(crate) fn accept_loop(sh: Arc<Shared>, listener: UnixListener) {
             break;
         }
         if waits {
-            match handover::wait_readable(listener.as_raw_fd(), sh.up.wake_fd(), None) {
+            match handover::wait_readable(listener.as_raw_sock(), sh.up.wake_fd(), None) {
                 Ready::Fd => {}
                 Ready::Wake | Ready::TimedOut => continue,
             }
@@ -153,7 +152,6 @@ fn serve_requests(
     stream: &UnixStream,
     idle: Option<Duration>,
 ) -> After {
-    use std::os::fd::AsRawFd;
     let mut reader = BufReader::new(read);
     let mut w = stream;
     loop {
@@ -163,7 +161,7 @@ fn serve_requests(
             if sh.up.quiescing() {
                 return After::HandOver(None);
             }
-            match handover::wait_readable(stream.as_raw_fd(), sh.up.wake_fd(), idle) {
+            match handover::wait_readable(stream.as_raw_sock(), sh.up.wake_fd(), idle) {
                 Ready::Fd => {}
                 // Idle past the limit: let go.
                 Ready::TimedOut => return After::Close,
@@ -268,7 +266,7 @@ fn serve_requests(
 fn other_binary(sh: &Shared, asking: Option<&std::path::Path>) -> Option<String> {
     let asking = asking?;
     let mine = sh.helpers.binary();
-    if crate::service::same_file(asking, mine) || !sh.helpers.path_unchanged() {
+    if crate::sys::same_file(asking, mine) || !sh.helpers.path_unchanged() {
         return None;
     }
     let (a, b) = (mine.display(), asking.display());

@@ -7,9 +7,9 @@ use crate::proto::{
     ClientContext, ClientRequest, NEEDS_USER_KEY, Request, RequestAuth, Response, ServerResponse,
     read_msg, write_msg,
 };
+use crate::sys::local::UnixStream;
 use crate::types::Reminder;
 use std::io::{BufReader, Read, Write};
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -89,6 +89,13 @@ pub fn is_disconnected(e: &anyhow::Error) -> bool {
     e.is::<Disconnected>()
 }
 
+/// Whether `e` is a daemon's [`STOPPING`]: it didn't take the request.
+#[cfg(windows)]
+fn stopping(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<Disconnected>()
+        .is_some_and(|d| d.0 == STOPPING)
+}
+
 /// Whether `e` is a daemon's answer that it didn't understand the request (a daemon older than
 /// this CLI, which doesn't know it).
 pub fn not_understood(e: &anyhow::Error) -> bool {
@@ -129,6 +136,9 @@ fn connect_waiting(paths: &Paths, sock: &Path) -> std::io::Result<UnixStream> {
 pub struct Client {
     reader: BufReader<UnixStream>,
     writer: UnixStream,
+    /// Where it connected, to connect again ([`Client::call`] on Windows).
+    #[cfg(windows)]
+    paths: Paths,
     pub ctx: ClientContext,
     /// Reminders from the latest response.
     pub reminders: Vec<Reminder>,
@@ -167,6 +177,8 @@ impl Client {
         Ok(Client {
             reader,
             writer,
+            #[cfg(windows)]
+            paths: paths.clone(),
             ctx,
             reminders: Vec::new(),
             user: user_key(paths),
@@ -176,7 +188,47 @@ impl Client {
     /// Sends a request, signed with the user key when there is one, and reads one response. An
     /// `Error` response becomes an `Err`; one saying an unsigned request needs a user key says
     /// why this command line has none.
+    ///
+    /// On Windows a daemon restarting closes its connections rather than hand them over, and
+    /// answers a request it won't take with [`STOPPING`]: the request is sent again on a new
+    /// connection, to the next daemon (waiting for it, up to [`READ_TIMEOUT`]).
+    #[cfg(windows)]
     pub fn call(&mut self, req: Request) -> anyhow::Result<Response> {
+        let give_up = std::time::Instant::now() + READ_TIMEOUT;
+        loop {
+            match self.call_once(req.clone()) {
+                Err(e) if stopping(&e) && std::time::Instant::now() < give_up => {
+                    std::thread::sleep(Duration::from_millis(50));
+                    self.reconnect()?;
+                }
+                answer => return answer,
+            }
+        }
+    }
+
+    /// A new connection to the daemon in place of this one.
+    #[cfg(windows)]
+    fn reconnect(&mut self) -> anyhow::Result<()> {
+        // The wait this one was given (a slow answer's), for the new one.
+        let timeout = self.writer.read_timeout().ok().flatten();
+        let fresh = Client::connect(&self.paths, self.ctx.clone())?;
+        self.reader = fresh.reader;
+        self.writer = fresh.writer;
+        if timeout.is_some() {
+            self.writer.set_read_timeout(timeout)?;
+        }
+        Ok(())
+    }
+
+    /// Sends a request, signed with the user key when there is one, and reads one response. An
+    /// `Error` response becomes an `Err`; one saying an unsigned request needs a user key says
+    /// why this command line has none.
+    #[cfg(unix)]
+    pub fn call(&mut self, req: Request) -> anyhow::Result<Response> {
+        self.call_once(req)
+    }
+
+    fn call_once(&mut self, req: Request) -> anyhow::Result<Response> {
         let auth = self.user.as_ref().ok().map(|k| RequestAuth::sign(k, &req));
         write_msg(
             &mut self.writer,

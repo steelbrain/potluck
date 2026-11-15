@@ -415,6 +415,37 @@ impl Write for DuplexIo {
 
 /// Turns on TCP keepalive, so a peer that vanished mid-stream is noticed (idle 30 s, then a
 /// probe every 10 s, 3 probes).
+#[cfg(windows)]
+pub fn keepalive(sock: &TcpStream) {
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{
+        IPPROTO_TCP, SO_KEEPALIVE, SOCKET, SOL_SOCKET, TCP_KEEPCNT, TCP_KEEPIDLE, TCP_KEEPINTVL,
+        setsockopt,
+    };
+    let s = sock.as_raw_socket() as SOCKET;
+    let set = |level: i32, opt: i32, val: u32| {
+        // SAFETY: setsockopt on a socket we own, with a pointer to a live DWORD of the given
+        // size.
+        unsafe {
+            setsockopt(
+                s,
+                level,
+                opt,
+                (&val as *const u32).cast(),
+                std::mem::size_of::<u32>() as i32,
+            );
+        }
+    };
+    set(SOL_SOCKET, SO_KEEPALIVE, 1);
+    // In seconds, per socket, since Windows 10 1709.
+    set(IPPROTO_TCP, TCP_KEEPIDLE, 30);
+    set(IPPROTO_TCP, TCP_KEEPINTVL, 10);
+    set(IPPROTO_TCP, TCP_KEEPCNT, 3);
+}
+
+/// Turns on TCP keepalive, so a peer that vanished mid-stream is noticed (idle 30 s, then a
+/// probe every 10 s, 3 probes).
+#[cfg(unix)]
 pub fn keepalive(sock: &TcpStream) {
     use std::os::fd::AsRawFd;
     let fd = sock.as_raw_fd();

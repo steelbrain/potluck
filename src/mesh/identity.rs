@@ -14,7 +14,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 use std::fs;
 use std::io::Write;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 /// The key file in the keys directory.
@@ -236,14 +237,17 @@ fn self_signed(pkcs8: &[u8]) -> Result<CertificateDer<'static>, rcgen::Error> {
     Ok(cert.der().clone())
 }
 
-/// Creates `dir` with mode 0700 if missing.
+/// Creates `dir` with mode 0700 (on Windows an access list for this user alone) if missing.
 pub fn ensure_dir(dir: &Path) -> Result<(), MeshError> {
     if !dir.exists() {
-        fs::DirBuilder::new()
+        #[cfg(unix)]
+        let made = fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
-            .create(dir)
-            .map_err(|e| MeshError::Identity(format!("{}: {e}", dir.display())))?;
+            .create(dir);
+        #[cfg(windows)]
+        let made = crate::sys::create_dir_all(dir, 0o700);
+        made.map_err(|e| MeshError::Identity(format!("{}: {e}", dir.display())))?;
     }
     Ok(())
 }
@@ -255,12 +259,17 @@ pub fn write_private(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), MeshErr
     let tmp: PathBuf = dir.join(format!(".{name}.{}.tmp", std::process::id()));
     let err = |e: std::io::Error| MeshError::Identity(format!("{}: {e}", path.display()));
     let _ = fs::remove_file(&tmp);
-    let mut f = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
+    let mut f = crate::sys::file_mode(fs::OpenOptions::new().write(true).create_new(true), 0o600)
         .open(&tmp)
         .map_err(err)?;
+    // Windows: a new file inherits its directory's access list, which may let others in (a
+    // directory made before, by hand): this user's alone before anything is written.
+    #[cfg(windows)]
+    if let Err(e) = crate::sys::set_mode(&tmp, 0o600) {
+        drop(f);
+        let _ = fs::remove_file(&tmp);
+        return Err(err(e));
+    }
     let written = f
         .write_all(bytes)
         .and_then(|()| f.sync_all())
@@ -275,7 +284,19 @@ pub fn write_private(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), MeshErr
     written.map_err(err)
 }
 
+/// Makes `path` private: on Windows an access list for this user alone, unless it has one (as a
+/// key file has, made in a private directory).
+#[cfg(windows)]
+pub(super) fn tighten(path: &Path, mode: u32) -> Result<(), MeshError> {
+    let err = |e: std::io::Error| MeshError::Identity(format!("{}: {e}", path.display()));
+    if !crate::sys::is_private(path).map_err(err)? {
+        crate::sys::set_mode(path, mode).map_err(err)?;
+    }
+    Ok(())
+}
+
 /// Clears group and other permission bits on `path`, if any are set.
+#[cfg(unix)]
 pub(super) fn tighten(path: &Path, mode: u32) -> Result<(), MeshError> {
     let meta = fs::metadata(path).map_err(|e| MeshError::Identity(format!("{e}")))?;
     if meta.permissions().mode() & 0o077 != 0 {

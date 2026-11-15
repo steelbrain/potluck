@@ -372,6 +372,7 @@ pub fn compare_versions(a: &str, b: &str) -> Ordering {
 }
 
 /// This machine's host name, as the kernel reports it.
+#[cfg(unix)]
 pub fn hostname() -> String {
     let mut buf = [0u8; 256];
     // SAFETY: gethostname writes at most buf.len() bytes into buf.
@@ -381,6 +382,12 @@ pub fn hostname() -> String {
     }
     let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
     String::from_utf8_lossy(&buf[..end]).into_owned()
+}
+
+/// This machine's host name: its DNS host name ([`crate::sys::hostname`]).
+#[cfg(windows)]
+pub fn hostname() -> String {
+    crate::sys::hostname()
 }
 
 /// The host name up to its first dot: the default node name.

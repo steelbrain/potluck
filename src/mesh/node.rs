@@ -18,6 +18,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::IpAddr;
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+#[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -453,11 +454,9 @@ struct Inner {
     former_pinged: Mutex<Option<Instant>>,
     /// False once it stops taking connections ([`Mesh::stop_accepting`]).
     accepting: AtomicBool,
-    /// Wakes the accept loop: written to, never read.
-    accept_wake: Option<(
-        std::os::unix::net::UnixStream,
-        std::os::unix::net::UnixStream,
-    )>,
+    /// Wakes the accept loop: written to, never read. None on Windows, which can't wait on a
+    /// local socket and a TCP listener at once: there a connection of its own wakes the loop.
+    accept_wake: Option<(crate::sys::local::UnixStream, crate::sys::local::UnixStream)>,
     /// A copy of the listener, for [`Mesh::hand_over`].
     kept: Mutex<Option<TcpListener>>,
     /// Record exchanges this machine started (for tests).
@@ -1654,7 +1653,10 @@ impl Inner {
             unsaved: AtomicBool::new(false),
             former_pinged: Mutex::new(None),
             accepting: AtomicBool::new(true),
-            accept_wake: std::os::unix::net::UnixStream::pair().ok(),
+            #[cfg(unix)]
+            accept_wake: crate::sys::local::UnixStream::pair().ok(),
+            #[cfg(windows)]
+            accept_wake: None,
             kept: Mutex::new(None),
             refused_log: Mutex::new(RefusedLog {
                 window: Instant::now(),
@@ -2583,7 +2585,10 @@ impl Inner {
         // connection a while at most and looks at the flag again. Not blocking in `accept`
         // either: a connection reset between the wait and the accept would block it.
         let waits = listener.set_nonblocking(true).is_ok();
-        let wake = self.accept_wake.as_ref().map(|(r, _)| r.as_raw_fd());
+        let wake = self
+            .accept_wake
+            .as_ref()
+            .map(|(r, _)| crate::sys::local::AsRawSock::as_raw_sock(r));
         loop {
             // Not accepting any more (a restart in place): connections wait in the backlog for
             // the next mesh, on this listener handed over.
@@ -3139,6 +3144,21 @@ const RELEASE_WAIT: Duration = Duration::from_secs(2);
 
 /// Whether a connection waits on `listener`, waiting `wait` at most, or less once `wake` is
 /// readable (also true on an error, so the caller's accept reports it).
+#[cfg(windows)]
+fn incoming(
+    listener: &TcpListener,
+    wake: Option<crate::sys::local::RawSock>,
+    wait: Duration,
+) -> bool {
+    use crate::sys::local::AsRawSock;
+    let mut socks = vec![listener.as_raw_sock()];
+    socks.extend(wake);
+    crate::sys::local::wait_readable(&socks, Some(wait))[0]
+}
+
+/// Whether a connection waits on `listener`, waiting `wait` at most, or less once `wake` is
+/// readable (also true on an error, so the caller's accept reports it).
+#[cfg(unix)]
 fn incoming(listener: &TcpListener, wake: Option<std::os::fd::RawFd>, wait: Duration) -> bool {
     let mut fds = [
         libc::pollfd {

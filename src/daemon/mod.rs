@@ -11,7 +11,8 @@
 //!   had failed (then they end so). Pins that no job or workspace holds any more (a
 //!   daemon killed between pinning and recording, or between a job's end and its unpinning) are
 //!   dropped.
-//! - Serves `potluck.sock` (mode 0600 in a 0700 home), one thread per connection, closed after
+//! - Serves `potluck.sock` (mode 0600 in a 0700 home; on Windows an AF_UNIX socket in a home
+//!   whose access list lets only this user in), one thread per connection, closed after
 //!   10 minutes without a request or without taking any of an answer; state behind a mutex,
 //!   written through to the store on every change. Every response carries the caller's reminders.
 //! - Dispatch: idempotent by key; refuses specs that no machine could ever run (facts, RAM) and
@@ -33,6 +34,8 @@
 //! - Restart in place ([`handover`]): on `potluck restart`, or once an update has replaced the
 //!   binary, the daemon drains, hands its socket, the mesh's listener, its open connections and
 //!   the mesh's view of the members to the binary at its path, and execs it in its own process.
+//!   Windows has no exec: there the daemon drains as well, then exits, and its [`keeper`] starts
+//!   the binary at its path in a new process.
 //!
 //! Time: records carry wall time, but run limits, the grace before SIGKILL and the loop's periodic
 //! work are measured on the boot clock ([`clock`]), so a step of the wall clock moves none of them,
@@ -74,6 +77,8 @@ pub mod cluster;
 mod files;
 pub mod handover;
 mod helpers;
+#[cfg(windows)]
+pub mod keeper;
 mod parts;
 mod runner;
 mod server;
@@ -81,18 +86,22 @@ mod state;
 
 pub use clock::{Clock, SystemClock};
 pub use cluster::{ClusterOptions, GitTunnel, Tunnel, Updater, real_updater};
+#[cfg(windows)]
+pub(crate) use files::set_copy_mode;
 pub use parts::{Parts, RealScheduler, Scheduler, WorkspaceProvider};
 
 use crate::config::{NodeConfig, Paths};
 use crate::store::Store;
+use crate::sys::local::{UnixListener, UnixStream};
 use crate::types::{MINUTE_MS, now_ms};
 use state::State;
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Write;
+#[cfg(unix)]
 use std::os::fd::AsRawFd;
+#[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
@@ -162,6 +171,7 @@ struct LogFile {
     len: u64,
     max: u64,
     /// The standard descriptors open on the log (launchd's stdout and stderr).
+    #[cfg(unix)]
     std_fds: Vec<std::os::fd::RawFd>,
 }
 
@@ -183,11 +193,17 @@ impl Logger {
                 None
             }
         };
+        #[cfg(unix)]
         let std_fds: Vec<std::os::fd::RawFd> = [libc::STDOUT_FILENO, libc::STDERR_FILENO]
             .into_iter()
             .filter(|&fd| file.as_ref().is_some_and(|f| same_file(f, fd)))
             .collect();
+        #[cfg(unix)]
         let to_stderr = !std_fds.contains(&libc::STDERR_FILENO);
+        // Windows: a service can't send stderr to the log, but `potluck daemon 2>>daemon.log`
+        // can; it stays where it is when the log starts afresh.
+        #[cfg(windows)]
+        let to_stderr = !file.as_ref().is_some_and(stderr_is);
         Logger {
             file: Arc::new(Mutex::new(LogFile {
                 path: path.to_path_buf(),
@@ -197,6 +213,7 @@ impl Logger {
                     .map_or(0, |m| m.len()),
                 file,
                 max,
+                #[cfg(unix)]
                 std_fds,
             })),
             to_stderr,
@@ -243,6 +260,7 @@ impl LogFile {
         let Ok(new) = open_append(&self.path) else {
             return;
         };
+        #[cfg(unix)]
         for &fd in &self.std_fds {
             // SAFETY: both descriptors are open; dup2 replaces `fd` with a copy of the new log's.
             unsafe { libc::dup2(new.as_raw_fd(), fd) };
@@ -267,7 +285,19 @@ fn open_append(path: &std::path::Path) -> std::io::Result<File> {
         .open(path)
 }
 
+/// Whether this process's stderr is open on the same file as `f`.
+#[cfg(windows)]
+fn stderr_is(f: &File) -> bool {
+    use std::os::windows::io::AsHandle;
+    let stderr = std::io::stderr();
+    matches!(
+        (crate::sys::FileId::of(f), crate::sys::FileId::of_handle(stderr.as_handle())),
+        (Ok(a), Ok(b)) if a == b
+    )
+}
+
 /// Whether descriptor `fd` is open on the same file as `f`.
+#[cfg(unix)]
 fn same_file(f: &File, fd: std::os::fd::RawFd) -> bool {
     use std::os::unix::fs::MetadataExt;
     let Ok(meta) = f.metadata() else {
@@ -886,7 +916,7 @@ impl Daemon {
         // Not one whose thread handed it over and hasn't ended yet.
         let handed: Vec<_> = conns
             .iter()
-            .filter_map(|(s, _)| handover::socket_id(s.as_raw_fd()))
+            .filter_map(|(s, _)| handover::conn_id(s))
             .collect();
         let cut = sh
             .conns
@@ -895,8 +925,7 @@ impl Daemon {
             .drain(..)
             .filter(|(stream, h)| {
                 let going = !h.is_finished()
-                    && !handover::socket_id(stream.as_raw_fd())
-                        .is_some_and(|id| handed.contains(&id));
+                    && !handover::conn_id(stream).is_some_and(|id| handed.contains(&id));
                 if going {
                     let _ = stream.shutdown(std::net::Shutdown::Both);
                 }
@@ -1071,6 +1100,7 @@ const HOME_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 /// Clears the group and other permission bits on the state directory. It holds job specs with
 /// their `--env` values, logs and sources, and may have been created with the umask's mode by
 /// something else first (`potluck service install`, an older potluck).
+#[cfg(unix)]
 fn make_private(home: &std::path::Path) -> anyhow::Result<()> {
     let mode = std::fs::metadata(home)
         .map_err(|e| anyhow::anyhow!("{}: {e}", home.display()))?
@@ -1083,7 +1113,33 @@ fn make_private(home: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Gives the state directory an access list that lets only this user in (no inherited entries),
+/// unless it has one already. It holds job specs with their `--env` values, logs and sources,
+/// and a directory made by hand inherits its parent's list: on a Dev Drive the drive root's,
+/// where Authenticated Users may modify. A list set on a directory reaches everything in it, a
+/// walk of the whole tree, so it is set only when it isn't that one already.
+#[cfg(windows)]
+fn make_private(home: &std::path::Path) -> anyhow::Result<()> {
+    let private =
+        crate::sys::is_private(home).map_err(|e| anyhow::anyhow!("{}: {e}", home.display()))?;
+    if !private {
+        crate::sys::set_mode(home, 0o700)
+            .map_err(|e| anyhow::anyhow!("making {} private: {e}", home.display()))?;
+    }
+    Ok(())
+}
+
+/// Makes the home (0700, or on Windows an access list for this user alone) and makes one made
+/// before private too.
+#[cfg(windows)]
+fn prepare_home(paths: &Paths) -> anyhow::Result<()> {
+    crate::sys::create_dir_all(&paths.home, 0o700)
+        .map_err(|e| anyhow::anyhow!("{}: {e}", paths.home.display()))?;
+    make_private(&paths.home)
+}
+
 /// Makes the home (0700) and clears the group and other bits on one made before.
+#[cfg(unix)]
 fn prepare_home(paths: &Paths) -> anyhow::Result<()> {
     std::fs::DirBuilder::new()
         .recursive(true)
@@ -1100,7 +1156,8 @@ fn lock_home(paths: &Paths) -> anyhow::Result<File> {
     take_home_lock(paths)
 }
 
-/// One daemon per home: `daemon.lock`, flocked for the daemon's lifetime.
+/// One daemon per home: `daemon.lock`, flocked for the daemon's lifetime (on Windows locked
+/// with `LockFileEx`, which ends with the daemon's process as a flock does).
 fn take_home_lock(paths: &Paths) -> anyhow::Result<File> {
     let path = paths.home.join("daemon.lock");
     let f = std::fs::OpenOptions::new()
@@ -1110,8 +1167,7 @@ fn take_home_lock(paths: &Paths) -> anyhow::Result<File> {
         .open(&path)
         .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
     let start = std::time::Instant::now();
-    // SAFETY: flock on an fd we own.
-    while unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+    while !lock_now(&f).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))? {
         if start.elapsed() >= HOME_LOCK_WAIT {
             anyhow::bail!(
                 "another potluck daemon is running for {} (as the service, or a `potluck daemon` \
@@ -1124,8 +1180,49 @@ fn take_home_lock(paths: &Paths) -> anyhow::Result<File> {
     Ok(f)
 }
 
+/// Takes the exclusive lock on `f` if no one holds it: whether it did.
+#[cfg(unix)]
+fn lock_now(f: &File) -> std::io::Result<bool> {
+    // SAFETY: flock on an fd we own.
+    Ok(unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0)
+}
+
+/// Takes the exclusive lock on `f` if no one holds it: whether it did.
+#[cfg(windows)]
+pub(crate) fn lock_now(f: &File) -> std::io::Result<bool> {
+    match f.try_lock() {
+        Ok(()) => Ok(true),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(false),
+        Err(std::fs::TryLockError::Error(e)) => Err(e),
+    }
+}
+
+/// Whether a daemon holds `daemon.lock` in `paths`' home now, or (on Windows) a keeper holds
+/// `keeper.lock` there, which it does while it restarts the daemon too. Only probes the locks:
+/// creates nothing, and a daemon starting meanwhile waits [`HOME_LOCK_WAIT`] for it.
+#[cfg(windows)]
+pub fn running_here(paths: &Paths) -> bool {
+    ["daemon.lock", keeper::LOCK_FILE].iter().any(|name| {
+        let Ok(f) = std::fs::OpenOptions::new()
+            .write(true)
+            .open(paths.home.join(name))
+        else {
+            return false;
+        };
+        match lock_now(&f) {
+            Ok(true) => {
+                let _ = f.unlock();
+                false
+            }
+            Ok(false) => true,
+            Err(_) => false,
+        }
+    })
+}
+
 /// Whether a daemon holds `daemon.lock` in `paths`' home now. Only probes the lock: creates
 /// nothing, and a daemon starting meanwhile waits [`HOME_LOCK_WAIT`] for it.
+#[cfg(unix)]
 pub fn running_here(paths: &Paths) -> bool {
     let Ok(f) = std::fs::OpenOptions::new()
         .write(true)
@@ -1137,10 +1234,11 @@ pub fn running_here(paths: &Paths) -> bool {
     unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) != 0 }
 }
 
-/// Binds the socket, replacing a stale one, readable and writable by this user only.
+/// Binds the socket, replacing a stale one, readable and writable by this user only (on
+/// Windows through the private state directory's access list, which it inherits).
 fn bind(paths: &Paths) -> anyhow::Result<UnixListener> {
     let sock = paths.socket();
-    if sock.exists() {
+    if crate::sys::local::socket_file_exists(&sock) {
         if UnixStream::connect(&sock).is_ok() {
             anyhow::bail!("{} is in use by another process", sock.display());
         }
@@ -1148,6 +1246,7 @@ fn bind(paths: &Paths) -> anyhow::Result<UnixListener> {
     }
     let listener =
         UnixListener::bind(&sock).map_err(|e| anyhow::anyhow!("{}: {e}", sock.display()))?;
+    #[cfg(unix)]
     std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600))?;
     Ok(listener)
 }
@@ -1158,6 +1257,7 @@ fn bind(paths: &Paths) -> anyhow::Result<UnixListener> {
 /// client and member connection, stream, log and copy. Returns the soft limit before and after.
 /// The jobs it starts get the new limits: on macOS they inherit them, on Linux their units are
 /// given them.
+#[cfg(unix)]
 fn raise_open_files() -> std::io::Result<(u64, u64)> {
     let mut lim = libc::rlimit {
         rlim_cur: 0,
@@ -1216,6 +1316,10 @@ pub fn run(paths: &Paths, config: &NodeConfig) -> anyhow::Result<()> {
         let left = handover::end_children(handover::CHILD_GRACE);
         i.children = handover::reap(&left);
     }
+    // A console's Ctrl+C or Ctrl+Break, or its window closing, ends the daemon at once, as
+    // SIGTERM does on Unix (its jobs run on).
+    #[cfg(windows)]
+    keeper::end_on_console_events();
     // Then: an update may replace the binary while the daemon starts.
     helpers::remember_own_binary();
     // Then the home's lock, for a daemon starting without a handover (one started from a
@@ -1225,6 +1329,7 @@ pub fn run(paths: &Paths, config: &NodeConfig) -> anyhow::Result<()> {
         Some(_) => None,
         None => Some(lock_home(paths)?),
     };
+    #[cfg(unix)]
     let open_files = raise_open_files();
     config.listen_ip()?;
     let (login_env, left_out) = match &inherited {
@@ -1278,6 +1383,7 @@ pub fn run(paths: &Paths, config: &NodeConfig) -> anyhow::Result<()> {
             "login environment: {v}; jobs don't get it (a job's environment holds text only)"
         ));
     }
+    #[cfg(unix)]
     match open_files {
         Ok((before, after)) if after > before => shared.log.log(format!(
             "open files: soft limit raised from {before} to {after}"
@@ -1301,14 +1407,7 @@ pub fn run(paths: &Paths, config: &NodeConfig) -> anyhow::Result<()> {
                 why,
                 told,
             } => (
-                exec_plainly(
-                    &shared,
-                    &bin,
-                    inherited,
-                    &told,
-                    || handover::end_children(handover::CHILD_GRACE),
-                    || handover::exec(&bin, None),
-                ),
+                restart_plainly(&shared, &bin, inherited, &told),
                 shared,
                 why,
                 "plainly",
@@ -1319,7 +1418,7 @@ pub fn run(paths: &Paths, config: &NodeConfig) -> anyhow::Result<()> {
                 shared,
                 why,
             } => (
-                exec_in_place(&shared, &bin, inherited)?,
+                restart_in_place(&shared, &bin, inherited)?,
                 shared,
                 why,
                 "in place",
@@ -1350,12 +1449,156 @@ pub fn run(paths: &Paths, config: &NodeConfig) -> anyhow::Result<()> {
     }
 }
 
+/// [`exec_plainly`] `bin`, with this process's children ended first.
+#[cfg(unix)]
+fn restart_plainly(
+    sh: &Arc<Shared>,
+    bin: &std::path::Path,
+    inherited: handover::Inherited,
+    told: &str,
+) -> handover::Inherited {
+    exec_plainly(
+        sh,
+        bin,
+        inherited,
+        told,
+        || handover::end_children(handover::CHILD_GRACE),
+        || handover::exec(bin, None),
+    )
+}
+
+/// A plain restart on Windows is a restart like any other there ([`exit_for_restart`]): those
+/// who asked are told `told`.
+#[cfg(windows)]
+fn restart_plainly(
+    sh: &Arc<Shared>,
+    bin: &std::path::Path,
+    inherited: handover::Inherited,
+    told: &str,
+) -> handover::Inherited {
+    exit_for_restart(sh, bin, inherited, Some(told))
+}
+
+/// [`exec_in_place`].
+#[cfg(unix)]
+fn restart_in_place(
+    sh: &Arc<Shared>,
+    bin: &std::path::Path,
+    inherited: handover::Inherited,
+) -> anyhow::Result<handover::Inherited> {
+    exec_in_place(sh, bin, inherited)
+}
+
+/// [`exit_for_restart`]: Windows has no exec, so the restart in place starts a new process.
+#[cfg(windows)]
+fn restart_in_place(
+    sh: &Arc<Shared>,
+    bin: &std::path::Path,
+    inherited: handover::Inherited,
+) -> anyhow::Result<handover::Inherited> {
+    Ok(exit_for_restart(sh, bin, inherited, None))
+}
+
+/// Windows' last steps of a restart, in place or plain (the same there: a running process can't
+/// become another binary). Those of [`exec_in_place`] up to the store's closing (the state stays
+/// locked until the process ends); then the `potluck restart`s that asked are told `told` (None:
+/// that the restart goes ahead and what it keeps), every connection closes, and the daemon exits
+/// with [`keeper::RESTART_EXIT`]: its keeper ends what the daemon left running (git, tools: work
+/// cut short) and starts the binary at its path at once, in a new process that starts as any
+/// daemon does and adopts the running jobs. Clients connect again (they wait while the keeper
+/// holds `keeper.lock`), and members dial again. Returns only if records the daemon held
+/// couldn't be written: what was handed over, back, with [`handover::Inherited::waits`], and the
+/// daemon starts again in this process and tries again.
+#[cfg(windows)]
+fn exit_for_restart(
+    sh: &Arc<Shared>,
+    bin: &std::path::Path,
+    inherited: handover::Inherited,
+    told: Option<&str>,
+) -> handover::Inherited {
+    let (how, restart) = match told {
+        None => ("in place", "restart in place"),
+        Some(_) => ("plainly", "plain restart"),
+    };
+    let (st, mut inherited) = match close_for_exec_as(sh, inherited, Vec::new, restart) {
+        Ok(ready) => ready,
+        Err(back) => return *back,
+    };
+    let text = match told {
+        Some(t) => t.to_string(),
+        None => format!(
+            "Restarted: potluck {} stopped, and its keeper started {} as the daemon in a new \
+             process. {}; open connections were closed, and clients connect again.{}",
+            crate::VERSION,
+            bin.display(),
+            handover::jobs_kept(inherited.running_jobs),
+            handover::drain_waited(inherited.drained_ms),
+        ),
+    };
+    for (conn, asked) in &mut inherited.conns {
+        if asked.take().is_some() {
+            let _ = conn.set_write_timeout(Some(std::time::Duration::from_secs(1)));
+            let _ = files::reply(
+                &mut &*conn,
+                &[],
+                crate::proto::Response::Text { text: text.clone() },
+            );
+        }
+        let _ = conn.shutdown(std::net::Shutdown::Both);
+    }
+    // From here on a client finds no socket, and waits for the next daemon (the keeper holds its
+    // lock meanwhile); one waiting in the backlog is told the daemon is stopping, and sends its
+    // request again to the next one.
+    let _ = std::fs::remove_file(sh.paths.socket());
+    refuse_waiting(&inherited.socket);
+    sh.log.log(format!(
+        "restarting {how}: exiting for the keeper to start {}",
+        bin.display()
+    ));
+    // The state stays locked: nothing writes after the store closed.
+    let _locked = st;
+    std::process::exit(keeper::RESTART_EXIT)
+}
+
+/// Answers each connection waiting in `listener`'s backlog with [`crate::client::STOPPING`] once
+/// it has sent its request (a second at most), and closes it.
+#[cfg(windows)]
+fn refuse_waiting(listener: &UnixListener) {
+    if listener.set_nonblocking(true).is_err() {
+        return;
+    }
+    while let Ok((conn, _)) = listener.accept() {
+        if conn.set_nonblocking(false).is_err()
+            || conn
+                .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+                .is_err()
+            || conn
+                .set_write_timeout(Some(std::time::Duration::from_secs(1)))
+                .is_err()
+        {
+            continue;
+        }
+        let mut reader = std::io::BufReader::new(&conn);
+        if let Ok(Some(_)) = crate::proto::read_msg::<_, crate::proto::ClientRequest>(&mut reader) {
+            let _ = files::reply(
+                &mut &conn,
+                &[],
+                crate::proto::Response::Error {
+                    message: crate::client::STOPPING.into(),
+                },
+            );
+        }
+        let _ = conn.shutdown(std::net::Shutdown::Both);
+    }
+}
+
 /// The last steps of a restart in place: closes the store (with the state locked until the exec,
 /// so nothing writes after), reaps children that ended, writes the handover file and execs `bin`
 /// with it. Returns only if that didn't happen: what was handed over, back, with why
 /// ([`handover::Inherited::waits`] when records the daemon held, which it keeps, or the handover
 /// file couldn't be written; [`handover::Inherited::failed`] when the exec failed), or an error if
 /// even that can't be had: then the process ends, and a service starts the daemon again plainly.
+#[cfg(unix)]
 fn exec_in_place(
     sh: &Arc<Shared>,
     bin: &std::path::Path,
@@ -1406,6 +1649,7 @@ fn exec_in_place(
 /// [`handover::Inherited::waits`] when records the daemon held couldn't be written (those who
 /// asked are told by the daemon serving on), else [`handover::Inherited::failed`] (told here when
 /// `bin` can't be executed any more; an exec that fails after all comes after they were told).
+#[cfg(unix)]
 fn exec_plainly(
     sh: &Arc<Shared>,
     bin: &std::path::Path,
@@ -1482,6 +1726,7 @@ fn cut_short(
 /// [`exec_in_place`] up to the exec: [`cut_short`], then closes the store
 /// ([`handover::close_store`]). Err when records the daemon holds couldn't be written:
 /// `inherited` back with them, and why the restart waits.
+#[cfg(any(unix, test))]
 fn close_for_exec(
     sh: &Shared,
     inherited: handover::Inherited,
@@ -1546,6 +1791,7 @@ mod tests {
 
     /// Run in a child of the test binary (the parent below starts it with a soft limit of 128):
     /// raises the limit and prints what it got. Does nothing in a plain test run.
+    #[cfg(unix)]
     #[test]
     fn open_files_child() {
         if std::env::var_os("POTLUCK_TEST_OPEN_FILES_CHILD").is_none() {
@@ -1565,6 +1811,7 @@ mod tests {
 
     /// A daemon started by a service gets a low soft limit (1024 under systemd's user manager, 256
     /// under launchd); it raises it to its hard limit.
+    #[cfg(unix)]
     #[test]
     fn the_open_files_limit_is_raised_to_the_hard_limit() {
         use std::os::unix::process::CommandExt;

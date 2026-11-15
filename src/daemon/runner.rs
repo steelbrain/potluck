@@ -21,6 +21,16 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+// The signals the daemon sends a job through its executor. Windows has none: its executor takes
+// SIGTERM to ask a job to stop (Ctrl+Break to its command) and SIGKILL to end it (its job object
+// terminated). The numbers are POSIX's, the same on Linux and macOS.
+#[cfg(unix)]
+use libc::{SIGKILL, SIGTERM};
+#[cfg(windows)]
+pub(crate) const SIGTERM: i32 = 15;
+#[cfg(windows)]
+pub(crate) const SIGKILL: i32 = 9;
+
 /// Sampling failures in a row before the daemon gives up on an invocation as lost.
 const MAX_SAMPLE_ERRORS: u32 = 20;
 /// A job's task limit: room for big parallel builds and test runs, not for a fork bomb. Linux:
@@ -764,7 +774,7 @@ fn decide(st: &mut State, opts: &Options, at: Now, p: Probe, s: Seen, acts: &mut
                 at: now,
             });
             if !gone {
-                acts.push(Act::Signal(id.clone(), p.handle.clone(), libc::SIGKILL));
+                acts.push(Act::Signal(id.clone(), p.handle.clone(), SIGKILL));
                 run.sent_kill(at);
             }
         } else if let Some((seen, limit)) = over_tasks {
@@ -772,12 +782,12 @@ fn decide(st: &mut State, opts: &Options, at: Now, p: Probe, s: Seen, acts: &mut
             ending = Some(Ending {
                 state: JobState::Failed,
                 exit_code: None,
-                signal: Some(libc::SIGKILL),
+                signal: Some(SIGKILL),
                 message: Some(over_tasks_message(seen, limit)),
                 at: now,
             });
             if !gone {
-                acts.push(Act::Signal(id.clone(), p.handle.clone(), libc::SIGKILL));
+                acts.push(Act::Signal(id.clone(), p.handle.clone(), SIGKILL));
                 run.sent_kill(at);
             }
         } else if oom_killed {
@@ -785,7 +795,7 @@ fn decide(st: &mut State, opts: &Options, at: Now, p: Probe, s: Seen, acts: &mut
             ending = Some(Ending {
                 state: JobState::Failed,
                 exit_code: None,
-                signal: Some(libc::SIGKILL),
+                signal: Some(SIGKILL),
                 message: Some(oom_killed_message(
                     job.usage.peak_mem_bytes.max(job.usage.mem_bytes),
                     lease.grant.ram_mib,
@@ -793,14 +803,14 @@ fn decide(st: &mut State, opts: &Options, at: Now, p: Probe, s: Seen, acts: &mut
                 at: now,
             });
             if !gone {
-                acts.push(Act::Signal(id.clone(), p.handle.clone(), libc::SIGKILL));
+                acts.push(Act::Signal(id.clone(), p.handle.clone(), SIGKILL));
                 run.sent_kill(at);
             }
         } else if let Some(status) = &s.status {
             ending = Some(ending_from_status(status));
             if !gone {
                 // The command is over; whatever it left behind is killed.
-                acts.push(Act::Signal(id.clone(), p.handle.clone(), libc::SIGKILL));
+                acts.push(Act::Signal(id.clone(), p.handle.clone(), SIGKILL));
                 run.sent_kill(at);
             }
         } else if supervisor_gone {
@@ -818,7 +828,7 @@ fn decide(st: &mut State, opts: &Options, at: Now, p: Probe, s: Seen, acts: &mut
                 message: Some(why),
                 at: now,
             });
-            acts.push(Act::Signal(id.clone(), p.handle.clone(), libc::SIGKILL));
+            acts.push(Act::Signal(id.clone(), p.handle.clone(), SIGKILL));
             run.sent_kill(at);
         } else if gone {
             ending = Some(if let Some(full) = &s.full {
@@ -873,7 +883,7 @@ fn decide(st: &mut State, opts: &Options, at: Now, p: Probe, s: Seen, acts: &mut
                 message: Some("cancelled".into()),
                 at: now,
             });
-            acts.push(Act::Signal(id.clone(), p.handle.clone(), libc::SIGTERM));
+            acts.push(Act::Signal(id.clone(), p.handle.clone(), SIGTERM));
             run.sent_term(at);
         } else if at.boot
             >= *run
@@ -890,7 +900,7 @@ fn decide(st: &mut State, opts: &Options, at: Now, p: Probe, s: Seen, acts: &mut
                 )),
                 at: now,
             });
-            acts.push(Act::Signal(id.clone(), p.handle.clone(), libc::SIGTERM));
+            acts.push(Act::Signal(id.clone(), p.handle.clone(), SIGTERM));
             run.sent_term(at);
         } else if opts.stall_ms > 0 {
             // Awake time: a machine asleep runs none of its jobs.
@@ -959,7 +969,7 @@ fn decide(st: &mut State, opts: &Options, at: Now, p: Probe, s: Seen, acts: &mut
             }
         } else {
             if run.grace_after_term(at, grace) {
-                acts.push(Act::Signal(id.clone(), p.handle.clone(), libc::SIGKILL));
+                acts.push(Act::Signal(id.clone(), p.handle.clone(), SIGKILL));
                 run.sent_kill(at);
             }
             false
@@ -1044,7 +1054,7 @@ fn stacks(
         st.save_run(id);
     }
     if end {
-        if let Err(e) = sh.parts.executor.signal(handle, libc::SIGTERM) {
+        if let Err(e) = sh.parts.executor.signal(handle, SIGTERM) {
             sh.log.log(format!("{id}: signal: {e:#}"));
         }
         sh.kick();
@@ -1070,6 +1080,16 @@ fn ending_from_status(s: &ExitStatus) -> Ending {
     }
 }
 
+#[cfg(windows)]
+fn signal_name(sig: i32) -> &'static str {
+    match sig {
+        SIGKILL => " (SIGKILL)",
+        SIGTERM => " (SIGTERM)",
+        _ => "",
+    }
+}
+
+#[cfg(unix)]
 fn signal_name(sig: i32) -> &'static str {
     match sig {
         libc::SIGHUP => " (SIGHUP)",
@@ -1954,6 +1974,13 @@ pub(crate) fn finish(sh: &Arc<Shared>, id: &str) {
     }
 }
 
+/// Windows has no signals, and potluck collects no crash reports there.
+#[cfg(windows)]
+fn is_crash_signal(_sig: i32) -> bool {
+    false
+}
+
+#[cfg(unix)]
 fn is_crash_signal(sig: i32) -> bool {
     matches!(
         sig,
@@ -2257,6 +2284,24 @@ fn workspace_budget(sh: &Shared) -> u64 {
     }
 }
 
+#[cfg(windows)]
+fn volume_bytes(dir: &Path) -> Option<u64> {
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+    let p = crate::sys::win::wide(dir);
+    let mut total = 0u64;
+    // SAFETY: p is NUL-terminated; the outputs not asked for may be null.
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(
+            p.as_ptr(),
+            std::ptr::null_mut(),
+            &mut total,
+            std::ptr::null_mut(),
+        )
+    };
+    (ok != 0).then_some(total)
+}
+
+#[cfg(unix)]
 fn volume_bytes(dir: &Path) -> Option<u64> {
     use std::os::unix::ffi::OsStrExt;
     let c = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
@@ -2492,12 +2537,15 @@ mod tests {
             ended_at: 5,
         });
         assert_eq!((e.state, e.exit_code), (JobState::Failed, Some(3)));
-        let e = ending_from_status(&ExitStatus {
-            code: None,
-            signal: Some(libc::SIGSEGV),
-            ended_at: 5,
-        });
-        assert_eq!(e.message.as_deref(), Some("killed by signal 11 (SIGSEGV)"));
+        #[cfg(unix)]
+        {
+            let e = ending_from_status(&ExitStatus {
+                code: None,
+                signal: Some(libc::SIGSEGV),
+                ended_at: 5,
+            });
+            assert_eq!(e.message.as_deref(), Some("killed by signal 11 (SIGSEGV)"));
+        }
     }
 
     #[test]

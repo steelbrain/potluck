@@ -428,6 +428,12 @@ pub fn main() -> i32 {
     let json = cli.json;
     let daemon = || {
         Paths::from_env().and_then(|paths| {
+            // On Windows `potluck daemon` keeps the daemon proper, its child, which it starts
+            // again when it exits to restart; the child runs these same arguments.
+            #[cfg(windows)]
+            if !crate::daemon::keeper::kept() {
+                return crate::daemon::keeper::run(&paths);
+            }
             let config = crate::config::NodeConfig::load(&paths)?;
             crate::daemon::run(&paths, &config).map(|()| 0)
         })
@@ -1476,20 +1482,36 @@ impl Cx<'_> {
         match client.call(Req::Restart { binary }) {
             Ok(Response::Text { text }) => {
                 // Done once the daemon answers again: at once on this connection after a restart
-                // in place, on a new one after a plain restart (which closed this one).
+                // in place, on a new one after a plain restart (which closed this one), and on
+                // Windows, where the daemon that was asked answered before it exited, from the
+                // new daemon.
                 let give_up = Instant::now() + RECONNECT;
-                while self.call(Req::Ping).is_err() {
-                    self.client = None;
-                    if Instant::now() >= give_up {
-                        anyhow::bail!(
-                            "{text}\nThe daemon did not answer again within {}s; whether it runs is \
-                             in {}",
-                            RECONNECT.as_secs(),
-                            log.display()
-                        );
+                let answered = loop {
+                    match self.call(Req::Ping) {
+                        Ok(answer) => break answer,
+                        Err(_) => {
+                            self.client = None;
+                            if Instant::now() >= give_up {
+                                anyhow::bail!(
+                                    "{text}\nThe daemon did not answer again within {}s; whether \
+                                     it runs is in {}",
+                                    RECONNECT.as_secs(),
+                                    log.display()
+                                );
+                            }
+                            std::thread::sleep(Duration::from_millis(100));
+                        }
                     }
-                    std::thread::sleep(Duration::from_millis(100));
-                }
+                };
+                #[cfg(windows)]
+                let text = match answered {
+                    Response::Pong { version, .. } => {
+                        format!("{text} The daemon answers again, as potluck {version}.")
+                    }
+                    _ => text,
+                };
+                #[cfg(unix)]
+                let _ = answered;
                 Ok(Report::new(
                     json!({ "restarted": true, "text": text }),
                     text,

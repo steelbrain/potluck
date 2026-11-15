@@ -1244,8 +1244,16 @@ fn receive_files(
                     if n != len {
                         return Err(std::io::ErrorKind::UnexpectedEof.into());
                     }
-                    use std::os::unix::fs::PermissionsExt;
-                    f.set_permissions(std::fs::Permissions::from_mode(mode & 0o777))
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        f.set_permissions(std::fs::Permissions::from_mode(mode & 0o777))
+                    }
+                    #[cfg(windows)]
+                    {
+                        drop(f);
+                        crate::daemon::files::set_copy_mode(&to, mode & 0o777)
+                    }
                 });
                 if let Err(e) = written {
                     return fail(&mut w, e.to_string());
