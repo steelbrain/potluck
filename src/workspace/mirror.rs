@@ -49,6 +49,17 @@ const MIRROR_CONFIG: &[(&str, &str)] = &[
     ("maintenance.autoDetach", "false"),
 ];
 
+/// Also set in every mirror on Windows.
+#[cfg(windows)]
+const WINDOWS_CONFIG: &[(&str, &str)] = &[
+    // Git for Windows sets core.autocrlf=true in its system config at install, which would write
+    // CRLF line endings into every text file of a tree: a tree holds the commit's files as the
+    // repository's own attributes (`.gitattributes`) check them out, as on Linux and macOS.
+    ("core.autocrlf", "false"),
+    // Paths longer than 260 characters (deep trees under a state directory's own path).
+    ("core.longpaths", "true"),
+];
+
 /// What a sync did, for the daemon to surface.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SyncReport {
@@ -498,7 +509,10 @@ fn make_mirror(url: &str, dst: &Path, local: bool) -> anyhow::Result<()> {
 }
 
 fn configure(mirror: &Path) -> anyhow::Result<()> {
-    for (k, v) in MIRROR_CONFIG {
+    let config = MIRROR_CONFIG.iter();
+    #[cfg(windows)]
+    let config = config.chain(WINDOWS_CONFIG);
+    for (k, v) in config {
         mirror_text(mirror, ["config", k, v])?;
     }
     // Syncs name their source each time; a stale origin would only mislead.
@@ -938,13 +952,36 @@ pub(super) fn remove_all(path: &Path) -> anyhow::Result<()> {
     std::fs::remove_dir_all(path).with_context(|| format!("can't remove {}", path.display()))
 }
 
+/// Clears the read-only attribute of `dir` and the files in it (not below it).
+#[cfg(windows)]
+fn clear_read_only(dir: &Path) {
+    let entries = std::fs::read_dir(dir).into_iter().flatten().flatten();
+    for path in std::iter::once(dir.to_path_buf()).chain(entries.map(|e| e.path())) {
+        if let Ok(meta) = path.symlink_metadata()
+            && meta.permissions().readonly()
+        {
+            let mut p = meta.permissions();
+            #[allow(clippy::permissions_set_readonly_false)]
+            p.set_readonly(false);
+            let _ = std::fs::set_permissions(&path, p);
+        }
+    }
+}
+
 fn make_dirs_writable(dir: &Path) {
-    use std::os::unix::fs::PermissionsExt;
     if let Ok(meta) = dir.symlink_metadata()
         && meta.is_dir()
     {
-        let mode = meta.permissions().mode();
-        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode | 0o700));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = meta.permissions().mode();
+            let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode | 0o700));
+        }
+        // Windows: a read-only file can't be deleted (git makes its objects read-only, and
+        // clones keep the attribute); a read-only directory can be.
+        #[cfg(windows)]
+        clear_read_only(dir);
         if let Ok(rd) = std::fs::read_dir(dir) {
             for e in rd.flatten() {
                 if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {

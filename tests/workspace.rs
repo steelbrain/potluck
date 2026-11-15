@@ -10,6 +10,7 @@ use potluck::types::{RepoRef, WorkspaceRecord, WorkspaceState};
 use potluck::workspace::Workspaces;
 use potluck::{cow, gitinfo};
 use std::collections::BTreeMap;
+#[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -69,6 +70,82 @@ fn git_at(dir: &Path, time: u64, args: &[&str]) -> String {
 
 fn git(dir: &Path, args: &[&str]) -> String {
     git_at(dir, 1_700_000_000, args)
+}
+
+/// The identity of the file at `path` (not following a link): its inode on Unix, its 128-bit file
+/// id on Windows. A file written anew gets another; a clone is another file.
+fn file_id(path: &Path) -> u128 {
+    #[cfg(unix)]
+    {
+        u128::from(path.symlink_metadata().unwrap().ino())
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO,
+            FILE_READ_ATTRIBUTES, FileIdInfo, GetFileInformationByHandleEx,
+        };
+        let f = std::fs::OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+            .unwrap();
+        // SAFETY: plain data, filled by the call.
+        let mut info: FILE_ID_INFO = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid handle and a FILE_ID_INFO of the size given.
+        let ok = unsafe {
+            GetFileInformationByHandleEx(
+                f.as_raw_handle(),
+                FileIdInfo,
+                (&mut info as *mut FILE_ID_INFO).cast(),
+                std::mem::size_of::<FILE_ID_INFO>() as u32,
+            )
+        };
+        assert_ne!(ok, 0, "{}", std::io::Error::last_os_error());
+        u128::from_le_bytes(info.FileId.Identifier)
+    }
+}
+
+/// The modification time of `meta`, in nanoseconds on Unix and 100 ns units on Windows.
+fn mtime(meta: &std::fs::Metadata) -> i128 {
+    #[cfg(unix)]
+    {
+        meta.mtime() as i128 * 1_000_000_000 + meta.mtime_nsec() as i128
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        meta.last_write_time() as i128
+    }
+}
+
+/// Makes the file at `path` writable: git makes its objects read-only.
+fn make_writable(path: &Path) {
+    #[cfg(unix)]
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    #[cfg(windows)]
+    {
+        let mut p = std::fs::metadata(path).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        p.set_readonly(false);
+        std::fs::set_permissions(path, p).unwrap();
+    }
+}
+
+/// How many names the file at `path` has (always 1 on Windows, where std can't tell on stable
+/// Rust; git makes no hard links in a mirror there).
+fn links(path: &Path) -> u64 {
+    #[cfg(unix)]
+    {
+        std::fs::metadata(path).unwrap().nlink()
+    }
+    #[cfg(windows)]
+    {
+        let _ = path;
+        1
+    }
 }
 
 fn write(dir: &Path, rel: &str, content: &str) {
@@ -634,9 +711,9 @@ fn corrupt_mirror_is_reported_and_recloned_keeping_worktrees_and_pins() {
     let root = e.ws.create(&"t-w1".to_string(), &repo).unwrap();
 
     let obj = mirror.join(format!("objects/{}/{}", &c2[..2], &c2[2..]));
-    let meta = std::fs::metadata(&obj).expect("the fetched commit is a loose object");
-    assert_eq!(meta.nlink(), 1, "never write into a file the source shares");
-    std::fs::set_permissions(&obj, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(obj.is_file(), "the fetched commit is a loose object");
+    assert_eq!(links(&obj), 1, "never write into a file the source shares");
+    make_writable(&obj);
     std::fs::write(&obj, b"garbage, not zlib").unwrap();
 
     let report = e.ws.sync_mirror(&repo.id, url).unwrap();
@@ -775,7 +852,9 @@ fn locks_left_by_a_killed_git_go_and_nothing_is_recloned() {
 }
 
 /// A runner's fetch over the mesh whose connection drops mid-pack is tried again; the mirror is
-/// neither checked in full nor recloned (all of a repository again, over the network).
+/// neither checked in full nor recloned (all of a repository again, over the network). The
+/// stand-in tunnel is a shell script.
+#[cfg(unix)]
 #[test]
 fn a_transfer_cut_short_is_tried_again_not_recloned() {
     let e = env();
@@ -1027,7 +1106,7 @@ fn a_broken_mirror_never_touches_a_repository_around_the_state_directory() {
 // --- seeding ---------------------------------------------------------------------------------
 
 /// (inode, mtime ns) per file under `dir`, skipping `.git`.
-fn stamps(dir: &Path) -> BTreeMap<String, (u64, i128)> {
+fn stamps(dir: &Path) -> BTreeMap<String, (u128, i128)> {
     let mut out = BTreeMap::new();
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
@@ -1040,9 +1119,10 @@ fn stamps(dir: &Path) -> BTreeMap<String, (u64, i128)> {
             if m.is_dir() {
                 stack.push(p);
             } else {
-                let rel = p.strip_prefix(dir).unwrap().to_string_lossy().into_owned();
-                let mtime = m.mtime() as i128 * 1_000_000_000 + m.mtime_nsec() as i128;
-                out.insert(rel, (m.ino(), mtime));
+                let rel = p.strip_prefix(dir).unwrap().to_string_lossy();
+                // As git names it, on Windows too.
+                let rel = rel.replace('\\', "/");
+                out.insert(rel, (file_id(&p), mtime(&m)));
             }
         }
     }
@@ -1062,8 +1142,12 @@ fn seeding_writes_only_what_differs_from_the_base() {
         );
     }
     write(&src, "run.sh", "#!/bin/sh\necho hi\n");
-    std::fs::set_permissions(src.join("run.sh"), std::fs::Permissions::from_mode(0o755)).unwrap();
-    std::os::unix::fs::symlink("dir0/file0.txt", src.join("link")).unwrap();
+    #[cfg(unix)]
+    {
+        std::fs::set_permissions(src.join("run.sh"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        std::os::unix::fs::symlink("dir0/file0.txt", src.join("link")).unwrap();
+    }
     let c1 = commit(&src, "one", 1_700_000_000);
     write(&src, "dir1/file1.txt", "changed 1\n");
     write(&src, "dir2/file2.txt", "changed 2\n");
@@ -1097,15 +1181,18 @@ fn seeding_writes_only_what_differs_from_the_base() {
     write(&w1, ".potluck/inv-1/log", "output");
     assert_eq!(git(&w1, &["status", "--porcelain"]), "");
     std::fs::remove_dir_all(w1.join(".potluck")).unwrap();
-    let mode = std::fs::metadata(w1.join("run.sh"))
-        .unwrap()
-        .permissions()
-        .mode();
-    assert_eq!(mode & 0o777, 0o755);
-    assert_eq!(
-        std::fs::read_link(w1.join("link")).unwrap(),
-        Path::new("dir0/file0.txt")
-    );
+    #[cfg(unix)]
+    {
+        let mode = std::fs::metadata(w1.join("run.sh"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o755);
+        assert_eq!(
+            std::fs::read_link(w1.join("link")).unwrap(),
+            Path::new("dir0/file0.txt")
+        );
+    }
     let base_at_c1 = stamps(&base);
     let w1_stamps = stamps(&w1);
     for (f, (ino, mtime)) in &w1_stamps {
@@ -1956,7 +2043,7 @@ fn paths_that_differ_only_in_case_are_the_repository_s_doing() {
     let mirror = e.mirror(&repo1.id);
     let base = e.ws.paths.base(&repo1.id);
     let w1 = e.ws.create(&"t-w1".to_string(), &repo1).unwrap();
-    let base_ino = std::fs::metadata(base.join("src/a.txt")).unwrap().ino();
+    let base_ino = file_id(&base.join("src/a.txt"));
 
     let w2 = e.ws.create(&"t-w2".to_string(), &repo2);
     if insensitive {
@@ -1972,10 +2059,7 @@ fn paths_that_differ_only_in_case_are_the_repository_s_doing() {
         assert!(!mirror.join("potluck-suspect").exists());
         // The base stayed where it was, untouched.
         assert_eq!(git(&base, &["rev-parse", "HEAD"]), repo1.commit);
-        assert_eq!(
-            std::fs::metadata(base.join("src/a.txt")).unwrap().ino(),
-            base_ino
-        );
+        assert_eq!(file_id(&base.join("src/a.txt")), base_ino);
         assert!(!e.ws.paths.workspace("t-w2").exists());
     } else {
         let w2 = w2.unwrap();
@@ -2322,28 +2406,25 @@ fn a_gitattributes_change_rewrites_only_the_files_it_concerns() {
             ..repo2.clone()
         };
         let what = format!("autocrlf {autocrlf}");
-        let eol = if autocrlf { "\r\n" } else { "\n" };
+        // `text=auto` checks out with the native line end (core.eol): CRLF on Windows.
+        let eol = if autocrlf || cfg!(windows) {
+            "\r\n"
+        } else {
+            "\n"
+        };
         let base = e.ws.paths.base(&repo1.id);
         let w1 = e.ws.create(&"t-w1".to_string(), &repo1).unwrap();
-        let inodes = || -> Vec<u64> {
+        let inodes = || -> Vec<u128> {
             (0..50)
-                .map(|i| {
-                    std::fs::metadata(base.join(format!("d/f{i}.txt")))
-                        .unwrap()
-                        .ino()
-                })
+                .map(|i| file_id(&base.join(format!("d/f{i}.txt"))))
                 .collect()
         };
         let before = inodes();
-        let bat = std::fs::metadata(base.join("run.bat")).unwrap().ino();
+        let bat = file_id(&base.join("run.bat"));
         // The base moves forward to two: only run.bat gets new attributes.
         let w2 = e.ws.create(&"t-w2".to_string(), &repo2).unwrap();
         assert_eq!(inodes(), before, "{what}: the base's other files stay");
-        assert_ne!(
-            std::fs::metadata(base.join("run.bat")).unwrap().ino(),
-            bat,
-            "{what}"
-        );
+        assert_ne!(file_id(&base.join("run.bat")), bat, "{what}");
         // A workspace at one, cloned from the base at two and moved back.
         let w3 = e.ws.create(&"t-w3".to_string(), &repo1).unwrap();
         for i in 0..50 {
@@ -2574,7 +2655,7 @@ fn names_the_filesystem_refuses_are_the_repository_s_doing() {
         let shown: String = name.chars().take(20).collect();
         // Warm: the base is at the first commit.
         e.ws.create(&"t-w1".to_string(), &repo1).unwrap();
-        let base_ino = std::fs::metadata(base.join("a.txt")).unwrap().ino();
+        let base_ino = file_id(&base.join("a.txt"));
         let w2 = e.ws.create(&"t-w2".to_string(), &repo2);
         if refused {
             let err = format!("{:#}", w2.unwrap_err());
@@ -2590,7 +2671,7 @@ fn names_the_filesystem_refuses_are_the_repository_s_doing() {
                 "{shown:?}"
             );
             assert_eq!(
-                std::fs::metadata(base.join("a.txt")).unwrap().ino(),
+                file_id(&base.join("a.txt")),
                 base_ino,
                 "{shown:?}: the base was made anew"
             );
@@ -2669,9 +2750,8 @@ fn a_tree_whose_deletion_fails_stays_aside_until_the_next_removal() {
     assert!(!aside.exists());
 }
 
-/// Holds `path` with flock(2), as potluck's own locks do.
+/// Holds `path` with flock(2) (on Windows LockFileEx), as potluck's own locks do.
 fn hold_lock(path: &Path, exclusive: bool) -> std::fs::File {
-    use std::os::unix::io::AsRawFd;
     let f = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -2679,12 +2759,11 @@ fn hold_lock(path: &Path, exclusive: bool) -> std::fs::File {
         .truncate(false)
         .open(path)
         .unwrap();
-    let how = if exclusive {
-        libc::LOCK_EX
+    if exclusive {
+        f.lock().unwrap();
     } else {
-        libc::LOCK_SH
-    };
-    assert_eq!(unsafe { libc::flock(f.as_raw_fd(), how) }, 0);
+        f.lock_shared().unwrap();
+    }
     f
 }
 
@@ -2817,7 +2896,6 @@ fn until(what: &str, mut cond: impl FnMut() -> bool) {
 /// Whether `path` (a potluck lock file) can be locked right now, shared or exclusively; the lock
 /// is let go at once.
 fn lock_free(path: &Path, exclusive: bool) -> bool {
-    use std::os::unix::io::AsRawFd;
     let Ok(f) = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -2825,12 +2903,11 @@ fn lock_free(path: &Path, exclusive: bool) -> bool {
     else {
         return false;
     };
-    let how = if exclusive {
-        libc::LOCK_EX
+    if exclusive {
+        f.try_lock().is_ok()
     } else {
-        libc::LOCK_SH
-    };
-    unsafe { libc::flock(f.as_raw_fd(), how | libc::LOCK_NB) == 0 }
+        f.try_lock_shared().is_ok()
+    }
 }
 
 /// While `deleting()` holds, polls whether `lock` is free; true once it was.
@@ -2907,8 +2984,8 @@ fn an_old_mirror_is_deleted_outside_its_lock() {
     e.sync(&repo);
     let mirror = e.mirror(&repo.id);
     let obj = mirror.join(format!("objects/{}/{}", &c2[..2], &c2[2..]));
-    assert_eq!(std::fs::metadata(&obj).unwrap().nlink(), 1);
-    std::fs::set_permissions(&obj, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!(links(&obj), 1);
+    make_writable(&obj);
     std::fs::write(&obj, b"garbage, not zlib").unwrap();
 
     let ws = Workspaces::new(e.ws.paths.clone());
@@ -2946,6 +3023,8 @@ fn an_old_mirror_is_deleted_outside_its_lock() {
 
 // --- clones ----------------------------------------------------------------------------------
 
+/// Modes and symbolic links as Unix has them; Windows has a test of its own in `cow`.
+#[cfg(unix)]
 #[test]
 fn clone_tree_keeps_contents_modes_links_and_mtimes() {
     let t = tmp();
@@ -3045,6 +3124,13 @@ fn non_cow_dir() -> Option<(tempfile::TempDir, Box<dyn FnOnce()>)> {
     Some((tempfile::tempdir_in(shm).unwrap(), Box::new(|| {})))
 }
 
+/// The system temp dir, on the system drive: NTFS.
+#[cfg(windows)]
+fn non_cow_dir() -> Option<(tempfile::TempDir, Box<dyn FnOnce()>)> {
+    let dir = tempfile::tempdir().unwrap();
+    (cow::fs_name(dir.path()) == "NTFS").then(|| (dir, Box::new(|| {}) as Box<dyn FnOnce()>))
+}
+
 /// An HFS+ disk image attached at a temp mount point, detached afterwards.
 #[cfg(target_os = "macos")]
 fn non_cow_dir() -> Option<(tempfile::TempDir, Box<dyn FnOnce()>)> {
@@ -3117,6 +3203,11 @@ fn cow_check_names_a_filesystem_without_clones() {
     assert_eq!(name, "tmpfs");
     #[cfg(target_os = "macos")]
     assert_eq!(name, "hfs");
+    #[cfg(windows)]
+    assert!(
+        err.contains("a Dev Drive or another ReFS volume") && name == "NTFS",
+        "{name}: {err}"
+    );
     assert_eq!(leftovers, 0);
     let clone_err = clone_err.expect_err("a clone there");
     assert!(!clone_err.contains("No such file"), "{clone_err}");
@@ -3270,9 +3361,7 @@ fn mirrors_and_bases_from_before_salted_ids_are_removed() {
     }
     // A sync of `busy` holds its mirror's lock.
     let lock = std::fs::File::open(e.ws.paths.home.join(format!("mirrors/{busy}.lock"))).unwrap();
-    use std::os::unix::io::AsRawFd;
-    // SAFETY: flock on an open file.
-    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+    lock.lock().unwrap();
 
     // A lock just let go can stay held a moment longer: a process another test's thread is
     // starting holds a copy of its descriptor until it runs its program. A mirror found busy is

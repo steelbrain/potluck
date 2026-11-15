@@ -335,8 +335,30 @@ pub fn repo_id(common_dir: &Path) -> String {
     crate::types::repo_id(common_dir)
 }
 
+/// `p` with every symbolic link resolved, absolute. On Windows without the verbatim prefix
+/// `canonicalize` gives (`\\?\C:\src` is `C:\src`, `\\?\UNC\host\share` is `\\host\share`):
+/// git, and the tools jobs run, don't all take it.
 pub(crate) fn canonical(p: &Path) -> anyhow::Result<PathBuf> {
-    std::fs::canonicalize(p).with_context(|| format!("can't resolve {}", p.display()))
+    let c = std::fs::canonicalize(p).with_context(|| format!("can't resolve {}", p.display()))?;
+    Ok(plain(c))
+}
+
+/// `p` without a Windows verbatim prefix ([`canonical`]); unchanged elsewhere.
+pub(crate) fn plain(p: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        if let Some(text) = p.to_str() {
+            if let Some(unc) = text.strip_prefix(r"\\?\UNC\") {
+                return PathBuf::from(format!(r"\\{unc}"));
+            }
+            if let Some(disk) = text.strip_prefix(r"\\?\")
+                && disk.as_bytes().get(1) == Some(&b':')
+            {
+                return PathBuf::from(disk);
+            }
+        }
+    }
+    p
 }
 
 /// Appends the uncommitted paths of the repository at `dir` (status lines, paths prefixed with
@@ -767,6 +789,27 @@ mod tests {
         assert!(!is_ancestor(&git_dir, &two, &one).unwrap());
         assert!(is_ancestor(&git_dir, &"0".repeat(40), &two).is_err());
         assert!(is_ancestor(&git_dir, "--all", &two).is_err());
+    }
+
+    /// Windows' verbatim prefix is dropped: git and the tools jobs run don't all take it.
+    #[test]
+    fn canonical_paths_are_plain() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = canonical(dir.path()).unwrap();
+        assert!(c.is_absolute() && c.is_dir(), "{}", c.display());
+        assert!(!c.to_string_lossy().starts_with(r"\\?\"), "{}", c.display());
+        if cfg!(windows) {
+            for (verbatim, want) in [
+                (r"\\?\C:\src\x", r"C:\src\x"),
+                (r"\\?\UNC\host\share\x", r"\\host\share\x"),
+                (r"\\?\Volume{0}\x", r"\\?\Volume{0}\x"),
+                (r"C:\src", r"C:\src"),
+            ] {
+                assert_eq!(plain(PathBuf::from(verbatim)), PathBuf::from(want));
+            }
+        } else {
+            assert_eq!(plain(PathBuf::from("/a/b")), PathBuf::from("/a/b"));
+        }
     }
 
     #[test]

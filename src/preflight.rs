@@ -6,6 +6,12 @@
 //! text) without line breaks (git's output is read line by line). The state directory is created
 //! if missing (mode 0700).
 //! Every problem found is reported at once, each with its fix.
+//!
+//! On Windows: Windows 10 1809 (build 17763) or newer, git 2.31 or newer (`git.exe` on PATH), the
+//! state directory on ReFS (a Dev Drive), and the paths in UTF-8 without line breaks. The state
+//! directory is created private (only this user may open it) and made private again at every
+//! check ([`make_private`]): one made by hand on a Dev Drive inherits the drive's access list,
+//! which lets every signed-in user change it.
 
 use crate::config::Paths;
 use anyhow::bail;
@@ -19,6 +25,8 @@ pub fn check(paths: &Paths) -> anyhow::Result<()> {
         let uid = unsafe { libc::getuid() };
         problems.extend(cgroup_problem(std::path::Path::new("/sys/fs/cgroup"), uid));
     }
+    #[cfg(windows)]
+    problems.extend(crate::facts::windows_build().and_then(windows_problem));
     problems.extend(git_problem());
     // Jobs get these paths as text (POTLUCK_HOME, POTLUCK_CONFIG, and TMPDIR in the state
     // directory), and the store keeps workspace paths as text; git's output and the service
@@ -44,7 +52,7 @@ pub fn check(paths: &Paths) -> anyhow::Result<()> {
     if let Some(p) = text(&paths.home, "potluck's state directory", "POTLUCK_HOME") {
         problems.push(p);
     } else {
-        match create_home(&paths.home) {
+        match create_home(&paths.home).and_then(|()| make_private(&paths.home)) {
             Ok(()) => {
                 if let Err(e) = crate::cow::check(&paths.home) {
                     problems.push(format!("{e:#}"));
@@ -70,18 +78,45 @@ pub fn check(paths: &Paths) -> anyhow::Result<()> {
 /// prints that option back as the first line of its answer, where potluck reads a path.
 const MIN_GIT: (u32, u32) = (2, 31);
 
-/// What is wrong with the git the daemon runs (the first `git` on PATH), if anything: none there,
-/// or one older than [`MIN_GIT`].
+/// The oldest Windows potluck runs on: Windows 10 1809 and Server 2019 (build 17763). The local
+/// socket is AF_UNIX, new in 1803; 1809 is the oldest release still serviced as an LTSC.
+const MIN_WINDOWS_BUILD: u32 = 17763;
+
+/// What is wrong with Windows build `build`, if anything: one older than [`MIN_WINDOWS_BUILD`].
+#[cfg_attr(unix, allow(dead_code))]
+fn windows_problem(build: u32) -> Option<String> {
+    (build < MIN_WINDOWS_BUILD).then(|| {
+        format!(
+            "potluck needs Windows 10 1809 or Windows Server 2019 (build {MIN_WINDOWS_BUILD}) or \
+             newer, and this is build {build}. Update Windows"
+        )
+    })
+}
+
+/// Whether `p` is a program the daemon can run as git: on Unix an executable file, on Windows a
+/// file (`git.exe`).
+fn runnable(p: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        p.metadata()
+            .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(windows)]
+    {
+        p.metadata().is_ok_and(|m| m.is_file())
+    }
+}
+
+/// What is wrong with the git the daemon runs (the first `git` on PATH, `git.exe` on Windows), if
+/// anything: none there, or one older than [`MIN_GIT`].
 fn git_problem() -> Option<String> {
-    use std::os::unix::fs::PermissionsExt;
     let need = format!("potluck needs git {}.{} or newer", MIN_GIT.0, MIN_GIT.1);
     let path = std::env::var_os("PATH").unwrap_or_default();
+    let exe = format!("git{}", crate::sys::EXE_SUFFIX);
     let Some(git) = std::env::split_paths(&path)
-        .map(|d| d.join("git"))
-        .find(|p| {
-            p.metadata()
-                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-        })
+        .map(|d| d.join(&exe))
+        .find(|p| runnable(p))
     else {
         return Some(format!(
             "{need}, and there is no git on PATH ({})",
@@ -159,13 +194,102 @@ pub fn renamed(paths: &Paths, had: &str, name: &str, in_cluster: bool) -> String
 /// Creates the state directory (and its parents), readable by this user only: it holds job specs
 /// with their `--env` values, logs and sources.
 fn create_home(home: &std::path::Path) -> std::io::Result<()> {
-    use std::os::unix::fs::DirBuilderExt;
     if let Some(parent) = home.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    match std::fs::DirBuilder::new().mode(0o700).create(home) {
+    match crate::sys::create_dir(home, 0o700) {
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && home.is_dir() => Ok(()),
         other => other,
+    }
+}
+
+/// Makes the state directory `home` private on Windows, as [`crate::sys::set_mode`] with 0700
+/// does, unless it is already: its access list protected, with one entry, full access for this
+/// user, inherited by what is made in it. Setting it walks everything inside to pass the entry
+/// on, which takes a while in a big state directory, so a directory already private is left as
+/// it is. Nothing on Unix, where the daemon clears the group and other bits itself.
+pub fn make_private(home: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        if !win::is_private(home).unwrap_or(false) {
+            crate::sys::set_mode(home, 0o700)?;
+        }
+    }
+    let _ = home;
+    Ok(())
+}
+
+#[cfg(windows)]
+mod win {
+    use crate::sys::win::wide;
+    use std::io;
+    use std::path::Path;
+    use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertStringSidToSidW, GetNamedSecurityInfoW, SE_FILE_OBJECT,
+    };
+    use windows_sys::Win32::Security::{
+        ACCESS_ALLOWED_ACE, ACL, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, EqualSid,
+        GetAce, GetSecurityDescriptorControl, OBJECT_INHERIT_ACE, PSECURITY_DESCRIPTOR, PSID,
+        SE_DACL_PROTECTED,
+    };
+    use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
+
+    /// Whether `path`'s access list is the private one [`crate::sys::set_mode`] gives.
+    pub fn is_private(path: &Path) -> io::Result<bool> {
+        let p = wide(path);
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        // SAFETY: p is NUL-terminated; sd receives a LocalAlloc'd descriptor that dacl points
+        // into, freed below.
+        let rc = unsafe {
+            GetNamedSecurityInfoW(
+                p.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut dacl,
+                std::ptr::null_mut(),
+                &mut sd,
+            )
+        };
+        if rc != ERROR_SUCCESS {
+            return Err(io::Error::from_raw_os_error(rc as i32));
+        }
+        let sid_text = wide(crate::sys::user_sid()?);
+        let mut me: PSID = std::ptr::null_mut();
+        // SAFETY: sid_text is NUL-terminated; me receives a LocalAlloc'd SID, freed below.
+        let converted = unsafe { ConvertStringSidToSidW(sid_text.as_ptr(), &mut me) } != 0;
+        // SAFETY: sd is a valid descriptor and dacl null or an ACL within it; the first ACE is
+        // read only when the ACL has exactly one.
+        let private = converted
+            && !dacl.is_null()
+            && unsafe {
+                let (mut control, mut revision) = (0u16, 0u32);
+                let mut ace: *mut std::ffi::c_void = std::ptr::null_mut();
+                GetSecurityDescriptorControl(sd, &mut control, &mut revision) != 0
+                    && control & SE_DACL_PROTECTED != 0
+                    && (*dacl).AceCount == 1
+                    && GetAce(dacl, 0, &mut ace) != 0
+                    && {
+                        let ace = &*(ace as *const ACCESS_ALLOWED_ACE);
+                        u32::from(ace.Header.AceType)
+                            == windows_sys::Win32::Security::ACCESS_ALLOWED_ACE_TYPE
+                            && u32::from(ace.Header.AceFlags)
+                                == OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE
+                            && ace.Mask == FILE_ALL_ACCESS
+                            && EqualSid((&ace.SidStart as *const u32).cast_mut().cast(), me) != 0
+                    }
+            };
+        // SAFETY: both were LocalAlloc'd by the calls above (me only when converted).
+        unsafe {
+            if converted {
+                LocalFree(me.cast());
+            }
+            LocalFree(sd.cast());
+        }
+        Ok(private)
     }
 }
 
@@ -280,9 +404,14 @@ mod tests {
         };
         let result = check(&paths);
         assert!(home.is_dir());
-        use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(&home).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o700, "{mode:o}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&home).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700, "{mode:o}");
+        }
+        #[cfg(windows)]
+        assert!(win::is_private(&home).unwrap());
         if let Err(e) = result {
             let msg = format!("{e:#}");
             // The CLI prints it after "potluck: ".
@@ -295,6 +424,41 @@ mod tests {
                 "{msg}"
             );
         }
+    }
+
+    /// On Windows a state directory made by hand inherits its parent's access list: the check
+    /// makes it private, and one private already is left as it is.
+    #[cfg(windows)]
+    #[test]
+    fn the_state_directory_is_made_private() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("by-hand");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::write(home.join("inside"), "x").unwrap();
+        assert!(!win::is_private(&home).unwrap());
+        make_private(&home).unwrap();
+        assert!(win::is_private(&home).unwrap());
+        make_private(&home).unwrap();
+        assert!(win::is_private(&home).unwrap());
+        assert_eq!(std::fs::read_to_string(home.join("inside")).unwrap(), "x");
+        let paths = Paths {
+            home: dir.path().join("made"),
+            config: dir.path().join("node.toml"),
+        };
+        let _ = check(&paths);
+        assert!(win::is_private(&paths.home).unwrap());
+    }
+
+    #[test]
+    fn windows_before_1809_is_too_old() {
+        assert_eq!(windows_problem(17763), None);
+        assert_eq!(windows_problem(26100), None);
+        let msg = windows_problem(17134).unwrap();
+        assert!(
+            msg.starts_with("potluck needs Windows 10 1809 or Windows Server 2019 (build 17763)")
+                && msg.contains("this is build 17134"),
+            "{msg}"
+        );
     }
 
     /// A cgroup tree as [`cgroup_problem`] reads it for user 1000: the kernel's controllers in
@@ -384,14 +548,23 @@ mod tests {
 
     /// A state directory or config path that isn't UTF-8 is refused before anything is created:
     /// jobs would get a mangled TMPDIR and POTLUCK_HOME, and the store can't keep workspace paths.
+    /// On Windows a path is UTF-16, which an unpaired surrogate keeps from being UTF-8.
     #[test]
     fn paths_that_are_not_utf8_are_refused() {
-        use std::os::unix::ffi::OsStrExt;
         let dir = tempfile::tempdir().unwrap();
-        let bad = std::ffi::OsStr::from_bytes(b"home-\xff");
+        #[cfg(unix)]
+        let bad = {
+            use std::os::unix::ffi::OsStrExt;
+            std::ffi::OsStr::from_bytes(b"home-\xff").to_os_string()
+        };
+        #[cfg(windows)]
+        let bad = {
+            use std::os::windows::ffi::OsStringExt;
+            std::ffi::OsString::from_wide(&[0x68, 0x6f, 0x6d, 0x65, 0x2d, 0xd800])
+        };
         let paths = Paths {
-            home: dir.path().join(bad),
-            config: dir.path().join(bad).join("node.toml"),
+            home: dir.path().join(&bad),
+            config: dir.path().join(&bad).join("node.toml"),
         };
         let msg = format!("{:#}", check(&paths).expect_err("not UTF-8"));
         assert!(

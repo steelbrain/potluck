@@ -9,6 +9,12 @@
 //! So is a name the filesystem refuses ([`refused`]): APFS takes only UTF-8 of the Unicode version
 //! it knows (an unassigned code point such as U+A7DD, or bytes that aren't UTF-8, are "Illegal
 //! byte sequence"), and the filesystems potluck runs on take no name over 255 bytes.
+//!
+//! NTFS and ReFS (Windows) look names up without regard to case too, by default, but character by
+//! character and without normalisation: `README` and `readme` are one file there, `Straße` and
+//! `STRASSE`, or a composed and a decomposed `é`, are two. Windows refuses names with `<>:"/\|?*`
+//! or control characters, names ending in a dot or a space, device names (`CON`, `aux.c`, `LPT1`),
+//! and names over 255 UTF-16 units; git for Windows refuses to check them out.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -32,7 +38,35 @@ pub(super) fn case_insensitive(dir: &Path) -> bool {
 /// The name a case- and normalisation-insensitive filesystem looks `s` up by: Unicode's canonical
 /// caseless form, NFD(case fold(NFD(s))). APFS folds case in full, not just to lower case: `ß` is
 /// `ss` there, a final `ς` is `σ`, a micro sign `μ` and `ﬁ` `fi`.
+#[cfg(not(windows))]
 fn fold(s: &str) -> String {
+    apfs_fold(s)
+}
+
+/// The name NTFS and ReFS look `s` up by: each character upper-cased on its own when its upper
+/// case is one character (`ß` stays `ß`), nothing normalised.
+#[cfg(windows)]
+fn fold(s: &str) -> String {
+    ntfs_fold(s)
+}
+
+/// [`fold`] on NTFS and ReFS.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn ntfs_fold(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            let mut upper = c.to_uppercase();
+            match (upper.next(), upper.next()) {
+                (Some(u), None) => u,
+                _ => c,
+            }
+        })
+        .collect()
+}
+
+/// [`fold`] on APFS.
+#[cfg_attr(windows, allow(dead_code))]
+fn apfs_fold(s: &str) -> String {
     use unicode_normalization::UnicodeNormalization;
     let nfd: String = s.nfd().collect();
     unicase::UniCase::new(nfd).to_folded_case().nfd().collect()
@@ -96,6 +130,7 @@ pub(super) fn describe(groups: &[Vec<String>]) -> String {
 /// filesystem at `dir` refuses, each with why ("Illegal byte sequence", "File name too long").
 /// Only names that aren't plain ASCII, or are over 255 bytes, are tried: each is created in a
 /// scratch directory under `dir`, removed again at once.
+#[cfg(unix)]
 pub(super) fn refused(dir: &Path, paths: &[Vec<u8>]) -> Vec<(String, String)> {
     use std::os::unix::ffi::OsStrExt;
     let names: BTreeSet<&[u8]> = paths
@@ -146,6 +181,74 @@ pub(super) fn refused(dir: &Path, paths: &[Vec<u8>]) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Of `paths` (as git lists them: bytes, `/` between names), those holding a name Windows
+/// refuses ([`windows_refuses`]), each with why. Nothing is created: some of these names open a
+/// device rather than fail.
+#[cfg(windows)]
+pub(super) fn refused(_dir: &Path, paths: &[Vec<u8>]) -> Vec<(String, String)> {
+    paths
+        .iter()
+        .filter_map(|p| {
+            let why = p.split(|b| *b == b'/').find_map(windows_refuses)?;
+            Some((String::from_utf8_lossy(p).into_owned(), why.to_string()))
+        })
+        .collect()
+}
+
+/// Why Windows refuses the file name `name` (bytes, as git lists them), if it does: as git for
+/// Windows refuses to check it out.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn windows_refuses(name: &[u8]) -> Option<&'static str> {
+    let Ok(name) = std::str::from_utf8(name) else {
+        return Some("not UTF-8");
+    };
+    if name.encode_utf16().count() > 255 {
+        return Some("File name too long");
+    }
+    if name
+        .chars()
+        .any(|c| (c as u32) < 0x20 || "<>:\"\\|?*".contains(c))
+    {
+        return Some("a character Windows doesn't allow in a name");
+    }
+    if name.ends_with('.') || name.ends_with(' ') {
+        return Some("ends with a dot or a space");
+    }
+    let stem = name
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches(' ')
+        .to_uppercase();
+    let numbered = |prefix: &str| {
+        stem.strip_prefix(prefix).is_some_and(|n| {
+            matches!(
+                n,
+                "1" | "2"
+                    | "3"
+                    | "4"
+                    | "5"
+                    | "6"
+                    | "7"
+                    | "8"
+                    | "9"
+                    | "\u{b9}"
+                    | "\u{b2}"
+                    | "\u{b3}"
+            )
+        })
+    };
+    if matches!(
+        stem.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) || numbered("COM")
+        || numbered("LPT")
+    {
+        return Some("a name Windows keeps for a device");
+    }
+    None
+}
+
 /// "d/x (Illegal byte sequence)", at most a few paths.
 pub(super) fn describe_refused(refused: &[(String, String)]) -> String {
     let mut parts: Vec<String> = refused
@@ -184,6 +287,7 @@ mod tests {
             vec![s(&["Cafe\u{301}", "caf\u{e9}"])]
         );
         // Names APFS takes for one (each pair checked there): case folded in full.
+        #[cfg(not(windows))]
         for (a, b) in [
             ("Stra\u{df}e", "STRASSE"),
             ("\u{1e9e}", "\u{df}"),
@@ -201,6 +305,7 @@ mod tests {
             assert_eq!(collisions(&s(&[a, b])).len(), 1, "{a:?} {b:?}");
         }
         // And names it keeps apart.
+        #[cfg(not(windows))]
         for (a, b) in [
             ("\u{130}", "i"),
             ("\u{131}", "I"),
@@ -212,8 +317,84 @@ mod tests {
         }
     }
 
+    /// NTFS and ReFS fold case character by character, without normalising.
+    #[test]
+    fn ntfs_folds_case_alone() {
+        for (a, b) in [
+            ("README", "readme"),
+            ("Docs", "DOCS"),
+            ("\u{e9}t\u{e9}", "\u{c9}T\u{c9}"),
+            ("\u{3c3}", "\u{3a3}"),
+        ] {
+            assert_eq!(ntfs_fold(a), ntfs_fold(b), "{a:?} {b:?}");
+        }
+        for (a, b) in [
+            ("Stra\u{df}e", "STRASSE"),
+            ("caf\u{e9}", "cafe\u{301}"),
+            ("\u{fb01}", "FI"),
+        ] {
+            assert_ne!(ntfs_fold(a), ntfs_fold(b), "{a:?} {b:?}");
+        }
+    }
+
+    /// The names Windows refuses, as git for Windows does.
+    #[test]
+    fn names_windows_refuses() {
+        for (name, why) in [
+            ("a:b", "a character Windows doesn't allow in a name"),
+            ("a\\b", "a character Windows doesn't allow in a name"),
+            ("q?", "a character Windows doesn't allow in a name"),
+            ("tab\there", "a character Windows doesn't allow in a name"),
+            ("dot.", "ends with a dot or a space"),
+            ("space ", "ends with a dot or a space"),
+            ("CON", "a name Windows keeps for a device"),
+            ("aux.c", "a name Windows keeps for a device"),
+            ("nul.tar.gz", "a name Windows keeps for a device"),
+            ("Lpt1", "a name Windows keeps for a device"),
+            ("COM\u{b9}", "a name Windows keeps for a device"),
+        ] {
+            assert_eq!(windows_refuses(name.as_bytes()), Some(why), "{name:?}");
+        }
+        assert_eq!(windows_refuses(b"x\xff"), Some("not UTF-8"));
+        assert_eq!(
+            windows_refuses("\u{e9}".repeat(256).as_bytes()),
+            Some("File name too long")
+        );
+        #[cfg(windows)]
+        {
+            let paths: Vec<Vec<u8>> = ["a/b", "x/aux.c", "ok", "d./f"]
+                .iter()
+                .map(|p| p.as_bytes().to_vec())
+                .collect();
+            let dir = tempfile::tempdir().unwrap();
+            assert_eq!(
+                refused(dir.path(), &paths),
+                [
+                    (
+                        "x/aux.c".to_string(),
+                        "a name Windows keeps for a device".to_string()
+                    ),
+                    ("d./f".to_string(), "ends with a dot or a space".to_string())
+                ]
+            );
+        }
+        for ok in [
+            "README.md",
+            "con2",
+            "COM10",
+            "console.rs",
+            "auxiliary",
+            ".hidden",
+            "caf\u{e9}",
+            &"\u{e9}".repeat(255),
+        ] {
+            assert_eq!(windows_refuses(ok.as_bytes()), None, "{ok:?}");
+        }
+    }
+
     /// A name over 255 bytes is refused everywhere; U+A7DD where the filesystem doesn't know it
     /// (APFS); plain names never. Nothing is left behind.
+    #[cfg(unix)]
     #[test]
     fn finds_names_the_filesystem_refuses() {
         let dir = tempfile::tempdir().unwrap();

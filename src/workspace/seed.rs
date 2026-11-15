@@ -10,7 +10,6 @@ use crate::gitinfo::{self, canonical, short};
 use crate::types::{RepoRef, WorkspaceId, WorkspaceRecord};
 use anyhow::{Context, bail};
 use std::collections::{BTreeSet, HashSet};
-use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 
 /// One repository of a workspace: the top or a submodule.
@@ -577,10 +576,12 @@ fn add_size(path: &Path, seen: &mut HashSet<(u64, u64)>, total: &mut u64) -> any
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => return Err(e).with_context(|| format!("can't stat {}", p.display())),
         };
-        if meta.nlink() > 1 && !meta.is_dir() && !seen.insert((meta.dev(), meta.ino())) {
+        if let Some(key) = hard_link(&meta)
+            && !seen.insert(key)
+        {
             continue;
         }
-        *total += meta.blocks() * 512;
+        *total += allocated(&meta);
         if meta.is_dir()
             && let Ok(rd) = std::fs::read_dir(&p)
         {
@@ -588,6 +589,35 @@ fn add_size(path: &Path, seen: &mut HashSet<(u64, u64)>, total: &mut u64) -> any
         }
     }
     Ok(())
+}
+
+/// A file with other hard links: its device and inode, so it counts once. Windows: `None` (std
+/// can't tell its links and file index on stable Rust; git makes no hard links in a tree).
+fn hard_link(meta: &std::fs::Metadata) -> Option<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        (meta.nlink() > 1 && !meta.is_dir()).then(|| (meta.dev(), meta.ino()))
+    }
+    #[cfg(windows)]
+    {
+        let _ = meta;
+        None
+    }
+}
+
+/// The space an entry takes: its blocks on Unix; on Windows a file's size (a directory's
+/// counts nothing).
+fn allocated(meta: &std::fs::Metadata) -> u64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        meta.blocks() * 512
+    }
+    #[cfg(windows)]
+    {
+        if meta.is_dir() { 0 } else { meta.len() }
+    }
 }
 
 /// Free space under which a failed seeding is put down to a full disk.
@@ -619,17 +649,7 @@ pub(crate) fn disk_full(dir: &Path) -> Option<DiskFull> {
 
 /// Bytes free for an unprivileged user on the filesystem holding `path` (statvfs).
 fn free_bytes(path: &Path) -> Option<u64> {
-    use std::os::unix::ffi::OsStrExt;
-    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
-    // SAFETY: statvfs fills `s`; `c` is a valid C string.
-    unsafe {
-        let mut s: libc::statvfs = std::mem::zeroed();
-        if libc::statvfs(c.as_ptr(), &mut s) != 0 {
-            return None;
-        }
-        #[allow(clippy::useless_conversion)]
-        Some(u64::from(s.f_bavail).saturating_mul(u64::from(s.f_frsize)))
-    }
+    crate::sys::free_bytes(path)
 }
 
 /// The base checkout's commit and git dir, if it is usable: a worktree at a readable commit with

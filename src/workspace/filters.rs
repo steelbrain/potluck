@@ -340,19 +340,17 @@ impl SameAs {
     /// For the regular file at `path`; `len`, when known, is how many bytes will be fed (a file of
     /// another size is told apart without reading it).
     fn new(path: &Path, len: Option<u64>) -> SameAs {
-        use std::os::unix::fs::OpenOptionsExt;
+        let mut options = std::fs::File::options();
+        options.read(true);
         // Opened without waiting: git calls a FIFO in a tracked file's place modified, and a
         // blocking open of it waits for a writer that never comes. Only a regular file is read
-        // (O_NONBLOCK changes nothing for one).
-        let file = std::fs::File::options()
-            .read(true)
-            .custom_flags(libc::O_NONBLOCK)
-            .open(path)
-            .ok()
-            .filter(|f| {
-                f.metadata()
-                    .is_ok_and(|m| m.is_file() && len.is_none_or(|len| m.len() == len))
-            });
+        // (O_NONBLOCK changes nothing for one). Windows has no FIFOs in a tree.
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::custom_flags(&mut options, libc::O_NONBLOCK);
+        let file = options.open(path).ok().filter(|f| {
+            f.metadata()
+                .is_ok_and(|m| m.is_file() && len.is_none_or(|len| m.len() == len))
+        });
         SameAs {
             file,
             buf: Vec::new(),
@@ -800,10 +798,11 @@ mod tests {
         let path = |o: &str| objects.join(&o[..2]).join(&o[2..]);
         let loose = path(&oid);
         assert!(loose.is_file(), "{} is loose", loose.display());
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o644)).unwrap();
-        }
+        // Git makes objects read-only.
+        let mut writable = std::fs::metadata(&loose).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        writable.set_readonly(false);
+        std::fs::set_permissions(&loose, writable).unwrap();
         std::fs::copy(path(&other), &loose).unwrap();
         assert_eq!(
             git(&co, &["cat-file", "blob", &oid]).as_bytes(),
@@ -816,7 +815,9 @@ mod tests {
     }
 
     /// Names git's batch input can't carry as they are (a leading blank, a line feed, a carriage
-    /// return at the end) are compared too, each on its own.
+    /// return at the end) are compared too, each on its own. Windows allows none of them but the
+    /// blank.
+    #[cfg(unix)]
     #[test]
     fn awkward_names_are_compared_too() {
         let t = tempfile::tempdir().unwrap();
@@ -913,6 +914,7 @@ mod tests {
 
     /// A FIFO in a tracked file's place (git calls it modified) is not that file, and looking at
     /// it doesn't wait for a writer that never comes.
+    #[cfg(unix)]
     #[test]
     fn a_fifo_in_a_files_place_is_not_waited_on() {
         use std::os::unix::ffi::OsStringExt;

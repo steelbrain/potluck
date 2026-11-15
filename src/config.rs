@@ -1,7 +1,8 @@
 //! Where potluck keeps its state, and the node config.
 //!
-//! State: `$POTLUCK_HOME`, default `~/.local/state/potluck` on Linux and macOS. It must be on a
-//! copy-on-write filesystem. Layout:
+//! State: `$POTLUCK_HOME`, default `~/.local/state/potluck` on Linux and macOS,
+//! `%USERPROFILE%\.local\state\potluck` on Windows. It must be on a copy-on-write filesystem
+//! (on Windows ReFS, such as a Dev Drive, where the default on C: is not). Layout:
 //! - `potluck.sock`, `potluck.db`, `daemon.log`, `daemon.lock` (one daemon per home)
 //! - `keys/` (this machine's key pair and the trust records, phase 2)
 //! - `mirrors/<repo_id>.git` (bare mirrors), `bases/<repo_id>` (base checkouts to clone from)
@@ -9,7 +10,8 @@
 //!   TMPDIR, beside the tree)
 //! - `jobs/<job_id>/`: `output.log`, `status.json`, `keep/` and `crash/` (14 days)
 //!
-//! Config: `$POTLUCK_CONFIG`, default `~/.config/potluck/node.toml`. Optional. Example:
+//! Config: `$POTLUCK_CONFIG`, default `~/.config/potluck/node.toml` (on Windows
+//! `%USERPROFILE%\.config\potluck\node.toml`). Optional. Example:
 //!
 //! ```toml
 //! name = "studio"                 # default: the short hostname
@@ -58,11 +60,12 @@ pub struct Paths {
 }
 
 impl Paths {
-    /// From `$POTLUCK_HOME` and `$POTLUCK_CONFIG`, or the defaults, made absolute (the daemon
-    /// hands them to jobs, which run elsewhere).
+    /// From `$POTLUCK_HOME` and `$POTLUCK_CONFIG`, or the defaults under the user's home
+    /// (`HOME`, on Windows `USERPROFILE`), made absolute (the daemon hands them to jobs, which run
+    /// elsewhere).
     pub fn from_env() -> anyhow::Result<Paths> {
         Paths::from_vars(
-            std::env::var_os("HOME"),
+            std::env::var_os(crate::sys::home_var()),
             std::env::var_os("POTLUCK_HOME"),
             std::env::var_os("POTLUCK_CONFIG"),
         )
@@ -75,17 +78,17 @@ impl Paths {
     ) -> anyhow::Result<Paths> {
         let user_home = user_home
             .map(PathBuf::from)
-            .ok_or_else(|| anyhow::anyhow!("HOME is not set"))?;
+            .ok_or_else(|| anyhow::anyhow!("{} is not set", crate::sys::home_var()))?;
         let absolute = |p: PathBuf, var: &str| {
             std::path::absolute(&p)
                 .map_err(|e| anyhow::anyhow!("{var} {:?} can't be made absolute: {e}", p.display()))
         };
         let home = home
             .map(PathBuf::from)
-            .unwrap_or_else(|| user_home.join(".local/state/potluck"));
+            .unwrap_or_else(|| user_home.join(".local").join("state").join("potluck"));
         let config = config
             .map(PathBuf::from)
-            .unwrap_or_else(|| user_home.join(".config/potluck/node.toml"));
+            .unwrap_or_else(|| user_home.join(".config").join("potluck").join("node.toml"));
         Ok(Paths {
             home: absolute(home, "POTLUCK_HOME")?,
             config: absolute(config, "POTLUCK_CONFIG")?,
@@ -278,6 +281,7 @@ fn parse_error(text: &str, e: &toml::de::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     /// A relative POTLUCK_HOME or POTLUCK_CONFIG is taken from the current directory: jobs run in
     /// their workspaces, where a relative path would name something else (on macOS every job's
@@ -285,18 +289,26 @@ mod tests {
     #[test]
     fn paths_are_absolute() {
         let cwd = std::env::current_dir().unwrap();
+        let user = if cfg!(windows) {
+            r"C:\Users\u"
+        } else {
+            "/home/u"
+        };
         let p = Paths::from_vars(
-            Some("/home/u".into()),
+            Some(user.into()),
             Some("state".into()),
             Some("cfg/node.toml".into()),
         )
         .unwrap();
         assert_eq!(p.home, cwd.join("state"));
         assert_eq!(p.config, cwd.join("cfg/node.toml"));
-        let p = Paths::from_vars(Some("/home/u".into()), None, None).unwrap();
-        assert_eq!(p.home, PathBuf::from("/home/u/.local/state/potluck"));
-        assert_eq!(p.config, PathBuf::from("/home/u/.config/potluck/node.toml"));
-        let e = Paths::from_vars(Some("/home/u".into()), Some("".into()), None).unwrap_err();
+        let p = Paths::from_vars(Some(user.into()), None, None).unwrap();
+        assert_eq!(p.home, Path::new(user).join(".local/state/potluck"));
+        assert_eq!(p.config, Path::new(user).join(".config/potluck/node.toml"));
+        if cfg!(windows) {
+            assert_eq!(p.home.to_str(), Some(r"C:\Users\u\.local\state\potluck"));
+        }
+        let e = Paths::from_vars(Some(user.into()), Some("".into()), None).unwrap_err();
         assert!(
             format!("{e}").starts_with("POTLUCK_HOME \"\" can't be made absolute"),
             "{e}"
