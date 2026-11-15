@@ -17,12 +17,19 @@ use potluck::types::{
 };
 use potluck::workspace::Action;
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+#[cfg(unix)]
+use libc::SIGKILL;
+// The number the daemon sends to end a job on Windows, as on Unix.
+#[cfg(windows)]
+const SIGKILL: i32 = 9;
 
 const REPO: &str = "repo-0123abcd";
 const BRANCH: &str = "agent-1";
@@ -43,11 +50,15 @@ struct Launched {
     potluck_bin: PathBuf,
 }
 
-/// Runs each invocation as `potluck _supervise` in a process group of its own and reaps it.
+/// Runs each invocation as `potluck _supervise` in a process group of its own (a job object on
+/// Windows) and reaps it.
 #[derive(Default)]
 struct FakeExec {
     /// Supervisor pid -> whether it has exited (and was reaped).
     procs: Mutex<BTreeMap<u32, Arc<AtomicBool>>>,
+    /// Windows: supervisor pid -> its group, which signals go to.
+    #[cfg(windows)]
+    groups: Mutex<BTreeMap<u32, Arc<Mutex<potluck::sys::Group>>>>,
     launched: Mutex<Vec<Launched>>,
     finished: Mutex<Vec<u32>>,
     cpu: AtomicU64,
@@ -111,13 +122,28 @@ impl FakeExec {
             .is_some_and(|e| !e.load(Ordering::SeqCst))
     }
 
-    /// Signals the supervisor's group and its command's (a group of its own).
+    /// Signals the supervisor's group and its command's (a group of its own). On Windows SIGKILL
+    /// ends the supervisor's job object, with its command in it, and any other signal is a
+    /// Ctrl+Break to the supervisor.
     fn kill_group(&self, pid: u32, sig: i32) {
         // Only while the leader is unreaped: its pid (the group id) can't have been reused, nor
         // can its child's, which it hasn't reaped either.
         if self.alive(pid) {
+            #[cfg(unix)]
             for g in common::supervisor_groups(pid) {
                 unsafe { libc::kill(-(g as i32), sig) };
+            }
+            #[cfg(windows)]
+            {
+                let group = self.groups.lock().unwrap().get(&pid).cloned();
+                if let Some(group) = group {
+                    let group = group.lock().unwrap();
+                    if sig == SIGKILL {
+                        group.kill();
+                    } else {
+                        group.interrupt();
+                    }
+                }
             }
         }
     }
@@ -135,7 +161,7 @@ impl FakeExec {
     fn kill_all(&self) {
         let pids: Vec<u32> = self.procs.lock().unwrap().keys().copied().collect();
         for pid in pids {
-            self.kill_group(pid, libc::SIGKILL);
+            self.kill_group(pid, SIGKILL);
         }
     }
 }
@@ -154,8 +180,7 @@ impl Executor for FakeExec {
         if l.limits.log_max_bytes > 0 {
             cmd.arg("--log-max").arg(l.limits.log_max_bytes.to_string());
         }
-        let mut child = cmd
-            .arg(&l.status)
+        cmd.arg(&l.status)
             .arg("--")
             .args(&l.job.spec.cmd)
             .current_dir(&l.cwd)
@@ -163,16 +188,35 @@ impl Executor for FakeExec {
             .envs(&l.env)
             .stdin(Stdio::null())
             .stdout(log.try_clone()?)
-            .stderr(log)
-            .process_group(0)
-            .spawn()?;
-        let pid = child.id();
+            .stderr(log);
         let exited = Arc::new(AtomicBool::new(false));
-        self.procs.lock().unwrap().insert(pid, exited.clone());
-        std::thread::spawn(move || {
-            let _ = child.wait();
-            exited.store(true, Ordering::SeqCst);
-        });
+        #[cfg(unix)]
+        let pid = {
+            let mut child = cmd.process_group(0).spawn()?;
+            let pid = child.id();
+            self.procs.lock().unwrap().insert(pid, exited.clone());
+            std::thread::spawn(move || {
+                let _ = child.wait();
+                exited.store(true, Ordering::SeqCst);
+            });
+            pid
+        };
+        #[cfg(windows)]
+        let pid = {
+            let group = potluck::sys::Group::spawn(&mut cmd)?;
+            let pid = group.id();
+            let group = Arc::new(Mutex::new(group));
+            self.groups.lock().unwrap().insert(pid, group.clone());
+            self.procs.lock().unwrap().insert(pid, exited.clone());
+            // The group holds the child: polled, so that signals can take the lock meanwhile.
+            std::thread::spawn(move || {
+                while matches!(group.lock().unwrap().child().try_wait(), Ok(None)) {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                exited.store(true, Ordering::SeqCst);
+            });
+            pid
+        };
         self.launched.lock().unwrap().push(Launched {
             job: l.job.id.clone(),
             env: l.env.clone(),
@@ -209,7 +253,7 @@ impl Executor for FakeExec {
             self.sampled_tracked.store(tracked.len(), Ordering::SeqCst);
         }
         if alive && self.over_memory_at_peak.swap(false, Ordering::SeqCst) {
-            self.kill_group(pid, libc::SIGKILL);
+            self.kill_group(pid, SIGKILL);
             return Ok(Sample {
                 pids,
                 cpu_ms: self.cpu.load(Ordering::SeqCst),
@@ -221,7 +265,7 @@ impl Executor for FakeExec {
             });
         }
         if alive && self.over_tasks.swap(false, Ordering::SeqCst) {
-            self.kill_group(pid, libc::SIGKILL);
+            self.kill_group(pid, SIGKILL);
             return Ok(Sample {
                 pids,
                 cpu_ms: self.cpu.load(Ordering::SeqCst),
@@ -233,7 +277,7 @@ impl Executor for FakeExec {
             });
         }
         if alive && self.oom_killed.swap(false, Ordering::SeqCst) {
-            self.kill_group(pid, libc::SIGKILL);
+            self.kill_group(pid, SIGKILL);
             return Ok(Sample {
                 pids,
                 cpu_ms: self.cpu.load(Ordering::SeqCst),
@@ -245,7 +289,7 @@ impl Executor for FakeExec {
             });
         }
         if alive && self.over_memory.swap(false, Ordering::SeqCst) {
-            self.kill_group(pid, libc::SIGKILL);
+            self.kill_group(pid, SIGKILL);
             return Ok(Sample {
                 pids,
                 cpu_ms: self.cpu.load(Ordering::SeqCst),
@@ -475,6 +519,8 @@ impl WorkspaceProvider for FakeWs {
         std::fs::write(root.join("COMMIT"), &repo.commit)?;
         std::fs::write(root.join("data/a.txt"), b"alpha")?;
         std::fs::write(root.join("data/sub/b.bin"), [0u8, 1, 2, 255])?;
+        // A link out of the workspace, which copies refuse (Windows: making one takes a privilege).
+        #[cfg(unix)]
         std::os::unix::fs::symlink("/etc/hosts", root.join("data/escape"))?;
         std::fs::create_dir_all(self.paths.workspace_tmp(id))?;
         // Like the real one: creating pins its commits under the workspace id, removing unpins.
@@ -1451,6 +1497,7 @@ fn cancel_queued_and_running() {
     let j = f.wait(&running);
     assert_eq!(j.state, JobState::Cancelled);
     assert_eq!(j.exit_code_for_client(), 130);
+    #[cfg(unix)]
     assert_eq!(j.signal, Some(libc::SIGTERM), "{j:#?}");
     assert!(start.elapsed() < Duration::from_secs(5));
     let pid = pid_of(j.handle.as_ref().unwrap());
@@ -1632,6 +1679,7 @@ fn why_of_a_finished_job_gives_its_peak_memory() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn run_limit_terms_then_kills() {
     let f = Fixture::new().start();
@@ -1810,7 +1858,7 @@ fn too_many_processes_ends_the_job_with_its_own_message() {
     f.exec.over_tasks.store(true, Ordering::SeqCst);
     let j = f.wait(&id);
     assert_eq!(j.state, JobState::Failed);
-    assert_eq!((j.exit_code, j.signal), (None, Some(libc::SIGKILL)));
+    assert_eq!((j.exit_code, j.signal), (None, Some(SIGKILL)));
     assert_eq!(j.exit_code_for_client(), 137);
     let message = "too many processes: 5334, over its limit of 5333 (half of kern.maxprocperuid, the most processes one user may have)";
     assert_eq!(j.message.as_deref(), Some(message));
@@ -2024,6 +2072,7 @@ fn a_wall_clock_step_moves_no_run_limit() {
 
 /// The grace between SIGTERM and SIGKILL is on the awake clock, which no step of the wall clock
 /// moves: a wall clock set back right after the SIGTERM doesn't hold the SIGKILL back.
+#[cfg(unix)]
 #[test]
 fn a_wall_clock_set_back_does_not_hold_back_the_sigkill() {
     let f = Fixture::new().start();
@@ -2051,6 +2100,7 @@ fn a_wall_clock_set_back_does_not_hold_back_the_sigkill() {
 /// clock: a machine that sleeps (a laptop's lid closed) right after the SIGTERM gives the job the
 /// rest of its grace once it wakes, rather than a SIGKILL at once. The SIGKILL still comes once
 /// the grace has passed awake.
+#[cfg(unix)]
 #[test]
 fn time_asleep_is_no_part_of_the_kill_grace() {
     let mut f = Fixture::new();
@@ -2253,6 +2303,7 @@ fn a_run_limit_survives_a_restart_and_a_clock_step() {
 
 /// A run record written before the daemon kept boot-clock readings has wall times: a cancel's
 /// SIGTERM time from it still leads to the SIGKILL after the grace.
+#[cfg(unix)]
 #[test]
 fn an_older_run_record_carries_its_times_over() {
     let mut f = Fixture::new().start();
@@ -2552,6 +2603,7 @@ fn a_workspace_held_while_the_policy_runs_is_not_removed() {
 
 /// A kept file that can't be copied (a full disk; here a `keep/` the job made read-only) is a
 /// warning on the job, which `why` shows, not something lost without a word.
+#[cfg(unix)]
 #[test]
 fn a_kept_file_that_cannot_be_copied_is_a_warning() {
     let f = Fixture::new().start();
@@ -2931,6 +2983,8 @@ fn a_replaced_binary_is_not_what_the_daemon_runs_its_helpers_from() {
     // The update: a new file renamed over the old one. This "version" says so and fails.
     let new = bin_dir.join(".potluck.new");
     std::fs::write(&new, "#!/bin/sh\necho the new binary ran\nexit 3\n").unwrap();
+    // On Windows the script is no program at all, so a daemon that ran it fails the job too.
+    #[cfg(unix)]
     std::fs::set_permissions(&new, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
     std::fs::rename(&new, &installed).unwrap();
     let after = f.dispatch(spec("echo after"));
@@ -3378,7 +3432,7 @@ fn a_restart_finds_jobs_whose_processes_vanished_lost() {
     f.stop();
     // Killed while no daemon watched, so nothing records how it ended.
     f.exec
-        .kill_group(pid_of(j.handle.as_ref().unwrap()), libc::SIGKILL);
+        .kill_group(pid_of(j.handle.as_ref().unwrap()), SIGKILL);
     std::thread::sleep(Duration::from_millis(300));
     f.restart();
     let j = f.wait(&id);
@@ -3663,7 +3717,7 @@ fn a_request_that_panics_is_logged_without_its_env() {
 }
 
 /// Reads until the daemon closes the connection; how many bytes came. Fails if it stays open.
-fn read_until_closed(s: &mut std::os::unix::net::UnixStream, within: Duration) -> usize {
+fn read_until_closed(s: &mut potluck::sys::local::UnixStream, within: Duration) -> usize {
     use std::io::Read;
     s.set_read_timeout(Some(within)).unwrap();
     let mut n = 0;
@@ -3680,8 +3734,8 @@ fn read_until_closed(s: &mut std::os::unix::net::UnixStream, within: Duration) -
 
 #[test]
 fn idle_connections_are_let_go() {
+    use potluck::sys::local::UnixStream;
     use std::io::Write;
-    use std::os::unix::net::UnixStream;
     let mut f = Fixture::new();
     f.opts.idle_ms = 300;
     let f = f.start();
@@ -3778,12 +3832,15 @@ fn only_one_daemon_per_home() {
         .unwrap()
         .to_string();
     assert!(e.contains("another potluck daemon"), "{e}");
-    use std::os::unix::fs::PermissionsExt;
-    let mode = std::fs::metadata(f.paths.socket())
-        .unwrap()
-        .permissions()
-        .mode();
-    assert_eq!(mode & 0o777, 0o600);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(f.paths.socket())
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
 }
 
 #[test]
@@ -4074,16 +4131,26 @@ fn nested_lease_check() {
 /// daemon's checks, `potluck service install`, an older potluck).
 #[test]
 fn the_state_directory_is_private() {
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     let f = Fixture::new();
     std::fs::create_dir_all(&f.paths.home).unwrap();
+    #[cfg(unix)]
     std::fs::set_permissions(&f.paths.home, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // On Windows a new directory takes the access list of the one above, which lets others in.
+    #[cfg(windows)]
+    assert!(!potluck::sys::is_private(&f.paths.home).unwrap());
     let f = f.start();
-    let mode = std::fs::metadata(&f.paths.home)
-        .unwrap()
-        .permissions()
-        .mode();
-    assert_eq!(mode & 0o777, 0o700, "{mode:o}");
+    #[cfg(unix)]
+    {
+        let mode = std::fs::metadata(&f.paths.home)
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700, "{mode:o}");
+    }
+    #[cfg(windows)]
+    assert!(potluck::sys::is_private(&f.paths.home).unwrap());
 }
 
 /// A store write that fails (a full disk; here the jobs table is briefly gone) is made again
@@ -4183,7 +4250,7 @@ fn a_supervisor_killed_while_the_daemon_watches_fails_the_job() {
     let id = f.dispatch(spec("sleep 30"));
     let j = f.wait_for(&id, "running", |j| j.state == JobState::Running);
     f.exec
-        .kill_group(pid_of(j.handle.as_ref().unwrap()), libc::SIGKILL);
+        .kill_group(pid_of(j.handle.as_ref().unwrap()), SIGKILL);
     let j = f.wait(&id);
     assert_eq!(
         (j.state, j.exit_code_for_client()),
@@ -4209,7 +4276,7 @@ fn a_supervisor_killed_after_a_restart_while_the_daemon_watches_fails_the_job() 
     std::thread::sleep(Duration::from_millis(500));
     assert_eq!(f.get(&id).state, JobState::Running);
     f.exec
-        .kill_group(pid_of(j.handle.as_ref().unwrap()), libc::SIGKILL);
+        .kill_group(pid_of(j.handle.as_ref().unwrap()), SIGKILL);
     let j = f.wait(&id);
     assert_eq!(
         (j.state, j.exit_code_for_client()),
@@ -4258,7 +4325,7 @@ fn a_job_ended_without_a_status_on_a_full_disk_says_so() {
     let id = f.dispatch(spec("sleep 30"));
     let j = f.wait_for(&id, "running", |j| j.state == JobState::Running);
     f.exec
-        .kill_group(pid_of(j.handle.as_ref().unwrap()), libc::SIGKILL);
+        .kill_group(pid_of(j.handle.as_ref().unwrap()), SIGKILL);
     let j = f.wait(&id);
     drop(f);
     detach();

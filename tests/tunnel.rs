@@ -491,6 +491,26 @@ impl Cluster {
 }
 
 /// The processes whose command line mentions any of `needles`.
+#[cfg(windows)]
+fn processes(needles: &[&str]) -> Vec<String> {
+    let out = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Get-CimInstance Win32_Process | ForEach-Object { \"$($_.ProcessId) $($_.CommandLine)\" }",
+        ])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| needles.iter().any(|n| l.contains(n)))
+        .map(str::to_string)
+        .collect()
+}
+
+/// The processes whose command line mentions any of `needles`.
+#[cfg(unix)]
 fn processes(needles: &[&str]) -> Vec<String> {
     let out = Command::new("ps")
         .args(["-A", "-ww", "-o", "pid=", "-o", "args="])
@@ -505,6 +525,7 @@ fn processes(needles: &[&str]) -> Vec<String> {
 
 /// The process group of the `git upload-pack` serving a git dir in `repo` (it leads a group of
 /// its own).
+#[cfg(unix)]
 fn upload_pack_group(repo: &Path) -> String {
     let out = Command::new("ps")
         .args(["-A", "-ww", "-o", "pgid=", "-o", "args="])
@@ -519,6 +540,7 @@ fn upload_pack_group(repo: &Path) -> String {
 }
 
 /// The processes in process group `pgid`.
+#[cfg(unix)]
 fn group(pgid: &str) -> Vec<String> {
     let out = Command::new("ps")
         .args(["-A", "-ww", "-o", "pgid=", "-o", "pid=", "-o", "args="])
@@ -1474,10 +1496,27 @@ fn a_program_path_with_spaces_and_percents() {
     let head = commit_file(&c.repo, "a.txt", b"one\n", "first");
     let dir = c.root.path().join("my tools 100% %s");
     std::fs::create_dir_all(&dir).unwrap();
-    let bin = dir.join("pot luck");
-    std::os::unix::fs::symlink(BIN, &bin).unwrap();
+    #[cfg(unix)]
+    let bin = {
+        let bin = dir.join("pot luck");
+        std::os::unix::fs::symlink(BIN, &bin).unwrap();
+        bin
+    };
+    // Windows: a copy (a symbolic link needs a privilege there), named as an .exe.
+    #[cfg(windows)]
+    let bin = {
+        let bin = dir.join("pot luck.exe");
+        common::copy_binary(Path::new(BIN), &bin);
+        bin
+    };
     let url = tunnel::fetch_url(&bin, "source", &c.repo_id);
+    #[cfg(unix)]
     assert!(url.contains("my% tools% 100%%% %%s/pot% luck"), "{url}");
+    #[cfg(windows)]
+    assert!(
+        url.contains("my% tools% 100%%% %%s\\pot% luck.exe"),
+        "{url}"
+    );
     let into = c.bare("into.git");
     let out = c.fetch(&into, &url);
     assert!(
@@ -1623,6 +1662,7 @@ fn upload_pack_dies_when_the_runner_goes_away() {
 
 /// The runner dies while the source is still packing and sending: `git upload-pack` and the
 /// `git pack-objects` it started are killed.
+#[cfg(unix)]
 #[test]
 fn upload_pack_and_its_children_die_when_the_runner_goes_away_mid_pack() {
     let c = cluster();

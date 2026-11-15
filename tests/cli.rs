@@ -11,6 +11,7 @@ use potluck::types::{
     Facts, Gpu, Grant, JobState, RepoRef, WorkspaceRecord, WorkspaceState, now_ms,
 };
 use serde_json::Value;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -975,8 +976,29 @@ fn a_potluck_toml_that_is_not_a_file_is_named_as_such() {
     let link = repo_with("");
     git(link.path(), &["rm", "-q", "potluck.toml"]);
     std::fs::write(link.path().join("real.toml"), RECIPES).unwrap();
-    std::os::unix::fs::symlink("real.toml", link.path().join("potluck.toml")).unwrap();
-    git(link.path(), &["add", "real.toml", "potluck.toml"]);
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink("real.toml", link.path().join("potluck.toml")).unwrap();
+        git(link.path(), &["add", "real.toml", "potluck.toml"]);
+    }
+    // Windows: the link goes into the index as git keeps one (making a symbolic link on disk
+    // takes a privilege there).
+    #[cfg(windows)]
+    {
+        std::fs::write(link.path().join("target"), "real.toml").unwrap();
+        let blob = git(link.path(), &["hash-object", "-w", "target"]);
+        std::fs::remove_file(link.path().join("target")).unwrap();
+        git(link.path(), &["add", "real.toml"]);
+        git(
+            link.path(),
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("120000,{},potluck.toml", blob.trim()),
+            ],
+        );
+    }
     git(link.path(), &["commit", "-q", "-m", "a link"]);
     for (repo, what) in [(&tree, "a directory"), (&link, "a symbolic link")] {
         for args in [
@@ -1088,19 +1110,22 @@ fn usage_errors_exit_2_and_json_errors_are_one_document() {
     );
     assert!(r.stderr.contains("potluck service install"), "{}", r.stderr);
     // A socket someone listens on but this user may not use: not "not running".
-    let sock = home.path().join("potluck.sock");
-    let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
-    std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o000)).unwrap();
-    let r = run(potluck(home.path()).args(["status"]));
-    assert_eq!(r.code, 2);
-    assert!(
-        r.stderr.contains(&format!(
-            "can't connect to the potluck daemon: {}: Permission denied",
-            sock.display()
-        )) && !r.stderr.contains("not running"),
-        "{}",
-        r.stderr
-    );
+    #[cfg(unix)]
+    {
+        let sock = home.path().join("potluck.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let r = run(potluck(home.path()).args(["status"]));
+        assert_eq!(r.code, 2);
+        assert!(
+            r.stderr.contains(&format!(
+                "can't connect to the potluck daemon: {}: Permission denied",
+                sock.display()
+            )) && !r.stderr.contains("not running"),
+            "{}",
+            r.stderr
+        );
+    }
     let r = run(potluck(home.path()).args(["--help"]));
     assert_eq!(r.code, 0);
     assert!(r.stdout.contains("dispatch"));
@@ -1570,8 +1595,24 @@ fn logs_json_of_a_large_log_takes_little_memory() {
 
 /// Waits for `child` to exit 0 and returns the most memory it held. macOS: its peak resident
 /// size from wait4. Linux: its VmHWM, read until it exits, because the kernel's ru_maxrss of a
-/// child includes its parent's peak at the fork (this test process).
+/// child includes its parent's peak at the fork (this test process). Windows: its peak working
+/// set, which its process object keeps after it exits.
 fn peak_memory(child: &mut std::process::Child) -> u64 {
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::ProcessStatus::{
+            GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+        };
+        assert!(child.wait().unwrap().success());
+        // SAFETY: plain data, filled by the call.
+        let mut counters: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+        // SAFETY: the child's handle stays open until it is dropped; a buffer of the size given.
+        let ok = unsafe { GetProcessMemoryInfo(child.as_raw_handle(), &mut counters, size) };
+        assert_ne!(ok, 0, "{}", std::io::Error::last_os_error());
+        counters.PeakWorkingSetSize as u64
+    }
     #[cfg(target_os = "macos")]
     {
         let mut status = 0;
@@ -1639,8 +1680,15 @@ fn copy_daemon(evil: &'static str) -> FakeDaemon {
     })
 }
 
+#[cfg(unix)]
 fn mode(p: &Path) -> u32 {
     std::fs::metadata(p).unwrap().permissions().mode() & 0o7777
+}
+
+/// Windows has no modes: whether the file is read-only.
+#[cfg(windows)]
+fn read_only(p: &Path) -> bool {
+    std::fs::metadata(p).unwrap().permissions().readonly()
 }
 
 /// A file that can't be written (here: past a file size limit) is named in the error, not
@@ -1761,6 +1809,13 @@ fn output_read_in_part_is_not_an_error() {
     }
 }
 
+/// The OS's error for a full disk.
+#[cfg(unix)]
+const DISK_FULL: i32 = libc::ENOSPC;
+/// The OS's error for a full disk (ERROR_DISK_FULL).
+#[cfg(windows)]
+const DISK_FULL: i32 = 112;
+
 /// Output that takes no bytes: `Full` fails every write as a full disk does (`> /dev/full`),
 /// `Gone` as a pipe nobody reads.
 struct Unwritable(std::io::ErrorKind);
@@ -1769,7 +1824,7 @@ impl std::io::Write for Unwritable {
     fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
         Err(match self.0 {
             std::io::ErrorKind::BrokenPipe => std::io::ErrorKind::BrokenPipe.into(),
-            _ => std::io::Error::from_raw_os_error(libc::ENOSPC),
+            _ => std::io::Error::from_raw_os_error(DISK_FULL),
         })
     }
     fn flush(&mut self) -> std::io::Result<()> {
@@ -1817,7 +1872,7 @@ fn output_that_cannot_be_written_is_an_error() {
         assert!(
             (stderr.contains("can't write the output")
                 || stderr.contains("writing the job's output"))
-                && stderr.contains("os error 28"),
+                && stderr.contains(&format!("os error {DISK_FULL}")),
             "{args:?}: {stderr}"
         );
         let (code, stderr) = run_into(std::io::ErrorKind::BrokenPipe, args);
@@ -1914,6 +1969,7 @@ fn cp_writes_directories_files_and_modes() {
         std::fs::read_to_string(out.join("z/late.txt")).unwrap(),
         "late"
     );
+    #[cfg(unix)]
     assert_eq!(
         (
             mode(&out),
@@ -1922,6 +1978,14 @@ fn cp_writes_directories_files_and_modes() {
             mode(&out.join("README"))
         ),
         (0o755, 0o700, 0o755, 0o444)
+    );
+    #[cfg(windows)]
+    assert_eq!(
+        (
+            read_only(&out.join("bin/app")),
+            read_only(&out.join("README"))
+        ),
+        (false, true)
     );
     assert!(r.stdout.contains("copied 3 files"), "{}", r.stdout);
     // Again into the now existing directory: it lands inside, under the source's name; a
@@ -1952,10 +2016,12 @@ fn cp_writes_directories_files_and_modes() {
         std::fs::read_to_string(dest.path().join("one.txt")).unwrap(),
         "one"
     );
+    #[cfg(unix)]
     assert_eq!(mode(&dest.path().join("one.txt")), 0o600);
 }
 
 /// As for kept files: setuid, setgid and sticky bits from a workspace are not kept.
+#[cfg(unix)]
 #[test]
 fn cp_drops_setuid_setgid_and_sticky_bits() {
     let fake = copy_daemon("");
@@ -2928,6 +2994,7 @@ fn context_names_the_repository_and_branch_cheaply() {
 
 /// Installs and removes a real service under a test name (`potluck-test-...`), then checks the
 /// service manager saw both. Opt-in: it talks to the user's systemd or launchd.
+#[cfg(unix)]
 #[test]
 #[ignore = "installs a real user service named potluck-test-*; run with --ignored"]
 fn service_install_and_uninstall_for_real() {
@@ -3010,6 +3077,7 @@ fn service_install_and_uninstall_for_real() {
 /// `service install` refuses what the daemon would refuse, before it writes or starts anything:
 /// otherwise the service manager starts a daemon that exits at once, again and again, while the
 /// command says it started it.
+#[cfg(unix)]
 #[test]
 fn service_install_refuses_a_config_the_daemon_would_refuse() {
     let home = tempfile::tempdir().unwrap();
@@ -3032,6 +3100,7 @@ fn service_install_refuses_a_config_the_daemon_would_refuse() {
 
 /// A node.toml that parses but whose `listen` isn't an IP address: the daemon exits at start on
 /// it, so `service install` refuses it too rather than start a service that fails again and again.
+#[cfg(unix)]
 #[test]
 fn service_install_refuses_a_listen_address_the_daemon_would_refuse() {
     let home = tempfile::tempdir().unwrap();
@@ -3055,6 +3124,7 @@ fn service_install_refuses_a_listen_address_the_daemon_would_refuse() {
 
 /// A node name starting with `-` makes ids (`-box-1`, `-box-w1`) that every command reads as
 /// options: the daemon refuses to start under it, and `service install` refuses it up front.
+#[cfg(unix)]
 #[test]
 fn a_node_name_starting_with_a_dash_is_refused() {
     let home = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
@@ -3099,6 +3169,7 @@ fn a_node_name_starting_with_a_dash_is_refused() {
 /// new user's next step after `service install`) used to pass `service install`, whose daemon
 /// then failed again and again under the service manager, with a message about "its cluster" on
 /// a machine in none. Both now refuse it and say how to go on.
+#[cfg(unix)]
 #[test]
 fn a_name_set_after_the_first_start_is_refused_with_the_way_on() {
     let home = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
@@ -3171,6 +3242,7 @@ fn a_name_set_after_the_first_start_is_refused_with_the_way_on() {
 /// as the first line, which potluck reads as the top of the tree, so every dispatch and every
 /// seeding on that machine failed. The daemon refuses to start with such a git, and `service
 /// install` refuses it up front, naming the git it found and its version.
+#[cfg(unix)]
 #[test]
 fn a_git_older_than_2_31_is_refused() {
     let home = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
@@ -3247,6 +3319,7 @@ fn a_git_older_than_2_31_is_refused() {
 /// install` used to say it installed and started the service, whose daemon then exited at once
 /// ("another potluck daemon is running") and was started again every 10 s (seen with a test
 /// LaunchAgent on the Mac). It now refuses, and a second daemon says what to do.
+#[cfg(unix)]
 #[test]
 fn service_install_refuses_while_a_daemon_runs_outside_it() {
     let home = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
@@ -3316,6 +3389,7 @@ fn service_install_refuses_while_a_daemon_runs_outside_it() {
 /// a line in `dir/calls`. `systemctl --user` fails as the real one does when it can't find the
 /// user manager's bus (no XDG_RUNTIME_DIR and no DBUS_SESSION_BUS_ADDRESS). A service counts as
 /// running from `enable --now` or `bootstrap` until `disable --now` or `bootout`. Lingering is on.
+#[cfg(unix)]
 fn fake_service_tools(dir: &Path) -> (PathBuf, PathBuf) {
     let bin = dir.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
@@ -3423,6 +3497,7 @@ fn service_install_finds_the_user_manager_without_xdg_runtime_dir() {
 /// `service install` again with nothing to change leaves the running daemon alone and says it
 /// changed nothing, on both systems; a service file that differs is rewritten and the daemon
 /// restarted. macOS used to restart the daemon every time, and `changed` was always true.
+#[cfg(unix)]
 #[test]
 fn service_install_restarts_the_daemon_only_when_its_service_changed() {
     let home = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
@@ -3478,6 +3553,7 @@ fn service_install_restarts_the_daemon_only_when_its_service_changed() {
 }
 
 /// Removes the test service if an assertion failed halfway.
+#[cfg(unix)]
 fn svc_guard(dir: &Path, name: &str) -> impl Drop {
     struct G(PathBuf, String);
     impl Drop for G {

@@ -1,5 +1,8 @@
 //! A fake potluck daemon on a temporary Unix socket, answering with a test's handler, and helpers
 //! to build the records it answers with.
+//!
+//! On Windows, Git for Windows' `usr\bin` (sh, sleep, cat and the rest) goes first on this test
+//! process's PATH before main, so the processes the tests start find them.
 
 #![allow(dead_code)]
 
@@ -9,12 +12,12 @@ use potluck::mesh::{MemberEntry, MembershipView, UserEntry};
 use potluck::proto::{
     ClientRequest, Request as ProtoRequest, Response, ServerResponse, read_msg, write_msg,
 };
+use potluck::sys::local::{UnixListener, UnixStream};
 use potluck::types::{
     JobRecord, JobSpec, JobState, Reminder, RepoRef, Request, Usage, WorkspaceState,
 };
 use std::collections::BTreeMap;
 use std::io::{BufReader, Write};
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -28,14 +31,48 @@ use std::thread::JoinHandle;
 #[used]
 #[cfg_attr(target_os = "macos", unsafe(link_section = "__DATA,__mod_init_func"))]
 #[cfg_attr(target_os = "linux", unsafe(link_section = ".init_array"))]
+#[cfg_attr(windows, unsafe(link_section = ".CRT$XCU"))]
 static NO_USER_KEY: extern "C" fn() = {
     extern "C" fn clear() {
         // SAFETY: this runs before main, while the test process has one thread, so nothing else
         // reads or writes the environment meanwhile.
         unsafe { std::env::remove_var("POTLUCK_USER_KEY") };
+        #[cfg(windows)]
+        git_tools_first();
     }
     clear
 };
+
+/// Puts Git for Windows' `usr\bin` first on PATH, found from where `git.exe` is on PATH (its
+/// `cmd`, `bin` or `mingw64\bin`, below the directory holding `usr\bin`). Nothing changes when it
+/// can't be found, or is first already. Runs before main, from [`NO_USER_KEY`].
+#[cfg(windows)]
+fn git_tools_first() {
+    let Some(path) = std::env::var_os("PATH") else {
+        return;
+    };
+    let dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
+    let Some(tools) = dirs
+        .iter()
+        .filter(|d| d.join("git.exe").is_file())
+        .find_map(|d| {
+            d.ancestors()
+                .map(|a| a.join("usr").join("bin"))
+                .find(|u| u.join("sh.exe").is_file())
+        })
+    else {
+        return;
+    };
+    if dirs.first() == Some(&tools) {
+        return;
+    }
+    let mut all = vec![tools];
+    all.extend(dirs);
+    if let Ok(joined) = std::env::join_paths(all) {
+        // SAFETY: as in NO_USER_KEY: before main, with one thread.
+        unsafe { std::env::set_var("PATH", joined) };
+    }
+}
 
 /// One client connection, for the handler to answer on.
 pub struct Conn<'a> {
@@ -364,10 +401,20 @@ pub fn potluck_at(program: &Path, home: &Path) -> std::process::Command {
     c
 }
 
+/// Copies the executable at `from` to `to`. Windows starts a process without a fork, and a child
+/// gets only the handles it is given, so no child can hold `to` open from this process's copy (as
+/// one does on Unix, below).
+#[cfg(windows)]
+pub fn copy_binary(from: &Path, to: &Path) {
+    std::fs::copy(from, to)
+        .unwrap_or_else(|e| panic!("copying {} to {}: {e}", from.display(), to.display()));
+}
+
 /// Copies the executable at `from` to `to` through a child process (`cp`), so this
 /// (multithreaded) test process never holds `to` open for writing. If it did, another test
 /// thread forking meanwhile would leave a copy of that descriptor in its child until the child
 /// execs, and running `to` in that time fails with ETXTBSY ("Text file busy") on Linux.
+#[cfg(unix)]
 pub fn copy_binary(from: &Path, to: &Path) {
     let st = std::process::Command::new("cp")
         .arg(from)
@@ -430,6 +477,7 @@ pub fn free_port() -> u16 {
 /// The process groups that hold a `potluck _supervise` started in a group of its own (`pid`) and
 /// its command, which leads a group of its own: `pid`'s, then each child's. Signalling these
 /// reaches every process of the invocation that stayed in its group.
+#[cfg(unix)]
 pub fn supervisor_groups(pid: u32) -> Vec<u32> {
     let mut groups = vec![pid];
     groups.extend(children(pid));

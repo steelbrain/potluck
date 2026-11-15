@@ -23,12 +23,19 @@ use potluck::types::{
 use potluck::workspace::Action;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+#[cfg(unix)]
+use libc::SIGKILL;
+// The number the daemon sends to end a job on Windows, as on Unix.
+#[cfg(windows)]
+const SIGKILL: i32 = 9;
 
 const BIN: &str = env!("CARGO_BIN_EXE_potluck");
 const BRANCH: &str = "agent-1";
@@ -79,10 +86,14 @@ struct Launched {
     pid: u32,
 }
 
-/// Runs each invocation as `potluck _supervise` in a process group of its own and reaps it.
+/// Runs each invocation as `potluck _supervise` in a process group of its own (a job object on
+/// Windows) and reaps it.
 #[derive(Default)]
 struct FakeExec {
     procs: Mutex<BTreeMap<u32, Arc<AtomicBool>>>,
+    /// Windows: supervisor pid -> its group, which signals go to.
+    #[cfg(windows)]
+    groups: Mutex<BTreeMap<u32, Arc<Mutex<potluck::sys::Group>>>>,
     launched: Mutex<Vec<Launched>>,
     cpu: AtomicU64,
     /// Each `finish` leaves a crash report `report-<n>.ips` in the crash dir (n counts the calls),
@@ -109,13 +120,28 @@ impl FakeExec {
             .is_some_and(|e| !e.load(Ordering::SeqCst))
     }
 
-    /// Signals the supervisor's group and its command's (a group of its own).
+    /// Signals the supervisor's group and its command's (a group of its own). On Windows SIGKILL
+    /// ends the supervisor's job object, with its command in it, and any other signal is a
+    /// Ctrl+Break to the supervisor.
     fn kill_group(&self, pid: u32, sig: i32) {
         // Only while the leader is unreaped: its pid (the group id) can't have been reused, nor
         // can its child's, which it hasn't reaped either.
         if self.alive(pid) {
+            #[cfg(unix)]
             for g in common::supervisor_groups(pid) {
                 unsafe { libc::kill(-(g as i32), sig) };
+            }
+            #[cfg(windows)]
+            {
+                let group = self.groups.lock().unwrap().get(&pid).cloned();
+                if let Some(group) = group {
+                    let group = group.lock().unwrap();
+                    if sig == SIGKILL {
+                        group.kill();
+                    } else {
+                        group.interrupt();
+                    }
+                }
             }
         }
     }
@@ -131,7 +157,7 @@ impl FakeExec {
     fn kill_all(&self) {
         let pids: Vec<u32> = self.procs.lock().unwrap().keys().copied().collect();
         for pid in pids {
-            self.kill_group(pid, libc::SIGKILL);
+            self.kill_group(pid, SIGKILL);
         }
     }
 }
@@ -142,8 +168,8 @@ impl Executor for FakeExec {
             .create(true)
             .append(true)
             .open(&l.log)?;
-        let mut child = Command::new(&l.potluck_bin)
-            .arg("_supervise")
+        let mut cmd = Command::new(&l.potluck_bin);
+        cmd.arg("_supervise")
             .arg(&l.status)
             .arg("--")
             .args(&l.job.spec.cmd)
@@ -152,16 +178,35 @@ impl Executor for FakeExec {
             .envs(&l.env)
             .stdin(Stdio::null())
             .stdout(log.try_clone()?)
-            .stderr(log)
-            .process_group(0)
-            .spawn()?;
-        let pid = child.id();
+            .stderr(log);
         let exited = Arc::new(AtomicBool::new(false));
-        self.procs.lock().unwrap().insert(pid, exited.clone());
-        std::thread::spawn(move || {
-            let _ = child.wait();
-            exited.store(true, Ordering::SeqCst);
-        });
+        #[cfg(unix)]
+        let pid = {
+            let mut child = cmd.process_group(0).spawn()?;
+            let pid = child.id();
+            self.procs.lock().unwrap().insert(pid, exited.clone());
+            std::thread::spawn(move || {
+                let _ = child.wait();
+                exited.store(true, Ordering::SeqCst);
+            });
+            pid
+        };
+        #[cfg(windows)]
+        let pid = {
+            let group = potluck::sys::Group::spawn(&mut cmd)?;
+            let pid = group.id();
+            let group = Arc::new(Mutex::new(group));
+            self.groups.lock().unwrap().insert(pid, group.clone());
+            self.procs.lock().unwrap().insert(pid, exited.clone());
+            // The group holds the child: polled, so that signals can take the lock meanwhile.
+            std::thread::spawn(move || {
+                while matches!(group.lock().unwrap().child().try_wait(), Ok(None)) {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                exited.store(true, Ordering::SeqCst);
+            });
+            pid
+        };
         self.launched.lock().unwrap().push(Launched {
             job: l.job.id.clone(),
             env: l.env.clone(),
@@ -2247,6 +2292,7 @@ fn user_add_takes_a_key_that_starts_with_a_hyphen() {
 /// was removed. The mesh that replaced its listening one read the records from disk, where b is
 /// still a member: it listened again, heard of the removal again, and so on at every heartbeat.
 /// Now the mesh stays until the records are saved, and b stays out throughout.
+#[cfg(unix)]
 #[test]
 fn a_removal_this_machine_cant_save_yet_puts_it_out_once() {
     use std::os::unix::fs::PermissionsExt;
@@ -2975,6 +3021,7 @@ fn locality_prefers_a_warm_machine() {
 
 /// A job that crashes on another machine: its crash reports reach the owner's `jobs/<id>/crash`,
 /// those written seconds after the crash too (the runner collects again 5 s later).
+#[cfg(unix)]
 #[test]
 fn crash_reports_reach_the_owner() {
     let w = World::new();
@@ -3276,6 +3323,7 @@ fn status_lists_a_job_where_it_runs_now_not_where_a_lost_member_said() {
 }
 
 /// The version after the potluck the tests run: its patch number plus one.
+#[cfg(unix)]
 fn above_this_version() -> String {
     let mut parts: Vec<u64> = env!("CARGO_PKG_VERSION")
         .split('.')
@@ -3291,6 +3339,7 @@ fn above_this_version() -> String {
 
 /// A member on a newer version makes the older one update itself, from a local test release;
 /// `self-update` answers first, then updates.
+#[cfg(unix)]
 #[test]
 fn a_newer_member_makes_the_older_update() {
     let w = World::new();
@@ -4096,7 +4145,9 @@ fn a_member_just_paired_is_shown_with_its_facts() {
     assert!(seen_up);
 }
 
-/// A release directory served over plain HTTP on 127.0.0.1.
+/// A release directory served over plain HTTP on 127.0.0.1. Its binary is a shell script, which
+/// Windows can't run.
+#[cfg(unix)]
 mod release {
     use std::io::{BufRead, BufReader, Write};
     use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -4370,6 +4421,7 @@ fn only_job_and_workspace_requests_are_relayed() {
 /// An owner that can't write a job's log as it arrives (a full disk; here a log file it may not
 /// write) says so in its daemon log, and the runner's says why the owner refused; once the owner
 /// can write again, the log arrives whole and the job ends there.
+#[cfg(unix)]
 #[test]
 fn an_owner_that_cannot_write_a_log_says_why() {
     use std::os::unix::fs::PermissionsExt;
@@ -4882,7 +4934,7 @@ fn start_cut_short(w: &World, run_record: bool) -> (Node, Node, String) {
     let pid = b.exec.launch_of(&job).unwrap().pid;
     b.stop();
     // Nothing of it ran: no processes, and the executor finds no invocation by its name.
-    b.exec.kill_group(pid, libc::SIGKILL);
+    b.exec.kill_group(pid, SIGKILL);
     wait_until("its processes are gone", || !b.exec.alive(pid));
     b.exec
         .names
@@ -4998,7 +5050,7 @@ fn a_granted_job_the_runner_does_not_hold_is_queued_again_after_the_claim_grace(
     let granted = rec.lease.as_ref().unwrap().granted_at;
     let pid = b.exec.launch_of(&job).unwrap().pid;
     b.stop();
-    b.exec.kill_group(pid, libc::SIGKILL);
+    b.exec.kill_group(pid, SIGKILL);
     wait_until("its processes are gone", || !b.exec.alive(pid));
     forget_job(&b.paths, &job);
     b.start();
