@@ -15,12 +15,39 @@
   cgroup v1 or systemd's hybrid layout (the default on Ubuntu 20.04 and Debian 10) need
   `systemd.unified_cgroup_hierarchy=1` on the kernel command line.
 - A state directory on a filesystem that can clone files: APFS on macOS, btrfs or XFS with reflink
-  on Linux. Workspaces are copy-on-write clones; the daemon clones a test file there and refuses to
-  start if that fails. The state directory is `~/.local/state/potluck`, or `$POTLUCK_HOME`.
-- `git` 2.31 or newer. The daemon refuses to start when the first `git` on its PATH is older, or
-  when there is none.
+  on Linux, ReFS on Windows (a Dev Drive or another ReFS volume). Workspaces are copy-on-write
+  clones; the daemon clones a test file there and refuses to start if that fails. The state
+  directory is `~/.local/state/potluck`, or `$POTLUCK_HOME`.
+- Windows: Windows 10 version 1809 or newer, Windows 11, or Windows Server 2019 or newer, on x86_64
+  or arm64. The system drive is NTFS, which can't clone files, so the state directory goes on a Dev
+  Drive (Windows 11: Settings > System > Storage > Advanced storage settings > Disks & volumes >
+  Create Dev Drive) or another ReFS volume, named by `POTLUCK_HOME` as a user environment variable,
+  which the command line and the daemon's scheduled task both get. In PowerShell, then in a new
+  terminal:
+
+  ```powershell
+  [Environment]::SetEnvironmentVariable('POTLUCK_HOME', 'D:\potluck', 'User')
+  ```
+
+- `git` 2.31 or newer (on Windows, Git for Windows). The daemon refuses to start when the first
+  `git` on its PATH is older, or when there is none.
+- Windows: you signed in. The daemon's scheduled task runs in your session from when you sign in
+  until you sign out, and signing out ends the daemon and the jobs running on the machine. An
+  unattended machine needs automatic sign-in, for example with Sysinternals Autologon, which keeps
+  the password encrypted as an LSA secret.
 - In a cluster: one TCP port per machine that the other members can reach (7465 by default), and
   the same potluck version on every member.
+- In a cluster, on Windows with Windows Defender Firewall on (the default): an inbound rule for the
+  cluster port. Without one, the firewall blocks members' connections to the machine; when the
+  daemon first listens, Windows may show a Windows Security Alert on the screen, and allowing
+  potluck there needs an administrator. Add the rule in a PowerShell run as administrator:
+
+  ```powershell
+  New-NetFirewallRule -DisplayName potluck -Direction Inbound -Protocol TCP -LocalPort 7465 -Action Allow
+  ```
+
+  A rule that blocks potluck.exe (as one made by answering that alert with Cancel can) wins over
+  an allow rule.
 - In a cluster, on a Mac with the application firewall on
   (`/usr/libexec/ApplicationFirewall/socketfilterfw --getglobalstate` says `enabled`): an allow
   rule for the potluck binary. potluck's binaries are ad-hoc signed, so the firewall's automatic
@@ -94,6 +121,32 @@ uses sudo and never prompts. When no service is installed yet, it prints the nex
 `POTLUCK_RELEASES_URL` makes either download from a directory holding one release's binaries and
 `SHA256SUMS` instead of GitHub.
 
+## install.ps1 (Windows)
+
+In PowerShell (Windows PowerShell 5.1, which Windows includes, or PowerShell 7), this installs the
+latest release, or a given version:
+
+```powershell
+irm https://github.com/steelbrain/potluck/releases/latest/download/install.ps1 | iex
+& ([scriptblock]::Create((irm https://github.com/steelbrain/potluck/releases/latest/download/install.ps1))) 0.1.3
+```
+
+Setting `$env:POTLUCK_VERSION` before the first line also gives the version. `install.ps1` picks the
+x86_64 or arm64 binary for the machine (on Windows on Arm the arm64 one, also from an x64
+PowerShell), refuses a binary whose SHA-256 doesn't match the release's `SHA256SUMS`, checks that
+it runs and reports the version asked for or the latest release's tag, and installs it as
+`%USERPROFILE%\.local\bin\potluck.exe` (or `$env:POTLUCK_INSTALL_DIR\potluck.exe`; when that is a
+symlink, over the file it leads to). Windows doesn't let a running program's file be replaced, so
+a `potluck.exe` that is running is renamed aside in its directory (`.potluck.exe.old-...`) and
+removed by a later install or update once nothing runs it. When the directory isn't on your user
+PATH, it adds it and says so; with `POTLUCK_NO_MODIFY_PATH=1` it only says so. A potluck daemon
+running here restarts in place on the new binary, and `POTLUCK_NO_RESTART=1` and
+`POTLUCK_RELEASES_URL` work as for install.sh; when the scheduled task runs and no daemon answers,
+the task is restarted. The script never asks for elevation and never prompts. When no service is
+installed yet, it prints the next steps: the `POTLUCK_HOME` setting when your profile's drive
+isn't ReFS and `POTLUCK_HOME` isn't set, `potluck service install`, `potluck user init` (on the
+first machine) and `potluck pair` (on the others).
+
 ## Building from source
 
 Or build from source. Stable Rust works:
@@ -104,6 +157,8 @@ cargo install --locked --git https://github.com/steelbrain/potluck
 
 In a clone, `cargo build --release` uses the nightly pinned in `rust-toolchain.toml`, with
 `-Zthreads=8` from `.cargo/config.toml`; `RUSTFLAGS= cargo +stable build --release` uses stable.
+On Windows the build needs the Visual Studio C++ build tools, and for arm64 also clang (ring
+builds its assembly with it).
 The crate isn't on crates.io yet (`publish = false` in `Cargo.toml`).
 
 ## The machine's name
@@ -118,8 +173,15 @@ hostname. The daemon refuses to start under a name it didn't start with, and say
 Then run the daemon as a service with `potluck service install`. On Linux it writes and starts the
 systemd user unit `~/.config/systemd/user/potluck.service`; on macOS the LaunchAgent
 `~/Library/LaunchAgents/potluck.daemon.plist`, with `AbandonProcessGroup` so that stopping the
-daemon doesn't stop its jobs. The service runs the executable you ran `service install` with,
-symlinks resolved, and gets `POTLUCK_HOME` and `POTLUCK_CONFIG` if they are set. Before it writes
+daemon doesn't stop its jobs. On Windows it registers the Task Scheduler task `potluck`, which
+runs the daemon in your session from when you sign in (with your sign-in's token: no stored
+password, no elevation), with no time limit, on battery too, at normal priority, and set to
+restart a minute after a failure. It starts the task at once when you are signed in; otherwise it
+says the daemon starts when you sign in. The task is hidden in Task Scheduler unless View > Show
+Hidden Tasks is on; `schtasks /query /tn potluck /v` shows it, and
+`%USERPROFILE%\.config\potluck\potluck.task.xml` is a copy of its definition. The service runs
+the executable you ran `service install` with, symlinks resolved, and gets `POTLUCK_HOME` and
+`POTLUCK_CONFIG` if they are set. Before it writes
 anything, `service install` checks what the daemon would refuse to start without: a node config that
 parses with values in bounds and a `listen` that is an IP address, a usable node name that matches
 the one the machine started with, lingering and a user manager that answers on Linux, and a state
