@@ -2608,10 +2608,11 @@ fn a_member_trying_its_port_again_keeps_its_members_up() {
     let _blocker = std::net::TcpListener::bind(("127.0.0.1", a.port)).unwrap();
     a.start();
     wait_until("a hears from b", || a.node_alive("b"));
-    // Past the tries at 1 s and 3 s.
+    // Past the tries at 1 s and 3 s, with a dispatch every so often meanwhile (on a busy machine,
+    // where a command line takes a second or more, through more tries).
     let start = Instant::now();
     let mut dispatched = 0;
-    while start.elapsed() < Duration::from_millis(4_500) {
+    while start.elapsed() < Duration::from_millis(4_500) || dispatched <= 10 {
         let o = a.cli(&[
             "dispatch",
             "--timeout",
@@ -2624,7 +2625,6 @@ fn a_member_trying_its_port_again_keeps_its_members_up() {
         assert_eq!(o.code, 0, "after {:?}: {}", start.elapsed(), o.json);
         dispatched += 1;
     }
-    assert!(dispatched > 10, "{dispatched}");
     let log = a.daemon_log();
     assert_eq!(log.matches("can't listen for members").count(), 1, "{log}");
 }
@@ -4146,19 +4146,36 @@ fn a_dispatch_for_an_updating_member_ends_lost_after_the_window() {
     pair(&a, &b);
     let first = a.dispatch(&["--gpu", "any", "--", "sleep", "60"]);
     let ws = a.running_on(&first, "b").workspace.unwrap();
+    // Dispatched straight to a's socket, signed as a's command line signs them: a command line
+    // (which runs git to find what it dispatches) took longer than the window on a busy machine.
+    let sent = sent_spec(&a, &first);
+    let key = user_key(&a);
+    let send = |change: &dyn Fn(&mut potluck::types::JobSpec)| {
+        let mut spec = potluck::types::JobSpec {
+            auth: None,
+            cmd: vec!["true".into()],
+            ..sent.clone()
+        };
+        change(&mut spec);
+        dispatched(&a, potluck::jobauth::sign(&spec, &key, now_ms())).unwrap()
+    };
     b.stop();
     b.version = "0.1.1".into();
     b.start();
     wait_until("a hears b on 0.1.1", || {
-        a.cli_ok(&["nodes"])["nodes"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|n| n["facts"]["node"] == "b" && n["updating"] == true)
+        match a.client().call(Request::Nodes) {
+            Ok(Response::Nodes { nodes }) => {
+                nodes.iter().any(|n| n.facts.node == "b" && n.updating)
+            }
+            _ => false,
+        }
     });
     let since = Instant::now();
-    let j = a.dispatch(&["--gpu", "any", "--", "true"]);
-    let k = a.dispatch(&["--workspace", &ws, "--", "true"]);
+    let j = send(&|_| {});
+    let k = send(&|s| {
+        s.request.gpus.clear();
+        s.workspace = Some(ws.clone());
+    });
     for (job, why) in [
         (
             &j,
@@ -4707,7 +4724,16 @@ fn a_workspace_pinned_by_an_away_owners_job_stays_pending() {
     let mut a = w.node("a").start();
     let b = w.node("b").gpu().start();
     pair(&a, &b);
-    let first = a.dispatch(&["--gpu", "any", "--", "sleep", "2"]);
+    // It runs until the test lets it end, once a is away: one that ends by the clock may end
+    // before the second is queued on a busy machine.
+    let first = a.dispatch(&[
+        "--gpu",
+        "any",
+        "--",
+        "sh",
+        "-c",
+        "while [ ! -e \"$TMPDIR/go\" ]; do sleep 0.05; done",
+    ]);
     let ws = a.running_on(&first, "b").workspace.unwrap();
     let second = a.dispatch(&["--workspace", &ws, "--", "true"]);
     let pending = |n: &Node| -> u64 {
@@ -4722,6 +4748,7 @@ fn a_workspace_pinned_by_an_away_owners_job_stays_pending() {
     wait_until("b counts a's queued job", || pending(&b) == 2);
     a.stop();
     wait_until("b sees a down", || !b.node_alive("a"));
+    std::fs::write(b.paths.workspace_tmp(&ws).join("go"), "").unwrap();
     wait_until("the first job is over on b", || pending(&b) <= 1);
     std::thread::sleep(Duration::from_millis(500));
     assert_eq!(pending(&b), 1, "{}", b.daemon_log());
@@ -4908,14 +4935,17 @@ fn exclusive_across_machines() {
     wait_until("b sees c", || b.node_alive("c"));
     let busy = a.dispatch(&["--on", "node=b", "--ram", "1", "--", "sleep", "60"]);
     a.running_on(&busy, "b");
+    // It runs until the test lets it end: one that ends by the clock may end before the jobs
+    // behind it are queued on a busy machine.
     let excl = a.dispatch(&[
         "--on",
         "node=b",
         "--exclusive",
         "--hold-line",
         "--",
-        "sleep",
-        "3",
+        "sh",
+        "-c",
+        "while [ ! -e \"$TMPDIR/go\" ]; do sleep 0.05; done",
     ]);
     let others: Vec<String> = (0..3)
         .map(|_| a.dispatch(&["--on", "cpu_model=fast", "--ram", "1", "--", "sleep", "1"]))
@@ -4925,7 +4955,7 @@ fn exclusive_across_machines() {
     }
     assert_eq!(a.get(&excl).state, JobState::Queued);
     a.cli_ok(&["cancel", &busy]);
-    a.running_on(&excl, "b");
+    let excl_ws = a.running_on(&excl, "b").workspace.unwrap();
     let only_b = a.dispatch(&["--on", "node=b", "--ram", "1", "--", "true"]);
     let either = a.dispatch(&["--on", "cpu_model=fast", "--ram", "1", "--", "true"]);
     let mut lines = String::new();
@@ -4936,6 +4966,7 @@ fn exclusive_across_machines() {
         ))
     });
     assert_eq!(a.done(&either).node.as_deref(), Some("c"));
+    std::fs::write(b.paths.workspace_tmp(&excl_ws).join("go"), "").unwrap();
     let x = a.done(&excl);
     assert_eq!(x.state, JobState::Succeeded, "{x:#?}");
     let after = a.done(&only_b);
@@ -5874,7 +5905,16 @@ fn a_workspace_is_kept_only_by_its_owners_report_of_a_job_pinned_to_it() {
     wait_until("b and c see each other", || {
         b.node_alive("c") && c.node_alive("b")
     });
-    let first = a.dispatch(&["--gpu", "any", "--", "sleep", "2"]);
+    // It runs until the test lets it end: one that ends by the clock may end before the second
+    // is queued on a busy machine.
+    let first = a.dispatch(&[
+        "--gpu",
+        "any",
+        "--",
+        "sh",
+        "-c",
+        "while [ ! -e \"$TMPDIR/go\" ]; do sleep 0.05; done",
+    ]);
     let ws = a.running_on(&first, "b").workspace.unwrap();
     let second = a.dispatch(&["--workspace", &ws, "--", "true"]);
     let pending = |n: &Node| -> u64 {
@@ -5890,6 +5930,7 @@ fn a_workspace_is_kept_only_by_its_owners_report_of_a_job_pinned_to_it() {
     let pinned = entry_of(&report_to(&b, "a"), "queue", &second);
     let mut report = report_to(&b, "c");
     a.cli_ok(&["cancel", &second]);
+    std::fs::write(b.paths.workspace_tmp(&ws).join("go"), "").unwrap();
     wait_until("b counts nothing", || pending(&b) == 0);
     // c's next report, as c could make it: a's job in c's queue.
     c.stop();
