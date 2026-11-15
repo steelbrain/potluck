@@ -2498,7 +2498,9 @@ fn nested_dispatch_gives_the_whole_group_its_grace() {
         exclusive: false,
     };
     let fake = lease_daemon(true, grant);
-    std::fs::write(fake.home().join("node.toml"), "kill_grace_s = 5\n").unwrap();
+    // A grace far longer than a busy machine takes to start the command line, so an end at the
+    // stop and one at the grace's end can't be mistaken for each other.
+    std::fs::write(fake.home().join("node.toml"), "kill_grace_s = 30\n").unwrap();
     let cwd = tempfile::tempdir().unwrap();
     let marker = cwd.path().join("cleaned");
     // A child in the background takes the stop (TERM) and cleans up. On Windows the stop is
@@ -2510,7 +2512,7 @@ fn nested_dispatch_gives_the_whole_group_its_grace() {
         sh_path(&marker)
     );
     let cmd: &[&str] = if cfg!(windows) {
-        &["ping", "-n", "30", "127.0.0.1"]
+        &["ping", "-n", "60", "127.0.0.1"]
     } else {
         &["sh", "-c", &script]
     };
@@ -2524,7 +2526,7 @@ fn nested_dispatch_gives_the_whole_group_its_grace() {
     }
     let took = started.elapsed();
     assert!(
-        took < std::time::Duration::from_secs(5),
+        took < std::time::Duration::from_secs(20),
         "it ended when the group did, not at the end of the grace: {took:?}"
     );
 }
