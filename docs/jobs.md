@@ -7,7 +7,11 @@ The command runs in the workspace's root as an argument list, not through a shel
 `-- sh -c '...'` for shell syntax. On Windows a program gets its arguments quoted as the C
 runtime reads them, except cmd: in `-- cmd /c LINE` (or `/k`, after any other switches) cmd gets
 LINE as if typed after `/c`, quotes included. Several arguments after `/c` are joined by spaces,
-each holding a space and no quote put in quotes. Only committed work runs:
+each holding a space and no quote put in quotes. Programs built on MSYS2 or Cygwin, such as Git for
+Windows' `sh` and MSYS2's `bash`, read their command line their own way: an argument holding `"`, `'`
+or `\` can reach them changed, and one holding a space is cut after about 8190 characters, so a
+longer `sh -c` script runs only in part. Commit a longer script and run its file.
+Only committed work runs:
 
 ```console
 $ potluck dispatch --timeout 10m -- cargo test

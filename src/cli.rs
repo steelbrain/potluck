@@ -4,7 +4,7 @@
 use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 
-/// A build and test cluster for a handful of Linux and macOS machines.
+/// A build and test cluster for a handful of Linux, macOS and Windows machines.
 ///
 /// Every command takes --json and none prompts. A job keeps running when its client exits.
 ///
