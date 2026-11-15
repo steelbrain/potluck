@@ -318,3 +318,38 @@ pub fn process_info(pids: &[u32]) -> io::Result<Vec<ProcessInfo>> {
     found.sort_by_key(|p| pids.iter().position(|&q| q == p.pid));
     Ok(found)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows_sys::Win32::System::SystemServices::JOB_OBJECT_QUERY;
+
+    /// A job object opens by its name while a handle to it is open, and is `None` once none is.
+    #[test]
+    fn a_job_object_is_found_by_name_until_its_last_handle_closes() {
+        let name = format!(
+            "Local\\potluck-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let limits = Limits {
+            mem_max_bytes: 0,
+            cpu_weight: 100,
+            tasks_max: 0,
+            kill_grace_ms: 0,
+            log_max_bytes: 0,
+        };
+        let job = create(&name, &limits).unwrap();
+        assert!(open(&name, JOB_OBJECT_QUERY).unwrap().is_some());
+        drop(job);
+        assert!(open(&name, JOB_OBJECT_QUERY).unwrap().is_none());
+        assert!(
+            open(&format!("{name}-never"), JOB_OBJECT_QUERY)
+                .unwrap()
+                .is_none()
+        );
+    }
+}
