@@ -21,7 +21,7 @@ or install.ps1. Running jobs survive any daemon restart:
 the new daemon finds them again, and after a plain restart `wait` and `logs` connect to it again.
 A daemon still running after its binary was replaced (with `POTLUCK_NO_RESTART=1`, or by a package
 manager) starts each job's supervisor and git's tunnel from a copy of the binary it started from,
-`bin/potluck` in the state directory, not from the new one.
+`bin/potluck` in the state directory (`bin\potluck.exe` on Windows), not from the new one.
 
 On a Mac, a new binary may have to be allowed again before the daemon can reach members: Local
 Network access is asked for on the Mac's screen, and on a Mac with the application firewall on,
@@ -52,3 +52,14 @@ restart asked by another potluck binary than the daemon's, while the one at the 
 still the binary it runs, would run that one again unchanged: the daemon refuses it, names both
 binaries, and serves on as it was (`potluck restart` exits 2, and install.sh and `self-update
 --here` fail with that).
+
+On Windows a running process can't switch to another binary, so `potluck daemon` there is a small
+keeper that runs the daemon as its child process. A restart goes as above up to the hand-over:
+the daemon checks the new binary, waits for work already going, and writes down everything it
+holds. Then it exits, and the keeper starts the binary at its path at once, as a new process. The
+keeper's process stays, so Task Scheduler sees no restart. Running jobs keep running and queued
+jobs stay queued: the new daemon finds them again, as after any restart. Open connections close
+instead of being handed over: `wait` and `logs -f` connect again and go on, commands run
+meanwhile wait for the new daemon, and the other members connect again. `potluck restart` exits 0
+once the new daemon answers, and names the version it answers as. The keeper runs the code it
+started with until its task is started again.

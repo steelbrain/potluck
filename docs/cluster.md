@@ -81,11 +81,12 @@ potluck: made a user key at /Users/anees/.config/potluck/user.key
 ```
 
 The user key is an ed25519 key in the file `$POTLUCK_USER_KEY`, else `user.key` beside the command
-line's `node.toml`, with mode 0600. Only the command line reads it; the daemon never does. The
-first user's admission is signed by the user key and co-signed by this machine's machine key, and
-the user key signs every member in again, in one batch with it, so no member drops out. On a
-machine in no cluster, `user init` founds one with that machine as its only member. Once the
-cluster has users, `user init` refuses and names them; `potluck user add NAME KEY` adds another.
+line's `node.toml`, with mode 0600 (on Windows, an access list for its user alone). Only the
+command line reads it; the daemon never does. The first user's admission is signed by the user key
+and co-signed by this machine's machine key, and the user key signs every member in again, in one
+batch with it, so no member drops out. On a machine in no cluster, `user init` founds one with that
+machine as its only member. Once the cluster has users, `user init` refuses and names them;
+`potluck user add NAME KEY` adds another.
 
 From then on:
 

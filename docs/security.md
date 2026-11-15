@@ -104,5 +104,10 @@ tailnet addresses. For a machine whose root you don't trust, keep that ACL.
   with mode 0600. The daemon answers its own command line without a user's signature: the socket
   is the user's. It keeps the state directory at mode 0700: it holds job specs with their `--env`
   values, logs, mirrors and workspaces.
+- Windows has no file modes. There the socket is an AF_UNIX socket, and at every start the daemon
+  gives the state directory an access list that lets only its user in, with nothing inherited
+  from the folder above it (Administrators and SYSTEM are left out too). The socket, the machine
+  key and everything else in the directory inherit that list, so only that user can connect to
+  the daemon. Key files potluck writes elsewhere (`user.key`) get the same list for themselves.
 - Workspaces, mirrors, logs and kept files are plain files on disk. Release downloads are checked
   against the release's `SHA256SUMS`, which catches a corrupted download but not a tampered release.
