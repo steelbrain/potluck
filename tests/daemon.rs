@@ -1277,11 +1277,15 @@ fn without_users_no_dispatch_is_taken() {
     let key = potluck::mesh::user::UserKey::load_or_create(&f.user_key())
         .unwrap()
         .0;
+    // On Windows the job asks for Windows: a Windows machine runs only jobs that do.
     let signed = |s: JobSpec| {
-        let s = JobSpec {
+        let mut s = JobSpec {
             submitted_from: "testnode".into(),
             ..s
         };
+        if cfg!(windows) {
+            s.on.insert("windows".into(), String::new());
+        }
         potluck::jobauth::sign(&s, &key, now_ms())
     };
     assert_eq!(call(signed(spec("true"))), refused);
@@ -1310,8 +1314,14 @@ fn dispatch_refuses_what_cannot_run() {
     let mut s = spec("true");
     s.on.insert("os".into(), "plan9".into());
     let e = call(s);
+    // A Windows machine declines a job that names another OS, whatever else it asks for.
+    let why = if cfg!(windows) {
+        "runs only jobs that ask for --on windows"
+    } else {
+        "os=plan9"
+    };
     assert!(
-        e.contains("no machine could ever run") && e.contains("os=plan9"),
+        e.contains("no machine could ever run") && e.contains(why),
         "{e}"
     );
     let mut s = spec("true");
@@ -1905,11 +1915,11 @@ fn stalls_are_sampled_and_ended_only_when_asked() {
     let quiet = f.dispatch(spec("echo started; sleep 30"));
     let j = f.wait_for(&quiet, "stalled", |j| j.stalled);
     assert_eq!(j.state, JobState::Running);
-    let log = f.log(&quiet);
-    assert!(
-        log.contains("under 1% CPU and no output") && log.contains("fake stacks of"),
-        "{log}"
-    );
+    // Its stacks are written into its log after it is marked stalled.
+    wait_until("its stacks are in the log", || {
+        let log = f.log(&quiet);
+        log.contains("under 1% CPU and no output") && log.contains("fake stacks of")
+    });
     std::thread::sleep(Duration::from_millis(2_000));
     let j = f.get(&quiet);
     assert_eq!(j.state, JobState::Running, "only marked");
@@ -2014,6 +2024,12 @@ fn output_past_the_log_limit_is_still_output() {
         .unwrap();
     let j = f.wait(&job);
     assert_eq!(j.state, JobState::Cancelled);
+    // On Windows the fake executor can't ask the supervisor to stop (the real one sets an event,
+    // tests/windows_exec.rs): the supervisor ignores the CTRL_BREAK it sends, and the kill after
+    // the grace drops the tail it held.
+    if cfg!(windows) {
+        return;
+    }
     // SIGTERM reached the supervisor: the tail of what was dropped is in the log.
     let log = f.log(&job);
     assert!(
@@ -2045,8 +2061,10 @@ fn a_trickle_of_cpu_time_is_a_stall() {
     let polling = f.dispatch(spec("echo started; sleep 30"));
     let j = f.wait_for(&polling, "stalled", |j| j.stalled);
     assert!(j.usage.cpu_ms > 0);
-    let log = f.log(&polling);
-    assert!(log.contains("under 1% CPU and no output for"), "{log}");
+    // Its stacks are written into its log after it is marked stalled.
+    wait_until("its stacks are in the log", || {
+        f.log(&polling).contains("under 1% CPU and no output for")
+    });
     f.client()
         .call(Request::Cancel {
             job: polling.clone(),
@@ -2263,7 +2281,7 @@ fn a_facts_refresh_keeps_the_machines_name() {
                 Ok(detected)
             }
         }),
-        login_env: BTreeMap::new(),
+        login_env: f.login_env.clone(),
         clock: f.clock.clone(),
     };
     f.launch(parts);
@@ -3763,8 +3781,10 @@ fn idle_connections_are_let_go() {
     let e = quiet.call(Request::Ping).unwrap_err();
     assert!(potluck::client::is_disconnected(&e), "{e:#}");
 
-    // One that asks for 3 MB of output and takes none of it: the daemon stops writing after the
-    // idle limit, so the reader gets part of it and then the end.
+    // One that asks twice for 3 MB of output and takes none of it: the daemon stops writing
+    // after the idle limit, so the reader gets part of the answers and then the end. (Windows
+    // takes one write into the socket's buffer whole, however large, so there the first answer
+    // is written at once, and the daemon is stuck at the second.)
     let id = f.dispatch(spec("head -c 3000000 /dev/zero | tr '\\0' x"));
     assert_eq!(f.wait(&id).exit_code, Some(0));
     let mut stuck = UnixStream::connect(f.paths.socket()).unwrap();
@@ -3779,9 +3799,10 @@ fn idle_connections_are_let_go() {
         auth: None,
     };
     potluck::proto::write_msg(&mut stuck, &req).unwrap();
+    potluck::proto::write_msg(&mut stuck, &req).unwrap();
     std::thread::sleep(Duration::from_millis(1500));
     let got = read_until_closed(&mut stuck, Duration::from_secs(5));
-    assert!(got < 3_000_000, "{got} bytes");
+    assert!(got < 6_000_000, "{got} bytes");
 
     // Those that keep asking are served as before.
     let mut c = f.client();
