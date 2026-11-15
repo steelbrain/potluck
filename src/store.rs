@@ -566,7 +566,9 @@ mod tests {
     }
 
     /// The WAL index is kept in memory, not in a memory-mapped `-shm` file: on a full btrfs a
-    /// write to that mapping killed the daemon with SIGBUS.
+    /// write to that mapping killed the daemon with SIGBUS. (Windows keeps the `-shm` file, whose
+    /// space it allocates when SQLite sizes it.)
+    #[cfg(unix)]
     #[test]
     fn no_shared_memory_file_is_mapped() {
         let dir = tempfile::tempdir().unwrap();
