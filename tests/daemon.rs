@@ -778,10 +778,20 @@ impl Fixture {
         let key = potluck::mesh::user::UserKey::load(&self.user_key())
             .unwrap()
             .expect("the user's key");
-        let spec = JobSpec {
+        #[cfg_attr(not(windows), allow(unused_mut))]
+        let mut spec = JobSpec {
             submitted_from: node,
             ..spec
         };
+        // On Windows a job that names no system asks for Windows: a Windows machine runs only
+        // jobs that do.
+        #[cfg(windows)]
+        if !["os", "linux", "macos", "windows"]
+            .iter()
+            .any(|k| spec.on.contains_key(*k))
+        {
+            spec.on.insert("windows".into(), String::new());
+        }
         potluck::jobauth::sign(&spec, &key, now_ms())
     }
 

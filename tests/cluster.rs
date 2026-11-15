@@ -846,7 +846,16 @@ impl Node {
 
     /// The CLI run in repository `dir`, its user key the file `user_key` ($POTLUCK_USER_KEY), or
     /// with None user.key beside this node's node.toml ([`Node::key_file`]).
+    /// On Windows a dispatch that names no system asks for Windows (`--on windows`): a Windows
+    /// machine runs only jobs that do.
     fn cli_keyed(&self, dir: &Path, user_key: Option<&Path>, args: &[&str]) -> Out {
+        #[cfg(windows)]
+        let args = &match args.split_first() {
+            Some((&"dispatch", rest)) if !names_a_system(rest) => {
+                [&["dispatch", "--on", "windows"][..], rest].concat()
+            }
+            _ => args.to_vec(),
+        }[..];
         let mut cmd = Command::new(BIN);
         cmd.arg("--json")
             .args(args)
@@ -7886,4 +7895,15 @@ fn with_users_a_resized_job_is_signed_and_its_runner_runs_it() {
     assert!(output_of(&a, &job).contains("on b"));
     assert!(!b.daemon_log().contains("WARNING"), "{}", b.daemon_log());
     a.cli_ok(&["cancel", &busy]);
+}
+
+/// Whether dispatch arguments ask for a system (`--on linux`, `--on os=macos`, ...).
+#[cfg(windows)]
+fn names_a_system(args: &[&str]) -> bool {
+    args.windows(2).any(|w| {
+        w[0] == "--on"
+            && ["os", "linux", "macos", "windows"]
+                .iter()
+                .any(|k| w[1] == *k || w[1].starts_with(&format!("{k}=")))
+    })
 }
