@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Windows: Windows 10 1809 or newer, Windows 11 and Windows Server 2019 or newer, x86_64 and arm64.
+  A Windows machine runs only jobs that ask for Windows (`--on windows`, `--on windows=11`,
+  `--on os=windows`), so jobs without an OS keep running on Linux and macOS. See
+  [Jobs](docs/jobs.md#where-it-runs).
+- On Windows each job runs in a job object of its own: its RAM is the job object's commit limit,
+  it may have at most its process limit, and at its run limit or on `cancel` its command gets
+  CTRL_BREAK, then the job object is ended.
+- On Windows, workspaces are block clones on a Dev Drive or another ReFS volume, so `POTLUCK_HOME`
+  must be on one; jobs start from the user's environment as a new sign-in gets it.
+- On Windows, `potluck service install` registers the Task Scheduler task `potluck`, which runs the
+  daemon at your sign-in, in your session.
+- On Windows, `potluck restart` starts the daemon again as a new process: running and queued jobs
+  keep going, open connections close and clients connect again.
+- Windows release binaries (`potluck-x86_64-pc-windows-msvc.exe`,
+  `potluck-aarch64-pc-windows-msvc.exe`) and `install.ps1`; `potluck self-update` and `install.ps1`
+  rename a running `potluck.exe` aside and move the new one in.
+
 ## 0.1.2 (2026-11-05)
 
 ### Added

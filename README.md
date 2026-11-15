@@ -1,7 +1,7 @@
 # potluck
 
-potluck runs build and test jobs on a handful of Linux and macOS machines owned by one person or
-team. Every machine runs the same daemon, and the daemons talk to each other directly. You
+potluck runs build and test jobs on a handful of Linux, macOS and Windows machines owned by one
+person or team. Every machine runs the same daemon, and the daemons talk to each other directly. You
 dispatch a command from a git repository with the resources it needs. A machine that has those
 resources free runs it at the dispatched commit, and the output comes back to the machine you
 dispatched from.
@@ -36,7 +36,7 @@ mirror of each repository on every machine. The rest belongs to the projects tha
 - Linux: the systemd user manager, with lingering enabled for your user
   (`sudo loginctl enable-linger $USER`), and cgroup v2 with the memory and pids controllers.
 - A state directory on a filesystem that can clone files: APFS on macOS, btrfs or XFS with reflink
-  on Linux.
+  on Linux, a Dev Drive or another ReFS volume on Windows (set `POTLUCK_HOME` to a directory there).
 - `git` 2.31 or newer.
 - In a cluster: one TCP port per machine that the other members can reach (7465 by default), and
   the same potluck version on every member.
@@ -53,6 +53,12 @@ curl -fsSL https://github.com/steelbrain/potluck/releases/latest/download/instal
 curl -fsSL https://github.com/steelbrain/potluck/releases/latest/download/install.sh | sh -s -- 0.1.2
 ```
 
+On Windows, in PowerShell:
+
+```powershell
+irm https://github.com/steelbrain/potluck/releases/latest/download/install.ps1 | iex
+```
+
 `install.sh` checks the binary against the release's `SHA256SUMS`, installs it as
 `~/.local/bin/potluck`, and restarts a potluck daemon running here in place on the new binary. It
 never uses sudo and never prompts.
@@ -63,7 +69,8 @@ Until then, build from source. Stable Rust works:
 cargo install --locked --git https://github.com/steelbrain/potluck
 ```
 
-Then run the daemon as a service, a systemd user unit on Linux or a LaunchAgent on macOS:
+Then run the daemon as a service, a systemd user unit on Linux, a LaunchAgent on macOS or a scheduled
+task on Windows:
 
 ```sh
 potluck service install
