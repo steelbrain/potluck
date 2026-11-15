@@ -7,7 +7,13 @@
 //! no daemon answers or the one that does is too old to know the request. Running jobs survive
 //! either.
 //!
-//! Releases are plain binaries named `potluck-<target>` plus `SHA256SUMS` (`sha256sum` format), on
+//! Windows can't replace or delete a running `.exe`, but can rename it: the old binary is renamed
+//! aside in its directory (`.potluck.exe.old-<pid>-<nanos>`), and the new one moved to its name; if
+//! that fails, the old one is moved back, so the path always holds a binary. A binary renamed aside
+//! is removed at once when nothing runs it, otherwise by a later update ([`remove_leftovers`]).
+//!
+//! Releases are plain binaries named `potluck-<target>` (`.exe` on Windows) plus `SHA256SUMS`
+//! (`sha256sum` format), on
 //! GitHub at `https://github.com/<GITHUB_REPO>/releases/download/v<version>/<file>`. "Latest" is
 //! first resolved to its tag (`.../releases/latest` redirects to `.../releases/tag/v<version>`), so
 //! the binary and `SHA256SUMS` come from one release even if another is published meanwhile.
@@ -27,7 +33,6 @@ use anyhow::{Context, Result, anyhow, bail};
 use std::cmp::Ordering;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -239,14 +244,17 @@ pub fn asset_for(os: &str, arch: &str) -> Option<&'static str> {
         ("macos", "x86_64") => "potluck-x86_64-apple-darwin",
         ("linux", "x86_64") => "potluck-x86_64-unknown-linux-musl",
         ("linux", "aarch64") => "potluck-aarch64-unknown-linux-musl",
+        ("windows", "x86_64") => "potluck-x86_64-pc-windows-msvc.exe",
+        ("windows", "aarch64") => "potluck-aarch64-pc-windows-msvc.exe",
         _ => return None,
     })
 }
 
 /// The architecture to install for: the one this binary was built for, except that an x86_64
-/// binary translated by Rosetta on Apple silicon gets the native arm64 binary, as install.sh does.
+/// binary translated on an arm64 machine (by Rosetta on Apple silicon, by Windows' x64 emulation
+/// on Arm) gets the native arm64 binary, as install.sh and install.ps1 do.
 fn host_arch(os: &str, arch: &'static str, translated: bool) -> &'static str {
-    if os == "macos" && arch == "x86_64" && translated {
+    if matches!(os, "macos" | "windows") && arch == "x86_64" && translated {
         "aarch64"
     } else {
         arch
@@ -256,7 +264,7 @@ fn host_arch(os: &str, arch: &'static str, translated: bool) -> &'static str {
 /// The release binary for this machine.
 pub fn asset_name() -> Result<&'static str> {
     let os = std::env::consts::OS;
-    let arch = host_arch(os, std::env::consts::ARCH, rosetta_translated());
+    let arch = host_arch(os, std::env::consts::ARCH, translated());
     asset_for(os, arch).ok_or_else(|| {
         anyhow!("potluck publishes no release binary for {os} on {arch}; build it with cargo")
     })
@@ -282,9 +290,27 @@ fn rosetta_translated() -> bool {
 }
 
 /// Only macOS has Rosetta.
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 fn rosetta_translated() -> bool {
     false
+}
+
+/// Whether this process runs translated on an arm64 machine: under Rosetta on macOS, under x64
+/// emulation on Windows on Arm (whose native machine `IsWow64Process2` reports as arm64).
+fn translated() -> bool {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::SystemInformation::IMAGE_FILE_MACHINE_ARM64;
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, IsWow64Process2};
+        let (mut process, mut native) = (0u16, 0u16);
+        // SAFETY: the pseudo handle of this process, and two u16s the call fills.
+        let ok = unsafe { IsWow64Process2(GetCurrentProcess(), &mut process, &mut native) } != 0;
+        ok && native == IMAGE_FILE_MACHINE_ARM64
+    }
+    #[cfg(not(windows))]
+    {
+        rosetta_translated()
+    }
 }
 
 /// `v0.2.0` or `0.2.0` to `0.2.0`; refuses anything that isn't a plain version string.
@@ -477,6 +503,8 @@ fn below_floor(plan: &Plan, new: &str, floor: Option<&str>) -> Result<Option<Str
 fn update_with(plan: &Plan, restart: Option<&dyn Fn() -> Result<Restart>>) -> Result<String> {
     let asset = asset_name()?;
     let target = resolve_target(plan.target)?;
+    #[cfg(windows)]
+    remove_leftovers(&target);
     let old_version = binary_version(&target).ok();
     // Toward the latest release, never below what is on disk or running here.
     let floor = highest([Some(crate::VERSION), plan.daemon, old_version.as_deref()]);
@@ -602,7 +630,7 @@ pub fn running_binary() -> Result<PathBuf> {
 
 /// `target` with symlinks resolved; it must be a regular file.
 fn resolve_target(target: &Path) -> Result<PathBuf> {
-    let real = fs::canonicalize(target)
+    let real = crate::sys::canonicalize(target)
         .with_context(|| format!("finding the binary to replace, {}", target.display()))?;
     let meta = fs::metadata(&real).with_context(|| real.display().to_string())?;
     if !meta.is_file() {
@@ -736,15 +764,20 @@ pub(crate) fn binary_version(path: &Path) -> Result<String> {
 
 /// Spawns `cmd`, retrying while the file is busy: another thread forking while a freshly written
 /// file was still open for writing leaves a copy of that descriptor in its child until the child
-/// execs, and exec then fails with ETXTBSY.
+/// execs, and exec then fails with ETXTBSY. On Windows a new file can be open for a moment in a
+/// virus scanner, and starting it fails with a sharing violation.
 fn spawn_retrying(cmd: &mut Command) -> std::io::Result<std::process::Child> {
+    #[cfg(unix)]
+    const BUSY: i32 = libc::ETXTBSY;
+    #[cfg(windows)]
+    const BUSY: i32 = windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION as i32;
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
     let mut tries = 0;
     loop {
         match cmd.spawn() {
-            Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) && tries < 50 => {
+            Err(e) if e.raw_os_error() == Some(BUSY) && tries < 50 => {
                 tries += 1;
                 std::thread::sleep(Duration::from_millis(20));
             }
@@ -760,6 +793,15 @@ struct Staged {
     done: bool,
 }
 
+/// `<pid>-<nanoseconds>`, for a file name no other update uses.
+fn unique() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    format!("{}-{nanos}", std::process::id())
+}
+
 impl Staged {
     fn write(target: &Path, data: &[u8]) -> Result<Staged> {
         let dir = target
@@ -769,15 +811,15 @@ impl Staged {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "potluck".into());
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.subsec_nanos())
-            .unwrap_or(0);
-        let path = dir.join(format!(".{name}.update-{}-{nanos}", std::process::id()));
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o700)
+        // Windows runs only a file named .exe from a command line without its extension; keep
+        // the new binary one, as it is.
+        let path = dir.join(format!(
+            ".{name}.update-{}{}",
+            unique(),
+            crate::sys::EXE_SUFFIX
+        ));
+        let mut opts = OpenOptions::new();
+        let mut file = crate::sys::file_mode(opts.write(true).create_new(true), 0o700)
             .open(&path)
             .with_context(|| {
                 format!(
@@ -789,7 +831,11 @@ impl Staged {
         let staged = Staged { path, done: false };
         let written = (|| -> std::io::Result<()> {
             file.write_all(data)?;
-            file.set_permissions(fs::Permissions::from_mode(0o755))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                file.set_permissions(fs::Permissions::from_mode(0o755))?;
+            }
             clear_quarantine(&staged.path)?;
             file.sync_all()
         })();
@@ -798,6 +844,7 @@ impl Staged {
         Ok(staged)
     }
 
+    #[cfg(unix)]
     fn rename_over(mut self, target: &Path) -> Result<()> {
         fs::rename(&self.path, target).with_context(|| {
             format!("renaming {} over {}", self.path.display(), target.display())
@@ -809,6 +856,100 @@ impl Staged {
                 .with_context(|| format!("syncing {}", dir.display()))?;
         }
         Ok(())
+    }
+
+    /// Windows: renames the target aside and moves the new binary to its name ([`swap_in`]).
+    #[cfg(windows)]
+    fn rename_over(mut self, target: &Path) -> Result<()> {
+        swap_in(&self.path, target)?;
+        self.done = true;
+        Ok(())
+    }
+}
+
+/// The name prefix of a binary renamed aside by an update (Windows), in its directory:
+/// `.<name>.old-`.
+fn leftover_prefix(target: &Path) -> String {
+    let name = target
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    format!(".{name}.old-")
+}
+
+/// Moves `new` to `target`'s name, renaming the binary at `target` aside first: Windows can't
+/// replace or delete a running program's file, but can rename it. If `new` can't be moved in, the
+/// old binary goes back to its name. The binary renamed aside is removed at once when nothing runs
+/// it; otherwise it stays until a later update ([`remove_leftovers`]). Returns where it was put
+/// while it stays.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn swap_in(new: &Path, target: &Path) -> Result<Option<PathBuf>> {
+    let aside = target.with_file_name(format!("{}{}", leftover_prefix(target), unique()));
+    let had = target.exists();
+    if had {
+        fs::rename(target, &aside).with_context(|| {
+            format!(
+                "renaming {} aside to {} to make room for the new binary",
+                target.display(),
+                aside.display()
+            )
+        })?;
+    }
+    if let Err(e) = move_durably(new, target) {
+        let why = format!("moving {} to {}: {e}", new.display(), target.display());
+        if !had {
+            bail!(why);
+        }
+        match fs::rename(&aside, target) {
+            Ok(()) => bail!("{why}; the old binary was put back"),
+            Err(back) => bail!(
+                "{why}; moving the old binary back failed too ({back}): it is {}; rename it to {}",
+                aside.display(),
+                target.display()
+            ),
+        }
+    }
+    if had && fs::remove_file(&aside).is_err() {
+        return Ok(Some(aside));
+    }
+    Ok(None)
+}
+
+/// `fs::rename`, and on Windows written through to the disk before it returns (as the Unix update
+/// syncs the directory).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn move_durably(from: &Path, to: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        use crate::sys::win::wide;
+        use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};
+        let (f, t) = (wide(from), wide(to));
+        // SAFETY: both are NUL-terminated paths.
+        if unsafe { MoveFileExW(f.as_ptr(), t.as_ptr(), MOVEFILE_WRITE_THROUGH) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        fs::rename(from, to)
+    }
+}
+
+/// Removes the binaries an update renamed aside beside `binary` (`.potluck.exe.old-*`, Windows)
+/// that nothing runs any more: a running one can't be removed and stays for the next time. For
+/// updates, install.ps1 and the daemon's start.
+pub fn remove_leftovers(binary: &Path) {
+    let (Some(dir), prefix) = (binary.parent(), leftover_prefix(binary)) else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry.file_name().to_string_lossy().starts_with(&prefix) {
+            let _ = fs::remove_file(entry.path());
+        }
     }
 }
 

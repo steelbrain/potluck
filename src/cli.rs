@@ -163,10 +163,20 @@ pub enum Command {
     Restart,
     /// Run the daemon in the foreground.
     Daemon,
-    /// Install or remove the daemon as a systemd user service or LaunchAgent.
+    /// Install or remove the daemon as a systemd user service, a LaunchAgent or a Task Scheduler
+    /// task (Windows).
     Service {
         #[command(subcommand)]
         action: ServiceAction,
+    },
+    /// What the Task Scheduler task runs (Windows, see [`crate::service`]): `potluck daemon`, with
+    /// these variables set and without the console window the task opens.
+    #[cfg(windows)]
+    #[command(name = "_service-daemon", hide = true)]
+    ServiceDaemon {
+        /// POTLUCK_HOME=PATH or POTLUCK_CONFIG=PATH, for the daemon.
+        #[arg(long = "env", value_name = "NAME=VALUE")]
+        env: Vec<String>,
     },
     #[command(name = "_supervise", hide = true)]
     Supervise {
@@ -411,6 +421,12 @@ pub fn main() -> i32 {
         Err(e) => return usage_error(&e, wants_json(&args)),
     };
     let json = cli.json;
+    let daemon = || {
+        Paths::from_env().and_then(|paths| {
+            let config = crate::config::NodeConfig::load(&paths)?;
+            crate::daemon::run(&paths, &config).map(|()| 0)
+        })
+    };
     let direct: Option<anyhow::Result<i32>> = match &cli.command {
         Command::Supervise {
             status,
@@ -423,10 +439,11 @@ pub fn main() -> i32 {
             *log_max,
             cmd,
         )),
-        Command::Daemon => Some(Paths::from_env().and_then(|paths| {
-            let config = crate::config::NodeConfig::load(&paths)?;
-            crate::daemon::run(&paths, &config).map(|()| 0)
-        })),
+        Command::Daemon => Some(daemon()),
+        #[cfg(windows)]
+        Command::ServiceDaemon { env } => {
+            Some(crate::service::start_service_daemon(env).and_then(|()| daemon()))
+        }
         // git's ext:: transport runs it: git's protocol on stdout, errors on stderr only.
         Command::Tunnel { node, repo_id } => Some(Ok(crate::tunnel::run_tunnel(node, repo_id))),
         Command::HandoverCheck { file } => match crate::daemon::handover::check(file) {
@@ -742,6 +759,10 @@ impl Cx<'_> {
             | Command::Supervise { .. }
             | Command::Tunnel { .. }
             | Command::HandoverCheck { .. } => {
+                anyhow::bail!("this command runs on its own, not through the client")
+            }
+            #[cfg(windows)]
+            Command::ServiceDaemon { .. } => {
                 anyhow::bail!("this command runs on its own, not through the client")
             }
         }

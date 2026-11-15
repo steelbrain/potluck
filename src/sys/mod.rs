@@ -13,10 +13,12 @@
 //!   instruction (it starts suspended until it is in the job).
 
 mod host;
+mod path;
 mod perm;
 mod proc;
 
 pub use host::{LocalTime, free_bytes, home_dir, home_var, hostname, local_time, user_name};
+pub use path::canonicalize;
 #[cfg(windows)]
 pub use perm::user_sid;
 pub use perm::{create_dir, create_dir_all, file_mode, set_mode};

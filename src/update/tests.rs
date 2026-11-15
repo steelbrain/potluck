@@ -1,12 +1,15 @@
 //! Updates against a fake release served over plain HTTP on 127.0.0.1, and install.sh against the
-//! same. The fake binaries are shell scripts that answer `--version` like potluck does. No test
-//! restarts a service, except the ignored ones at the end, which use services named for tests.
+//! same. The fake binaries are shell scripts that answer `--version` like potluck does, so the
+//! tests that run one are Unix's; on Windows the update of the real binary is tested in
+//! tests/self_update.rs. No test restarts a service, except the ignored ones at the end, which use
+//! services named for tests.
 
 use super::*;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::os::unix::fs::MetadataExt;
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -221,13 +224,22 @@ impl FakeRestart {
     }
 }
 
-/// A temp dir with an executable fake potluck at `bin/potluck`.
+/// The binary's file name here.
+const BIN: &str = if cfg!(windows) {
+    "potluck.exe"
+} else {
+    "potluck"
+};
+
+/// A temp dir with an executable fake potluck at `bin/potluck` (on Windows `bin\potluck.exe`,
+/// which doesn't run there).
 fn installed(version: &str) -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let bin = dir.path().join("bin");
     fs::create_dir(&bin).unwrap();
-    let target = bin.join("potluck");
+    let target = bin.join(BIN);
     fs::write(&target, fake_binary(version)).unwrap();
+    #[cfg(unix)]
     fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
     (dir, target)
 }
@@ -242,6 +254,7 @@ fn names_in(dir: &Path) -> Vec<String> {
 }
 
 /// The target's bytes and identity, to show it wasn't touched.
+#[cfg(unix)]
 fn snapshot(path: &Path) -> (Vec<u8>, u64, i64, i64) {
     let meta = fs::metadata(path).unwrap();
     (
@@ -250,6 +263,13 @@ fn snapshot(path: &Path) -> (Vec<u8>, u64, i64, i64) {
         meta.mtime(),
         meta.mtime_nsec(),
     )
+}
+
+/// The target's bytes and modification time, to show it wasn't touched.
+#[cfg(windows)]
+fn snapshot(path: &Path) -> (Vec<u8>, std::time::SystemTime) {
+    let meta = fs::metadata(path).unwrap();
+    (fs::read(path).unwrap(), meta.modified().unwrap())
 }
 
 #[cfg(target_os = "macos")]
@@ -264,6 +284,7 @@ fn has_quarantine(path: &Path) -> bool {
         .success()
 }
 
+#[cfg(unix)]
 #[test]
 fn updates_from_a_local_release() {
     let (_dir, target) = installed("0.0.1");
@@ -289,6 +310,7 @@ fn updates_from_a_local_release() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn takes_the_requested_version() {
     let (_dir, target) = installed("0.0.1");
@@ -298,6 +320,7 @@ fn takes_the_requested_version() {
     assert_eq!(fs::read(&target).unwrap(), fake_binary("9.9.9"));
 }
 
+#[cfg(unix)]
 #[test]
 fn replaces_the_real_file_behind_a_symlink() {
     let (dir, real) = installed("0.0.1");
@@ -335,7 +358,7 @@ fn refuses_a_bad_checksum_and_changes_nothing() {
     assert!(msg.contains(&format!("{asset} has SHA-256 ")), "{msg}");
     assert!(msg.contains("refusing it, nothing was changed"), "{msg}");
     assert_eq!(snapshot(&target), before);
-    assert_eq!(names_in(target.parent().unwrap()), ["potluck"]);
+    assert_eq!(names_in(target.parent().unwrap()), [BIN]);
 }
 
 #[test]
@@ -353,7 +376,7 @@ fn missing_asset_fails_clearly() {
         format!("downloading {}{asset}: HTTP 404", server.url())
     );
     assert_eq!(snapshot(&target), before);
-    assert_eq!(names_in(target.parent().unwrap()), ["potluck"]);
+    assert_eq!(names_in(target.parent().unwrap()), [BIN]);
 }
 
 #[test]
@@ -399,6 +422,7 @@ fn missing_sums_line_fails_clearly() {
     assert_eq!(server.requests(), [format!("/rel/{SUMS_FILE}")]);
 }
 
+#[cfg(unix)]
 #[test]
 fn refuses_another_version_than_requested() {
     let (_dir, target) = installed("0.0.1");
@@ -428,9 +452,10 @@ fn refuses_a_binary_that_does_not_run() {
     assert!(err.contains("doesn't run on this machine"), "{err}");
     assert!(err.ends_with("nothing was changed"), "{err}");
     assert_eq!(snapshot(&target), before);
-    assert_eq!(names_in(target.parent().unwrap()), ["potluck"]);
+    assert_eq!(names_in(target.parent().unwrap()), [BIN]);
 }
 
+#[cfg(unix)]
 #[test]
 fn an_identical_binary_is_left_alone() {
     let (_dir, target) = installed("9.9.9");
@@ -465,6 +490,7 @@ fn an_identical_binary_is_left_alone() {
 /// A daemon asked to update whose binary file is already the release (written by install.sh with
 /// POTLUCK_NO_RESTART=1, or by an update whose restart failed) still runs its old version: it must
 /// restart, or it never runs the release it was asked for.
+#[cfg(unix)]
 #[test]
 fn an_identical_binary_restarts_a_daemon_running_another_version() {
     // The daemon calling for itself passes its own version; the file and the release are 9.9.9.
@@ -505,6 +531,7 @@ fn an_identical_binary_restarts_a_daemon_running_another_version() {
 
 /// `potluck self-update --here` runs from the new binary while the daemon may still run the old
 /// one: the CLI passes the version the daemon reported, and that decides the restart.
+#[cfg(unix)]
 #[test]
 fn an_identical_binary_restarts_only_an_older_daemon() {
     let restart = FakeRestart::new();
@@ -543,6 +570,7 @@ fn an_identical_binary_restarts_only_an_older_daemon() {
 
 /// Toward the latest release, an update never goes below the version on disk, this process's, or
 /// the daemon's: a fix released for an older version line must not take machines down.
+#[cfg(unix)]
 #[test]
 fn latest_never_goes_lower() {
     // GitHub: the tag says 1.0.0, so nothing is downloaded.
@@ -593,6 +621,7 @@ fn latest_never_goes_lower() {
 
 /// A requested lower version is refused unless allowed: the mesh's version gating only moves up,
 /// a user asking directly may go down.
+#[cfg(unix)]
 #[test]
 fn a_requested_lower_version_needs_allow_lower() {
     let (_dir, target) = installed("9.9.9");
@@ -616,6 +645,7 @@ fn a_requested_lower_version_needs_allow_lower() {
 
 /// "Latest" is resolved to its tag first, so SHA256SUMS and the binary come from one release even
 /// if another is published between the two downloads.
+#[cfg(unix)]
 #[test]
 fn latest_is_resolved_to_its_tag_before_downloading() {
     let (_dir, target) = installed("0.0.1");
@@ -656,6 +686,7 @@ fn latest_is_resolved_to_its_tag_before_downloading() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn a_release_whose_binary_is_not_its_tag_is_refused() {
     let (_dir, target) = installed("0.0.1");
@@ -674,6 +705,7 @@ fn a_release_whose_binary_is_not_its_tag_is_refused() {
 /// Build metadata (`+...`) doesn't make another version: a binary reporting `9.9.9+abc` is the
 /// release tagged 9.9.9, and the 9.9.9 asked for, both when it is downloaded and when it is
 /// already the file here.
+#[cfg(unix)]
 #[test]
 fn a_binary_with_build_metadata_is_its_version() {
     let (_dir, target) = installed("0.0.1");
@@ -772,6 +804,7 @@ fn compares_versions_like_semver() {
 
 /// The release workflow marks a release latest only when no published release has a higher
 /// version, so a fix released for an older version line never becomes latest.
+#[cfg(unix)]
 #[test]
 fn the_workflow_marks_only_the_highest_release_latest() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -838,12 +871,26 @@ fn rosetta_takes_the_arm64_binary() {
         asset("linux", "x86_64", true),
         Some("potluck-x86_64-unknown-linux-musl")
     );
-    // This test binary runs natively (it isn't built for x86_64 macOS here).
-    assert!(!rosetta_translated());
+    // On Windows on Arm, an x86_64 potluck runs under x64 emulation and takes the arm64 binary.
+    assert_eq!(
+        asset("windows", "x86_64", true),
+        Some("potluck-aarch64-pc-windows-msvc.exe")
+    );
+    assert_eq!(
+        asset("windows", "x86_64", false),
+        Some("potluck-x86_64-pc-windows-msvc.exe")
+    );
+    assert_eq!(
+        asset("linux", "x86_64", true),
+        Some("potluck-x86_64-unknown-linux-musl")
+    );
+    // This test binary runs natively (it isn't built for x86_64 macOS or Windows here).
+    assert!(!translated());
     let native = asset_for(std::env::consts::OS, std::env::consts::ARCH);
     assert_eq!(asset_name().ok(), native);
 }
 
+#[cfg(unix)]
 #[test]
 fn an_unwritable_directory_fails_and_changes_nothing() {
     if unsafe { libc::geteuid() } == 0 {
@@ -949,6 +996,14 @@ fn names_the_assets() {
         asset_for("linux", "aarch64"),
         Some("potluck-aarch64-unknown-linux-musl")
     );
+    assert_eq!(
+        asset_for("windows", "x86_64"),
+        Some("potluck-x86_64-pc-windows-msvc.exe")
+    );
+    assert_eq!(
+        asset_for("windows", "aarch64"),
+        Some("potluck-aarch64-pc-windows-msvc.exe")
+    );
     assert_eq!(asset_for("freebsd", "x86_64"), None);
     assert_eq!(asset_for("linux", "riscv64"), None);
     assert!(asset_name().is_ok());
@@ -976,13 +1031,122 @@ fn builds_release_urls() {
     assert!(normalize_version("").is_err());
 }
 
+/// The binary at the target's name is moved aside, the new one moved in, and the one moved aside
+/// removed, as Windows needs for a running binary (here nothing runs it, so it goes at once).
+#[test]
+fn a_binary_is_moved_aside_for_the_new_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join(BIN);
+    fs::write(&target, b"old").unwrap();
+    let new = dir.path().join("new");
+    fs::write(&new, b"new").unwrap();
+    assert_eq!(swap_in(&new, &target).unwrap(), None);
+    assert_eq!(fs::read(&target).unwrap(), b"new");
+    assert_eq!(names_in(dir.path()), [BIN]);
+}
+
+/// A new binary that can't be moved in leaves the old one at its name.
+#[test]
+fn a_failed_swap_puts_the_old_binary_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join(BIN);
+    fs::write(&target, b"old").unwrap();
+    let err = swap_in(&dir.path().join("missing"), &target).unwrap_err();
+    assert!(
+        format!("{err:#}").ends_with("the old binary was put back"),
+        "{err:#}"
+    );
+    assert_eq!(fs::read(&target).unwrap(), b"old");
+    assert_eq!(names_in(dir.path()), [BIN]);
+}
+
+/// The variable naming the file whose appearance ends [`a_running_copy_waits`].
+#[cfg(windows)]
+const WAIT_ENV: &str = "POTLUCK_TEST_WAIT_FOR";
+
+/// Not a test: a copy of this test binary runs it to stay running until the file `WAIT_ENV` names
+/// appears (at most 2 minutes), after writing that name with `.started` added.
+#[cfg(windows)]
+#[test]
+#[ignore = "a helper that a running copy of this test binary runs"]
+fn a_running_copy_waits() {
+    let Some(path) = std::env::var_os(WAIT_ENV).map(PathBuf::from) else {
+        return;
+    };
+    let mut started = path.clone().into_os_string();
+    started.push(".started");
+    fs::write(&started, b"").unwrap();
+    let give_up = Instant::now() + Duration::from_secs(120);
+    while !path.exists() && Instant::now() < give_up {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Windows can't write over or delete a running program's file, but can rename it: the update
+/// renames the running binary aside and moves the new one in. The binary renamed aside stays while
+/// it runs, and the next update's cleanup removes it once it has ended. The running program is a
+/// copy of this test binary.
+#[cfg(windows)]
+#[test]
+fn a_running_binary_is_renamed_aside_until_it_ends() {
+    let dir = tempfile::tempdir().unwrap();
+    let marks = tempfile::tempdir().unwrap();
+    let target = dir.path().join(BIN);
+    fs::copy(std::env::current_exe().unwrap(), &target).unwrap();
+    let release = marks.path().join("release");
+    let mut running = Command::new(&target)
+        .args([
+            "--exact",
+            "update::tests::a_running_copy_waits",
+            "--ignored",
+            "--test-threads=1",
+        ])
+        .env(WAIT_ENV, &release)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let started = marks.path().join("release.started");
+    let give_up = Instant::now() + Duration::from_secs(60);
+    while !started.exists() {
+        assert!(running.try_wait().unwrap().is_none(), "the copy ended");
+        assert!(Instant::now() < give_up, "the copy never started");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        fs::write(&target, b"x").is_err(),
+        "a running binary was written over"
+    );
+    let result = Staged::write(&target, b"the new binary").and_then(|s| s.rename_over(&target));
+    let leftovers = || -> Vec<String> {
+        names_in(dir.path())
+            .into_iter()
+            .filter(|n| n.starts_with(".potluck.exe.old-"))
+            .collect()
+    };
+    let left = leftovers();
+    remove_leftovers(&target);
+    let still = leftovers();
+    fs::write(&release, b"").unwrap();
+    assert!(running.wait().unwrap().success());
+    result.unwrap();
+    assert_eq!(fs::read(&target).unwrap(), b"the new binary");
+    assert_eq!(left.len(), 1, "{left:?}");
+    assert_eq!(still, left, "a running binary was removed");
+    remove_leftovers(&target);
+    assert_eq!(names_in(dir.path()), [BIN]);
+}
+
 // install.sh
 
+#[cfg(unix)]
 fn install_sh() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("install.sh")
 }
 
 /// The POSIX shells to run install.sh with: `sh`, and `dash` when present (stricter than bash).
+#[cfg(unix)]
 fn shells() -> Vec<&'static str> {
     let mut shells = vec!["sh"];
     let has_dash = Command::new("sh")
@@ -996,17 +1160,20 @@ fn shells() -> Vec<&'static str> {
     shells
 }
 
+#[cfg(unix)]
 struct Install {
     ok: bool,
     stdout: String,
     stderr: String,
 }
 
+#[cfg(unix)]
 fn run_install(shell: &str, url: &str, dir: &Path, args: &[&str]) -> Install {
     run_install_with(shell, url, dir, args, None)
 }
 
 /// `path`, when given, replaces PATH.
+#[cfg(unix)]
 fn run_install_with(
     shell: &str,
     url: &str,
@@ -1022,6 +1189,7 @@ fn run_install_with(
 }
 
 /// install.sh into `dir`, with `env` on top of this process's environment.
+#[cfg(unix)]
 fn run_install_env(shell: &str, dir: &Path, args: &[&str], env: &[(&str, String)]) -> Install {
     let out = Command::new(shell)
         .arg(install_sh())
@@ -1039,6 +1207,7 @@ fn run_install_env(shell: &str, dir: &Path, args: &[&str], env: &[(&str, String)
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn install_sh_installs_from_a_local_release() {
     let server = Server::start(release(&fake_binary("9.9.9")));
@@ -1069,6 +1238,7 @@ fn install_sh_installs_from_a_local_release() {
 }
 
 /// As for self-update, a binary reporting `9.9.9+abc` is the 9.9.9 asked for.
+#[cfg(unix)]
 #[test]
 fn install_sh_takes_a_binary_with_build_metadata_for_its_version() {
     let server = Server::start(release(&fake_binary("9.9.9+abc")));
@@ -1095,6 +1265,7 @@ fn install_sh_takes_a_binary_with_build_metadata_for_its_version() {
 /// A `potluck` in the install directory that is a symlink (to a copy kept elsewhere) keeps being
 /// one: install.sh replaces the file it points to, as `potluck self-update` does. It used to
 /// replace the link with a file, leaving the target, which a service runs, at the old version.
+#[cfg(unix)]
 #[test]
 fn install_sh_replaces_a_symlinked_binary_at_its_target() {
     let server = Server::start(release(&fake_binary("9.9.9")));
@@ -1193,6 +1364,7 @@ exit 0
     assert!(!stdout.contains("Next steps"), "{stdout}");
 }
 
+#[cfg(unix)]
 #[test]
 fn install_sh_refuses_bad_releases() {
     let asset = asset_name().unwrap();
@@ -1267,6 +1439,7 @@ fn install_sh_refuses_bad_releases() {
 }
 
 /// GNU sha256sum and shasum print `\<hash>` for a file name with a backslash in it.
+#[cfg(unix)]
 #[test]
 fn install_sh_checks_a_download_in_a_temporary_directory_with_a_backslash() {
     let server = Server::start(release(&fake_binary("9.9.9")));
@@ -1295,6 +1468,7 @@ fn install_sh_checks_a_download_in_a_temporary_directory_with_a_backslash() {
 }
 
 /// A PATH holding everything this process's PATH does, except curl: install.sh then uses wget.
+#[cfg(unix)]
 fn path_without_curl(farm: &Path) -> String {
     fs::create_dir_all(farm).unwrap();
     for dir in std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()) {
@@ -1311,6 +1485,7 @@ fn path_without_curl(farm: &Path) -> String {
     farm.display().to_string()
 }
 
+#[cfg(unix)]
 fn has_wget() -> bool {
     Command::new("sh")
         .args(["-c", "command -v wget"])
@@ -1321,6 +1496,7 @@ fn has_wget() -> bool {
 
 /// From GitHub, install.sh resolves "latest" to its tag first (with curl, and with wget), so
 /// SHA256SUMS and the binary come from one release.
+#[cfg(unix)]
 #[test]
 fn install_sh_resolves_latest_to_its_tag() {
     let asset = asset_name().unwrap();
@@ -1370,6 +1546,7 @@ fn install_sh_resolves_latest_to_its_tag() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn install_sh_from_github_checks_the_tag_and_names_failures() {
     let asset = asset_name().unwrap();
@@ -1449,6 +1626,7 @@ fn install_sh_from_github_checks_the_tag_and_names_failures() {
 /// process never holds it open for writing. If it did, another test thread forking meanwhile would
 /// leave a copy of that descriptor in its child until the child execs, and running the script
 /// in that time fails with ETXTBSY ("Text file busy").
+#[cfg(unix)]
 fn write_script(path: &Path, text: &str) {
     let mut child = Command::new("sh")
         .args(["-c", "cat > \"$1\" && chmod 755 \"$1\"", "sh"])
@@ -1469,6 +1647,7 @@ fn write_script(path: &Path, text: &str) {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn install_sh_refuses_unsupported_platforms() {
     let server = Server::start(release(&fake_binary("9.9.9")));

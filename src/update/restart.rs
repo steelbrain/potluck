@@ -1,9 +1,14 @@
 //! Restarting the daemon's service after an update: `systemctl --user restart potluck.service` on
-//! Linux, `launchctl kickstart -k gui/<uid>/potluck.daemon` on macOS. A service that is installed
-//! but stopped (a systemd unit that isn't active, a LaunchAgent that isn't loaded) is left stopped.
+//! Linux, `launchctl kickstart -k gui/<uid>/potluck.daemon` on macOS, `schtasks /end` then
+//! `schtasks /run` of the task `potluck` on Windows. A service that is installed but stopped (a
+//! systemd unit that isn't active, a LaunchAgent that isn't loaded, a task with no instance
+//! running) is left stopped.
 
-use anyhow::{Result, bail};
+use anyhow::Result;
+#[cfg(unix)]
+use anyhow::bail;
 use std::fmt;
+#[cfg(unix)]
 use std::process::{Command, Output, Stdio};
 
 /// What happened to the daemon's service.
@@ -92,21 +97,35 @@ pub fn restart_daemon() -> Result<Restart> {
     restart_launch_agent(&label, &plist)
 }
 
+/// Restarts the daemon's service if it is installed and running (`POTLUCK_SERVICE_NAME` names
+/// another, as for `potluck service install`).
+#[cfg(windows)]
+pub fn restart_daemon() -> Result<Restart> {
+    restart_task(&crate::service::service_name())
+}
+
 /// potluck has no service on other systems.
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 pub fn restart_daemon() -> Result<Restart> {
     Ok(Restart::NoService)
 }
 
-/// Whether the daemon's service is installed (loaded in systemd, or a LaunchAgent plist or
-/// label), running or not.
+/// Whether the daemon's service is installed (loaded in systemd, a LaunchAgent plist or label, or
+/// a task Task Scheduler has), running or not.
 pub(crate) fn service_installed() -> bool {
     let name = crate::service::service_name();
-    if cfg!(target_os = "macos") {
+    #[cfg(windows)]
+    {
+        crate::service::task::state(&name).is_some()
+    }
+    #[cfg(target_os = "macos")]
+    {
         crate::service::service_dir().is_some_and(|d| d.join(format!("{name}.plist")).exists())
             || run(Command::new("launchctl").args(["print", &launchd_target(&name)]))
                 .is_ok_and(|o| o.status.success())
-    } else {
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
         run(crate::service::user_command("systemctl").args([
             "--user",
             "show",
@@ -121,28 +140,46 @@ pub(crate) fn service_installed() -> bool {
     }
 }
 
-/// The command that restarts the daemon's service by hand.
+/// The command that restarts the daemon's service by hand (on Windows two, for PowerShell).
 pub(crate) fn restart_command() -> String {
-    if cfg!(target_os = "linux") {
+    #[cfg(target_os = "linux")]
+    {
         format!(
             "systemctl --user restart {}",
             crate::service::service_name()
         )
-    } else if cfg!(target_os = "macos") {
+    }
+    #[cfg(target_os = "macos")]
+    {
         format!(
             "launchctl kickstart -k {}",
             launchd_target(&crate::service::service_name())
         )
-    } else {
+    }
+    #[cfg(windows)]
+    {
+        task_restart_command(&crate::service::service_name())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    {
         "potluck daemon".to_string()
     }
 }
 
+/// How to restart the task `name` by hand: end it, then start it, in PowerShell or cmd.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn task_restart_command(name: &str) -> String {
+    let name = crate::service::windows_quote(name);
+    format!("schtasks /end /tn {name}; schtasks /run /tn {name}")
+}
+
+#[cfg(target_os = "macos")]
 pub(crate) fn launchd_target(label: &str) -> String {
     // SAFETY: getuid has no preconditions and can't fail.
     format!("gui/{}/{label}", unsafe { libc::getuid() })
 }
 
+#[cfg(unix)]
 fn run(cmd: &mut Command) -> Result<Output> {
     let shown = format!("{cmd:?}").replace('"', "");
     match cmd.stdin(Stdio::null()).output() {
@@ -151,6 +188,7 @@ fn run(cmd: &mut Command) -> Result<Output> {
     }
 }
 
+#[cfg(unix)]
 fn failure(what: &str, out: &Output) -> anyhow::Error {
     let stderr = String::from_utf8_lossy(&out.stderr);
     anyhow::anyhow!("`{what}` failed ({}): {}", out.status, stderr.trim())
@@ -213,4 +251,20 @@ pub(crate) fn restart_launch_agent(label: &str, plist: &std::path::Path) -> Resu
         return Err(failure(&kickstart, &out));
     }
     Ok(Restart::Restarted(kickstart))
+}
+
+/// Restarts the task `name` if an instance of it runs (`schtasks /end`, waiting for the instance
+/// to be gone, then `schtasks /run`); reports it as not running if it has none, and as no service
+/// if Task Scheduler has no such task. The daemon's jobs keep running.
+#[cfg(windows)]
+pub(crate) fn restart_task(name: &str) -> Result<Restart> {
+    use crate::service::task;
+    match task::state(name) {
+        None => return Ok(Restart::NoService),
+        Some(false) => return Ok(Restart::NotRunning(name.to_string())),
+        Some(true) => {}
+    }
+    task::end(name)?;
+    task::run(name)?;
+    Ok(Restart::Restarted(task_restart_command(name)))
 }
