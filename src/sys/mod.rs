@@ -74,9 +74,14 @@ pub(crate) mod win {
     pub struct Owned(pub HANDLE);
 
     impl Owned {
-        /// `None` for a null or invalid handle (the call failed; `GetLastError` says why).
+        /// `None` for a null or invalid handle (the call failed; `GetLastError` says why, and
+        /// still does after this: no `Owned` is made, so none is dropped and closed).
         pub fn new(h: HANDLE) -> Option<Owned> {
-            (!h.is_null() && h != INVALID_HANDLE_VALUE).then_some(Owned(h))
+            if h.is_null() || h == INVALID_HANDLE_VALUE {
+                None
+            } else {
+                Some(Owned(h))
+            }
         }
     }
 
