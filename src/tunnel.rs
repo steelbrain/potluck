@@ -228,7 +228,7 @@ impl View {
         git_dir: &Path,
         commits: impl IntoIterator<Item = impl AsRef<str>>,
     ) -> io::Result<View> {
-        let objects = crate::sys::canonical(&git_dir.join("objects")).map_err(|e| {
+        let objects = crate::sys::canonicalize(&git_dir.join("objects")).map_err(|e| {
             io::Error::new(e.kind(), format!("can't read {}: {e}", git_dir.display()))
         })?;
         let alternate = objects

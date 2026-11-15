@@ -87,29 +87,6 @@ impl FileId {
     }
 }
 
-/// `path` made absolute with every symlink resolved, as `canonicalize` does. On Windows without
-/// the `\\?\` prefix `canonicalize` puts before it when the path can be written without one (a
-/// drive letter's, or a share's as `\\server\share`), so that programs that don't take such
-/// paths (git) read it.
-pub fn canonical(path: &Path) -> io::Result<std::path::PathBuf> {
-    let real = std::fs::canonicalize(path)?;
-    #[cfg(windows)]
-    {
-        if let Some(text) = real.to_str() {
-            if let Some(unc) = text.strip_prefix(r"\\?\UNC\") {
-                return Ok(format!(r"\\{unc}").into());
-            }
-            if let Some(rest) = text.strip_prefix(r"\\?\")
-                && rest.as_bytes().get(1) == Some(&b':')
-                && rest.len() < 260
-            {
-                return Ok(rest.into());
-            }
-        }
-    }
-    Ok(real)
-}
-
 /// Whether `a` and `b` are one file (symlinks followed); false if either can't be read.
 pub fn same_file(a: &Path, b: &Path) -> bool {
     matches!((FileId::of_path(a), FileId::of_path(b)), (Ok(x), Ok(y)) if x == y)
@@ -118,15 +95,6 @@ pub fn same_file(a: &Path, b: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_canonical_path_is_absolute_and_plain() {
-        let d = tempfile::tempdir().unwrap();
-        let c = canonical(d.path()).unwrap();
-        assert!(c.is_absolute(), "{}", c.display());
-        assert!(!c.to_string_lossy().starts_with(r"\\?\"), "{}", c.display());
-        assert!(same_file(&c, d.path()));
-    }
 
     #[test]
     fn a_file_is_itself_and_no_other() {

@@ -16,8 +16,8 @@ An update checks the release's SHA-256 and replaces the binary it runs from (the
 `--here` the one you ran), even one built from source. On Windows, which doesn't let a running
 program's file be replaced, the old `potluck.exe` is renamed aside in its directory
 (`.potluck.exe.old-...`) and the new one moved to its name; if that fails, the old one is moved
-back. The one renamed aside is removed at once when nothing runs it, otherwise by a later update
-or install.ps1. Running jobs survive any daemon restart:
+back. The one renamed aside is removed at once when nothing runs it, otherwise at the daemon's
+next start, by a later update or by install.ps1. Running jobs survive any daemon restart:
 the new daemon finds them again, and after a plain restart `wait` and `logs` connect to it again.
 A daemon still running after its binary was replaced (with `POTLUCK_NO_RESTART=1`, or by a package
 manager) starts each job's supervisor and git's tunnel from a copy of the binary it started from,

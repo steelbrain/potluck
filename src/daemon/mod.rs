@@ -1329,6 +1329,12 @@ pub fn run(paths: &Paths, config: &NodeConfig) -> anyhow::Result<()> {
         Some(_) => None,
         None => Some(lock_home(paths)?),
     };
+    // A self-update on Windows renames the running potluck.exe aside; copies nothing runs any
+    // more are removed now.
+    #[cfg(windows)]
+    if let Ok(bin) = crate::update::running_binary() {
+        crate::update::remove_leftovers(&bin);
+    }
     #[cfg(unix)]
     let open_files = raise_open_files();
     config.listen_ip()?;

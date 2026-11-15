@@ -209,8 +209,10 @@ fn plan<'a>(source: &'a Source, target: &'a Path, version: Option<&'a str>) -> P
 }
 
 /// A restart that only counts its calls.
+#[cfg(unix)]
 struct FakeRestart(std::cell::Cell<u32>);
 
+#[cfg(unix)]
 impl FakeRestart {
     fn new() -> FakeRestart {
         FakeRestart(std::cell::Cell::new(0))

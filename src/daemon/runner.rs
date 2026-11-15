@@ -21,15 +21,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-// The signals the daemon sends a job through its executor. Windows has none: its executor takes
-// SIGTERM to ask a job to stop (Ctrl+Break to its command) and SIGKILL to end it (its job object
-// terminated). The numbers are POSIX's, the same on Linux and macOS.
-#[cfg(unix)]
-use libc::{SIGKILL, SIGTERM};
-#[cfg(windows)]
-pub(crate) const SIGTERM: i32 = 15;
-#[cfg(windows)]
-pub(crate) const SIGKILL: i32 = 9;
+use crate::exec::{SIGKILL, SIGTERM};
 
 /// Sampling failures in a row before the daemon gives up on an invocation as lost.
 const MAX_SAMPLE_ERRORS: u32 = 20;

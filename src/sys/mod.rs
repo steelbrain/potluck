@@ -25,7 +25,7 @@ mod proc;
 #[cfg(windows)]
 pub(crate) mod registry;
 
-pub use fileid::{FileId, canonical, same_file};
+pub use fileid::{FileId, same_file};
 pub use host::{LocalTime, free_bytes, home_dir, home_var, hostname, local_time, user_name};
 pub use path::canonicalize;
 #[cfg(windows)]

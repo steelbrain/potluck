@@ -1093,7 +1093,7 @@ pub(crate) mod task {
         let sessions = unsafe { std::slice::from_raw_parts(info, count as usize) };
         let same = |a: Option<String>, b: &str| a.is_some_and(|a| a.to_lowercase() == b);
         let found = sessions.iter().any(|s| {
-            matches!(s.State, WTSActive | WTSDisconnected)
+            (s.State == WTSActive || s.State == WTSDisconnected)
                 && same(session_text(s.SessionId, WTSUserName), &user)
                 && same(session_text(s.SessionId, WTSDomainName), &domain)
         });
