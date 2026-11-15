@@ -1265,20 +1265,16 @@ fn uninstall_task(spec: &ServiceSpec) -> anyhow::Result<ServiceDone> {
 }
 
 /// The scheduled task's entry, `potluck _service-daemon [--env NAME=VALUE]...` (Windows), before
-/// it runs `potluck daemon`. Lets go of the console window Windows opened for this process when no
-/// other process shares it (Task Scheduler starts a console program in a console of its own,
-/// shown in the user's session; a `potluck _service-daemon` typed in a terminal keeps its
-/// terminal), and sets POTLUCK_HOME and POTLUCK_CONFIG as `service install` found them (a task's
-/// action carries no environment of its own). Call it before any other thread starts.
+/// it runs `potluck daemon`. Sets POTLUCK_HOME and POTLUCK_CONFIG as `service install` found them
+/// (a task's action carries no environment of its own). Then, when no other process shares its
+/// console (Task Scheduler starts a console program in a console of its own, shown in the user's
+/// session; a `potluck _service-daemon` typed in a terminal keeps its terminal), lets go of that
+/// console and sends stdout and stderr to the daemon log, as launchd does on macOS: an error
+/// before the daemon's log opens is said there, and the daemon the keeper starts inherits them
+/// (the console's handles end with the console). Call it before any other thread starts.
 #[cfg(windows)]
 pub fn start_service_daemon(env: &[String]) -> anyhow::Result<()> {
     use windows_sys::Win32::System::Console::{FreeConsole, GetConsoleProcessList};
-    let mut pids = [0u32; 2];
-    // SAFETY: pids has room for the 2 entries given.
-    if unsafe { GetConsoleProcessList(pids.as_mut_ptr(), pids.len() as u32) } == 1 {
-        // SAFETY: plain call; this process alone used the console.
-        unsafe { FreeConsole() };
-    }
     for kv in env {
         let (k, v) = kv
             .split_once('=')
@@ -1290,7 +1286,52 @@ pub fn start_service_daemon(env: &[String]) -> anyhow::Result<()> {
         // writes the environment meanwhile.
         unsafe { std::env::set_var(k, v) };
     }
+    let mut pids = [0u32; 2];
+    // SAFETY: pids has room for the 2 entries given.
+    if unsafe { GetConsoleProcessList(pids.as_mut_ptr(), pids.len() as u32) } <= 1 {
+        // SAFETY: plain call; no other process uses the console, if there is one.
+        unsafe { FreeConsole() };
+        std_to_log();
+    }
     Ok(())
+}
+
+/// Points stdin at NUL, and stdout and stderr at the daemon log (appended to), or at NUL when
+/// it can't be opened.
+#[cfg(windows)]
+fn std_to_log() {
+    use std::os::windows::io::IntoRawHandle;
+    use windows_sys::Win32::System::Console::{
+        STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetStdHandle,
+    };
+    let nul = |write: bool| {
+        std::fs::OpenOptions::new()
+            .read(!write)
+            .write(write)
+            .open("NUL")
+            .ok()
+    };
+    let log = crate::config::Paths::from_env().ok().and_then(|paths| {
+        crate::sys::create_dir_all(&paths.home, 0o700).ok()?;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(paths.daemon_log())
+            .ok()
+    });
+    let out = log.or_else(|| nul(true));
+    let err = out.as_ref().and_then(|f| f.try_clone().ok());
+    for (which, file) in [
+        (STD_INPUT_HANDLE, nul(false)),
+        (STD_OUTPUT_HANDLE, out),
+        (STD_ERROR_HANDLE, err),
+    ] {
+        if let Some(f) = file {
+            // SAFETY: the handle is valid and stays open for the life of the process (it is
+            // never closed: into_raw_handle gives it up).
+            unsafe { SetStdHandle(which, f.into_raw_handle()) };
+        }
+    }
 }
 
 #[cfg(test)]

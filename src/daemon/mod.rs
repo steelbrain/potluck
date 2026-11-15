@@ -200,8 +200,8 @@ impl Logger {
             .collect();
         #[cfg(unix)]
         let to_stderr = !std_fds.contains(&libc::STDERR_FILENO);
-        // Windows: a service can't send stderr to the log, but `potluck daemon 2>>daemon.log`
-        // can; it stays where it is when the log starts afresh.
+        // Windows: the service's task sends stderr to the log ([`crate::service`]), as can
+        // `potluck daemon 2>>daemon.log`; it stays where it is when the log starts afresh.
         #[cfg(windows)]
         let to_stderr = !file.as_ref().is_some_and(stderr_is);
         Logger {
