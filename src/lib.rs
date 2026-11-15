@@ -1,4 +1,5 @@
-//! potluck: a language-generic build and test cluster for a handful of Linux and macOS machines.
+//! potluck: a language-generic build and test cluster for a handful of Linux, macOS and Windows
+//! machines.
 //!
 //! Every machine runs the same daemon, and the daemons talk to each other directly. One machine
 //! submits work and is the source of truth for its repositories; jobs sit in one global queue and
@@ -24,6 +25,7 @@ pub mod sched;
 pub mod service;
 pub mod store;
 pub mod supervise;
+pub mod sys;
 pub mod tunnel;
 pub mod types;
 pub mod update;
@@ -37,6 +39,7 @@ pub mod workspace;
 #[used]
 #[cfg_attr(target_os = "macos", unsafe(link_section = "__DATA,__mod_init_func"))]
 #[cfg_attr(target_os = "linux", unsafe(link_section = ".init_array"))]
+#[cfg_attr(windows, unsafe(link_section = ".CRT$XCU"))]
 static NO_USER_KEY: extern "C" fn() = {
     extern "C" fn clear() {
         // SAFETY: this runs before main, while the test process has one thread, so nothing else

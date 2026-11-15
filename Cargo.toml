@@ -12,7 +12,6 @@ anyhow = "1.0.104"
 base64 = "0.23.1"
 clap = { version = "4.6.7", features = ["derive"] }
 glob = "0.3.3"
-libc = "0.2.191"
 rcgen = { version = "0.14.10", default-features = false, features = ["ring"] }
 ring = "0.17.14"
 rusqlite = { version = "0.41.1", features = ["bundled"] }
@@ -23,6 +22,42 @@ toml = "1.2.0"
 unicase = "2.10.0"
 unicode-normalization = "0.1.26"
 ureq = { version = "3.5.1", default-features = false, features = ["rustls"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.191"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+  "Wdk_Foundation",
+  "Wdk_Storage_FileSystem",
+  "Wdk_System_Threading",
+  "Win32_Devices_DeviceAndDriverInstallation",
+  "Win32_Foundation",
+  "Win32_Networking_WinSock",
+  "Win32_Security",
+  "Win32_Security_Authorization",
+  "Win32_Storage_FileSystem",
+  "Win32_System_Console",
+  "Win32_System_Diagnostics_Debug",
+  "Win32_System_Diagnostics_ToolHelp",
+  "Win32_System_Environment",
+  "Win32_System_IO",
+  "Win32_System_Ioctl",
+  "Win32_System_JobObjects",
+  "Win32_System_Kernel",
+  "Win32_System_LibraryLoader",
+  "Win32_System_Memory",
+  "Win32_System_Pipes",
+  "Win32_System_ProcessStatus",
+  "Win32_System_Registry",
+  "Win32_System_RemoteDesktop",
+  "Win32_System_SystemInformation",
+  "Win32_System_SystemServices",
+  "Win32_System_Threading",
+  "Win32_System_Time",
+  "Win32_System_WindowsProgramming",
+  "Win32_UI_Shell",
+] }
 
 [dev-dependencies]
 tempfile = "3.27.0"
