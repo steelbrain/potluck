@@ -164,8 +164,9 @@ job studio-41 now asks for 2 GiB of RAM, not 16 GiB; it keeps its place in the q
 kernel counted for the job's unit (`memory.peak`, from Linux 5.19) and potluck's samples, taken
 every half second; on macOS it is the largest sample of the memory footprint of the job's
 processes, so a climb between two samples can be missed; on Windows it is the peak commit the
-job's job object counted (`PeakJobMemoryUsed`). A job that ended before its first sample has no
-peak, and `why` gives none.
+job's job object counted (`PeakJobMemoryUsed`), which counts an allocation that failed at the
+job's limit too, so after one it can be far above the limit. A job that ended before its first
+sample has no peak, and `why` gives none.
 
 A job may have at most 16384 processes. On Linux that is its unit's `TasksMax`, which counts
 threads too, and a fork past it fails. On macOS it counts processes, potluck's supervisor
@@ -177,7 +178,8 @@ RLIMIT_NPROC holds it back: it starts at the user's process count plus the job's
 counts that limit per user, not per job, so other processes of the same user, other jobs
 included, take from the job's room while it runs: a job can be refused forks (EAGAIN) below its
 own limit when the user's other processes grow. On Windows it is the job object's limit on active
-processes, which counts processes, potluck's supervisor included; starting a process past it
+processes, which counts processes, potluck's supervisor included (but not the console host,
+`conhost.exe`, that Windows starts for the supervisor's console); starting a process past it
 fails.
 
 A job's limits on open files are the daemon's. At start the daemon raises its soft limit to its

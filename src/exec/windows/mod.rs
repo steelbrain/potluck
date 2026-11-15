@@ -30,10 +30,12 @@
 //! - **RAM** is the job's commit limit (JOB_OBJECT_LIMIT_JOB_MEMORY): an allocation past it
 //!   fails. The supervisor watches the job's completion port and ends the command and what it
 //!   started when one does, and records that in the status file, which `sample` reads
-//!   (`over_memory`). The peak is the job's PeakJobMemoryUsed; the memory now is the sum of its
-//!   processes' commit (private bytes).
+//!   (`over_memory`). The peak is the job's PeakJobMemoryUsed, which counts the allocation that
+//!   failed too; the memory now is the sum of its processes' commit (private bytes).
 //! - **Processes:** at most `tasks_max` at once, the supervisor included
-//!   (JOB_OBJECT_LIMIT_ACTIVE_PROCESS): starting one more fails.
+//!   (JOB_OBJECT_LIMIT_ACTIVE_PROCESS): starting one more fails. The console host Windows starts
+//!   for the supervisor's console (conhost.exe) is in the job, and a sample lists it, but the
+//!   limit doesn't count it.
 //! - **CPU:** the user and kernel time of every process the job ever held. `--cpu` sets nothing.
 //! - **Stop and kill.** [`signal`](JobExecutor::signal) with [`SIGKILL`] ends every process in the
 //!   job (TerminateJobObject, exit code 137). Any other signal sets the event `NAME.stop`, on
