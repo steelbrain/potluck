@@ -11,10 +11,12 @@
 //!   stdout and stderr to the daemon log), then `launchctl bootstrap gui/<uid>`.
 //! - Windows: the task `potluck`, registered with `schtasks /create /xml`, which runs `<this
 //!   executable> _service-daemon` at the user's sign-in, in the user's session (InteractiveToken:
-//!   no stored password, no elevation), restarted on failure, with no run time limit, at normal
-//!   priority and on battery too. `_service-daemon` ([`start_service_daemon`]) sets POTLUCK_HOME and
-//!   POTLUCK_CONFIG from its arguments (a task's action carries no environment of its own), lets go
-//!   of the console window Windows opens for it, and runs `potluck daemon`. The task's definition
+//!   no stored password, no elevation), with no run time limit, at normal priority and on battery
+//!   too. `_service-daemon` ([`start_service_daemon`]) sets POTLUCK_HOME and POTLUCK_CONFIG from
+//!   its arguments (a task's action carries no environment of its own), lets go of the console
+//!   window Windows opens for it, and runs `potluck daemon`, whose keeper starts the daemon again
+//!   5 seconds after it fails, as systemd's `Restart=on-failure` does (Task Scheduler's own
+//!   restart on failure doesn't count a program's exit code). The task's definition
 //!   is kept as `~/.config/potluck/potluck.task.xml`. Like a LaunchAgent it runs while the user is
 //!   signed in, so `service install` starts it at once only when the user has a session.
 //!
@@ -422,13 +424,15 @@ fn task_arguments(spec: &ServiceSpec) -> String {
 /// IgnoreNew: a start while it runs does nothing. No run time limit (`PT0S`); started again a
 /// minute after a failure; not held back or stopped on battery; priority 5, which runs it at
 /// normal priority (Task Scheduler's default, 7, is below normal); hidden in Task Scheduler's
-/// list unless it shows hidden tasks. Its working directory is the state directory.
+/// list unless it shows hidden tasks. Its working directory is the executable's, there whenever
+/// the task can run: Task Scheduler doesn't start a task whose working directory is missing, and
+/// the state directory may be on a volume attached after sign-in.
 pub fn render_task_xml(spec: &ServiceSpec, user: &str) -> String {
     let exe = xml_escape(&format!("\"{}\"", spec.exe.to_string_lossy()));
     let args = xml_escape(&task_arguments(spec));
-    // The log's directory, read as Windows does (on any system, for tests).
-    let log = spec.log.to_string_lossy();
-    let workdir = match log.rsplit_once(['\\', '/']) {
+    // The executable's directory, read as Windows does (on any system, for tests).
+    let program = spec.exe.to_string_lossy();
+    let workdir = match program.rsplit_once(['\\', '/']) {
         Some((d, _)) if d.ends_with(':') => format!(
             "\n      <WorkingDirectory>{}\\</WorkingDirectory>",
             xml_escape(d)
@@ -1624,7 +1628,7 @@ mod tests {
             "<AllowHardTerminate>true</AllowHardTerminate>",
             r#"<Command>&quot;C:\Users\Ann Lee\.local\bin\potluck.exe&quot;</Command>"#,
             r#"<Arguments>_service-daemon --env POTLUCK_CONFIG=D:\cfg\ --env &quot;POTLUCK_HOME=D:\pl &amp; co&quot;</Arguments>"#,
-            r"<WorkingDirectory>D:\pl &amp; co</WorkingDirectory>",
+            r"<WorkingDirectory>C:\Users\Ann Lee\.local\bin</WorkingDirectory>",
         ] {
             assert!(xml.contains(want), "missing {want:?} in\n{xml}");
         }

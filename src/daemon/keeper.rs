@@ -14,7 +14,10 @@
 //!   binary at its path as on Unix), the keeper ends what is left in that job (git and tools the
 //!   daemon ran, cut short, as the daemon ends its children before an exec on Unix) and at once
 //!   starts the binary at its path again, in a new job. The new daemon starts as any daemon
-//!   does, and adopts the running jobs. Any other exit ends the keeper with the daemon's code.
+//!   does, and adopts the running jobs. Any other exit ends the keeper with the daemon's code,
+//!   except under the service's task ([`crate::service`]): there an exit other than 0 (the daemon
+//!   failed, or couldn't start yet, such as before its state directory's volume is attached)
+//!   starts it again after [`AGAIN_AFTER`], as systemd's `Restart=on-failure` does on Linux.
 //! - While it runs it holds [`LOCK_FILE`] in the state directory, so a command line that finds no
 //!   socket meanwhile waits for the daemon ([`super::running_here`]) rather than report none.
 //! - A console's Ctrl+C or Ctrl+Break reaches the daemon too, which shares the keeper's console
@@ -58,6 +61,10 @@ pub const LOCK_FILE: &str = "keeper.lock";
 /// How long the keeper waits for what a restarting daemon left running to end.
 const END_WAIT: Duration = Duration::from_secs(5);
 
+/// How long the service's keeper waits before it starts a daemon that failed again (systemd's
+/// `RestartSec=5` on Linux).
+const AGAIN_AFTER: Duration = Duration::from_secs(5);
+
 /// Whether this process is the daemon a keeper started ([`MARKER`]); the marker leaves the
 /// environment. Call before any thread starts.
 pub fn kept() -> bool {
@@ -70,10 +77,11 @@ pub fn kept() -> bool {
 }
 
 /// `potluck daemon` on Windows: runs the daemon proper until it exits other than to restart, and
-/// returns its exit code.
-pub fn run(paths: &Paths) -> anyhow::Result<i32> {
+/// returns its exit code. With `again_on_failure` (the service's task) only an exit with code 0
+/// ends it: after any other the daemon starts again [`AGAIN_AFTER`] later.
+pub fn run(paths: &Paths, again_on_failure: bool) -> anyhow::Result<i32> {
     let exe = crate::update::running_binary()?;
-    let _lock = hold_lock(paths);
+    let mut lock = hold_lock(paths);
     keep_on_console_events();
     loop {
         let job = new_job().context("making a job object for the daemon")?;
@@ -82,11 +90,23 @@ pub fn run(paths: &Paths) -> anyhow::Result<i32> {
             .wait()
             .with_context(|| format!("waiting for the daemon ({})", exe.display()))?;
         let code = status.code().unwrap_or(1);
-        if code != RESTART_EXIT {
+        if code == RESTART_EXIT {
+            end_job(&job);
+        } else if again_on_failure && code != 0 {
+            end_job(&job);
+            eprintln!(
+                "potluck: the daemon exited with code {code}; starting it again in {} s",
+                AGAIN_AFTER.as_secs()
+            );
+            std::thread::sleep(AGAIN_AFTER);
+            // The state directory may have come since (its volume attached).
+            if lock.is_none() {
+                lock = hold_lock(paths);
+            }
+        } else {
             // Dropping the job ends what the daemon left running.
             return Ok(code);
         }
-        end_job(&job);
     }
 }
 

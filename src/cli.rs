@@ -426,13 +426,15 @@ pub fn main() -> i32 {
         Err(e) => return usage_error(&e, wants_json(&args)),
     };
     let json = cli.json;
-    let daemon = || {
+    // `service`: run by the service's task (Windows), whose keeper also starts a failed daemon
+    // again.
+    let daemon = |#[cfg_attr(not(windows), allow(unused_variables))] service: bool| {
         Paths::from_env().and_then(|paths| {
             // On Windows `potluck daemon` keeps the daemon proper, its child, which it starts
             // again when it exits to restart; the child runs these same arguments.
             #[cfg(windows)]
             if !crate::daemon::keeper::kept() {
-                return crate::daemon::keeper::run(&paths);
+                return crate::daemon::keeper::run(&paths, service);
             }
             let config = crate::config::NodeConfig::load(&paths)?;
             crate::daemon::run(&paths, &config).map(|()| 0)
@@ -452,10 +454,10 @@ pub fn main() -> i32 {
             job.as_deref(),
             cmd,
         )),
-        Command::Daemon => Some(daemon()),
+        Command::Daemon => Some(daemon(false)),
         #[cfg(windows)]
         Command::ServiceDaemon { env } => {
-            Some(crate::service::start_service_daemon(env).and_then(|()| daemon()))
+            Some(crate::service::start_service_daemon(env).and_then(|()| daemon(true)))
         }
         // git's ext:: transport runs it: git's protocol on stdout, errors on stderr only.
         Command::Tunnel { node, repo_id } => Some(Ok(crate::tunnel::run_tunnel(node, repo_id))),
