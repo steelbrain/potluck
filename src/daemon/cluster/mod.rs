@@ -1786,7 +1786,10 @@ mod tests {
             labels: BTreeMap::new(),
             priority: 3,
             request: Default::default(),
-            on: [("node".to_string(), node.to_string())].into(),
+            on: [("node".to_string(), node.to_string())]
+                .into_iter()
+                .chain(crate::types::on_here())
+                .collect(),
             repo: crate::types::RepoRef {
                 id: "proj-1234abcd".into(),
                 source: PathBuf::from("/nonexistent"),

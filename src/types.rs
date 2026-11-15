@@ -821,6 +821,17 @@ pub fn asks_for_os(on: &BTreeMap<String, String>, os: &str) -> bool {
             .is_some_and(|v| v.trim().eq_ignore_ascii_case(os))
 }
 
+/// For tests whose daemon has this system's facts: what a job asks for to run there. Nothing, or
+/// on Windows Windows itself ([`Facts::declines`]).
+#[cfg(test)]
+pub(crate) fn on_here() -> BTreeMap<String, String> {
+    if cfg!(windows) {
+        [("windows".to_string(), String::new())].into()
+    } else {
+        BTreeMap::new()
+    }
+}
+
 /// A requirement as `--on` writes it: `macos` for any macOS (an OS shorthand with no version),
 /// else `KEY=VALUE`.
 pub fn fmt_on(key: &str, want: &str) -> String {

@@ -2021,7 +2021,7 @@ mod tests {
                 },
             );
             let mut j = job(id, JobState::Starting);
-            j.spec.on.clear();
+            j.spec.on = crate::types::on_here();
             j.node = Some("lone".into());
             j.workspace = Some(w.to_string());
             j.lease = Some(crate::types::Lease {
@@ -2224,7 +2224,7 @@ mod tests {
             let user = lone.first_user();
             let sh = d.shared.clone();
             let mut spec = job("x", JobState::Queued).spec;
-            spec.on.clear();
+            spec.on = crate::types::on_here();
             spec.submitted_from = "lone".into();
             let spec = crate::jobauth::sign(&spec, &user, crate::types::now_ms());
             let paths = sh.paths.clone();
@@ -2326,7 +2326,7 @@ mod tests {
             {
                 let mut st = sh.lock();
                 let mut j = job(&id, JobState::Queued);
-                j.spec.on.clear();
+                j.spec.on = crate::types::on_here();
                 st.jobs.insert(id.clone(), j);
                 st.save_job(&id);
             }
@@ -2378,7 +2378,7 @@ mod tests {
             {
                 let mut st = sh.lock();
                 let mut j = job(&id, JobState::Running);
-                j.spec.on.clear();
+                j.spec.on = crate::types::on_here();
                 j.node = Some("lone".into());
                 j.lease = Some(crate::types::Lease {
                     grant: Default::default(),
@@ -2488,7 +2488,7 @@ mod tests {
             {
                 let mut st = sh.lock();
                 let mut j = job(&orphan, JobState::Queued);
-                j.spec.on.clear();
+                j.spec.on = crate::types::on_here();
                 j.spec.workspace = Some("lone-w9".into());
                 st.jobs.insert(orphan.clone(), j);
                 st.save_job(&orphan);
@@ -2503,7 +2503,7 @@ mod tests {
             {
                 let mut st = sh.lock();
                 let mut j = job(&next, JobState::Queued);
-                j.spec.on.clear();
+                j.spec.on = crate::types::on_here();
                 st.jobs.insert(next.clone(), j);
                 st.save_job(&next);
             }
@@ -2526,7 +2526,7 @@ mod tests {
         /// Job `id` running here, stored.
         fn running(st: &mut crate::daemon::state::State, id: &str) {
             let mut j = job(id, JobState::Running);
-            j.spec.on.clear();
+            j.spec.on = crate::types::on_here();
             j.node = Some("lone".into());
             j.lease = Some(crate::types::Lease {
                 grant: Default::default(),
