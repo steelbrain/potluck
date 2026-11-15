@@ -53,7 +53,9 @@
 //! **Windows** has no exec, and a socket can't be carried into a process that doesn't exist yet:
 //! `potluck daemon` there is a keeper running the daemon as its child ([`super::keeper`]). Steps
 //! 1 to 3 are the same (the check, the drain, the quiesce); in 4 the connections handed over
-//! are closed instead (those that asked for the restart are told first that it goes ahead), the
+//! are closed instead (those that asked for the restart are told first that it goes ahead, and
+//! a request sent on one since the quiesce, unread, is answered that the daemon is stopping, as
+//! is each connection waiting in the backlog: its client sends it again to the next daemon), the
 //! store is closed with the state locked, and the daemon exits with
 //! [`super::keeper::RESTART_EXIT`]: the keeper ends what the daemon left running in its job
 //! (work cut short) and starts the binary at its path as a new daemon, which starts as any

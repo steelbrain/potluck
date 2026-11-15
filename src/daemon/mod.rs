@@ -1535,7 +1535,18 @@ fn exit_for_restart(
             handover::drain_waited(inherited.drained_ms),
         ),
     };
-    for (conn, asked) in &mut inherited.conns {
+    // A request sent on an open connection since the quiesce began is unread (the next daemon
+    // reads it, on Unix): its client is told the daemon is stopping, and sends it again.
+    let socks: Vec<_> = inherited
+        .conns
+        .iter()
+        .map(|(c, _)| crate::sys::local::AsRawSock::as_raw_sock(c))
+        .collect();
+    let sent = match socks.is_empty() {
+        true => Vec::new(),
+        false => crate::sys::local::wait_readable(&socks, Some(std::time::Duration::ZERO)),
+    };
+    for ((conn, asked), sent) in inherited.conns.iter_mut().zip(sent) {
         if asked.take().is_some() {
             let _ = conn.set_write_timeout(Some(std::time::Duration::from_secs(1)));
             let _ = files::reply(
@@ -1543,6 +1554,8 @@ fn exit_for_restart(
                 &[],
                 crate::proto::Response::Text { text: text.clone() },
             );
+        } else if sent {
+            refuse(conn);
         }
         let _ = conn.shutdown(std::net::Shutdown::Both);
     }
@@ -1561,34 +1574,38 @@ fn exit_for_restart(
 }
 
 /// Answers each connection waiting in `listener`'s backlog with [`crate::client::STOPPING`] once
-/// it has sent its request (a second at most), and closes it.
+/// it has sent its request ([`refuse`]), and closes it.
 #[cfg(windows)]
 fn refuse_waiting(listener: &UnixListener) {
     if listener.set_nonblocking(true).is_err() {
         return;
     }
     while let Ok((conn, _)) = listener.accept() {
-        if conn.set_nonblocking(false).is_err()
-            || conn
-                .set_read_timeout(Some(std::time::Duration::from_secs(1)))
-                .is_err()
-            || conn
-                .set_write_timeout(Some(std::time::Duration::from_secs(1)))
-                .is_err()
-        {
-            continue;
-        }
-        let mut reader = std::io::BufReader::new(&conn);
-        if let Ok(Some(_)) = crate::proto::read_msg::<_, crate::proto::ClientRequest>(&mut reader) {
-            let _ = files::reply(
-                &mut &conn,
-                &[],
-                crate::proto::Response::Error {
-                    message: crate::client::STOPPING.into(),
-                },
-            );
-        }
+        refuse(&conn);
         let _ = conn.shutdown(std::net::Shutdown::Both);
+    }
+}
+
+/// Reads the request `conn` sends (waiting a second at most) and answers it with
+/// [`crate::client::STOPPING`], which the client sends again to the next daemon.
+#[cfg(windows)]
+fn refuse(conn: &UnixStream) {
+    let second = Some(std::time::Duration::from_secs(1));
+    if conn.set_nonblocking(false).is_err()
+        || conn.set_read_timeout(second).is_err()
+        || conn.set_write_timeout(second).is_err()
+    {
+        return;
+    }
+    let mut reader = std::io::BufReader::new(conn);
+    if let Ok(Some(_)) = crate::proto::read_msg::<_, crate::proto::ClientRequest>(&mut reader) {
+        let _ = files::reply(
+            &mut &*conn,
+            &[],
+            crate::proto::Response::Error {
+                message: crate::client::STOPPING.into(),
+            },
+        );
     }
 }
 
