@@ -2236,6 +2236,10 @@ mod tests {
                     })
             });
             while !seed.syncing.load(Ordering::SeqCst) {
+                // A dispatch refused before its sync would leave this waiting for good.
+                if dispatching.is_finished() {
+                    panic!("the dispatch ended first: {:?}", dispatching.join());
+                }
                 std::thread::sleep(Duration::from_millis(5));
             }
             d.drain(Duration::from_secs(1)).unwrap();
