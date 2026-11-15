@@ -12,8 +12,9 @@
 //!   status file's path (the state directory and the job: a test runs many daemons, and a job id
 //!   can be on several of them) and the start's time in microseconds (a job can come back to a
 //!   machine it ran on, and an earlier run's job object can still be there, with processes that
-//!   wouldn't die). `Local\` is the session's namespace: a daemon restarted in the same session
-//!   (the service's keeper, or a restart in place) finds it again.
+//!   wouldn't die; [`find`](JobExecutor::find) reads it back to tell a start since the claim from
+//!   an earlier attempt's). `Local\` is the session's namespace: a daemon restarted in the same
+//!   session (the service's keeper, or a restart in place) finds it again.
 //! - **Who holds it.** A job object lives, and its name can be opened, while a handle to it is
 //!   open. The daemon opens it by name for each call and closes it after; the supervisor holds it
 //!   from its start until it exits (the daemon gives it a handle before it lets go of its own).
@@ -244,9 +245,12 @@ impl Executor for JobExecutor {
         }
     }
 
-    /// The job object a start with this status file named in its record (`status.job`), when the
-    /// record was written since the claim: while the job object exists, or when the supervisor
-    /// wrote `status` since the claim (it ran and ended, and the job object went with it).
+    /// The job object a start with this status file named in its record (`status.job`), when that
+    /// start began since the claim (the time in the name): while the job object exists, or when
+    /// the supervisor recorded in `status` an end since the claim (it ran and ended, and the job
+    /// object went with it). Times come from the files' contents, not their modification times:
+    /// Windows stamps a file from a clock that advances once per timer tick (up to 15.6 ms), so a
+    /// file written just after the claim can look older than it.
     fn find(&self, _name: &str, status: &Path, since: Millis) -> anyhow::Result<Option<Handle>> {
         let record = record_path(status);
         let name = match std::fs::read_to_string(&record) {
@@ -254,7 +258,7 @@ impl Executor for JobExecutor {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e).with_context(|| format!("reading {}", record.display())),
         };
-        if name.is_empty() || !written_since(&record, since) {
+        if started_at(&name).is_none_or(|t| t < since) {
             // An earlier attempt's, or one cut short while it was being written.
             return Ok(None);
         }
@@ -262,7 +266,9 @@ impl Executor for JobExecutor {
             name: name.clone(),
             status: status.to_path_buf(),
         };
-        if open_job(&name, JOB_OBJECT_QUERY)?.is_some() || written_since(status, since) {
+        if open_job(&name, JOB_OBJECT_QUERY)?.is_some()
+            || read_status(status).is_some_and(|end| end.exit.ended_at >= since)
+        {
             return Ok(Some(handle));
         }
         Ok(None)
@@ -328,13 +334,12 @@ fn read_status(status: &Path) -> Option<JobStatus> {
     serde_json::from_slice(&std::fs::read(status).ok()?).ok()
 }
 
-/// Whether the file at `path` was last written at or after `since` (ms since the Unix epoch).
-fn written_since(path: &Path, since: Millis) -> bool {
-    std::fs::metadata(path)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .is_some_and(|t| t.as_millis() as Millis >= since)
+/// When the start that named job object `name` began, in ms since the Unix epoch: its nonce
+/// ([`job_name`]); `None` for a name not of that form.
+fn started_at(name: &str) -> Option<Millis> {
+    let (_, nonce) = name.rsplit_once('-')?;
+    let us = u64::from_str_radix(nonce, 16).ok()?;
+    Some(us / 1000)
 }
 
 fn now_us() -> u64 {
@@ -371,5 +376,14 @@ mod tests {
         assert_eq!(a.matches('\\').count(), 1, "{a}");
         let odd = job_name("potluck-ä/b\\c", Path::new(r"D:\x"), 1);
         assert!(odd.starts_with("Local\\potluck-__b_c-"), "{odd}");
+    }
+
+    #[test]
+    fn a_job_name_says_when_its_start_began() {
+        let us = 1_763_200_000_123_456;
+        let name = job_name("potluck-a-1", Path::new(r"D:\one\jobs\a-1\status.json"), us);
+        assert_eq!(started_at(&name), Some(1_763_200_000_123));
+        assert_eq!(started_at("Local\\potluck-a-1-x"), None);
+        assert_eq!(started_at(""), None);
     }
 }
