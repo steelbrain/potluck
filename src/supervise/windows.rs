@@ -247,10 +247,7 @@ fn supervise(
             } else {
                 126
             };
-            let _ = writeln!(
-                lock(&shared.sink).out.file,
-                "potluck: could not start {prog}: {e}"
-            );
+            let _ = writeln!(lock(&shared.sink).out.file, "{}", start_error(prog, &e));
             stop_reading(&shared, reading);
             drop(watching);
             return cannot_start(status, code);
@@ -555,6 +552,21 @@ fn duplicate(h: HANDLE) -> Option<Owned> {
     if ok == 0 { None } else { Owned::new(dup) }
 }
 
+/// What the log says when `prog` couldn't start. Windows says only "The system cannot find the
+/// path specified" for a program that names its arguments too (`-- "bash -lc 'make'"`): the
+/// whole string is taken for a path. So a program not found whose name holds a space or tab
+/// gets told that the program and its arguments are separate arguments.
+fn start_error(prog: &str, e: &std::io::Error) -> String {
+    let mut msg = format!("potluck: could not start {prog}: {e}");
+    if e.kind() == std::io::ErrorKind::NotFound && prog.contains([' ', '\t']) {
+        msg.push_str(
+            "; the program is the command's first argument and each of its arguments one of \
+             their own: `potluck dispatch -- PROGRAM ARG...`",
+        );
+    }
+    msg
+}
+
 /// Gives CMD's arguments to `command`: quoted as the C runtime reads them (`\"` for a quote,
 /// as `Command::args` writes them), except for cmd.exe, which doesn't read that quoting. For
 /// `cmd [SWITCH]... /c ARG...` (or `/k`) cmd gets the line after the switch as one typed after
@@ -649,6 +661,20 @@ mod tests {
         let (code, log) = run_cmd(dir.path(), ALL, &[missing.to_str().unwrap()]);
         assert_eq!((code, read(dir.path()).exit.code), (127, Some(127)));
         assert!(log.contains("could not start"), "{log}");
+        let hint = "`potluck dispatch -- PROGRAM ARG...`";
+        assert_eq!(
+            log.contains(hint),
+            missing.to_str().unwrap().contains(' '),
+            "{log}"
+        );
+        // A program given with its arguments in one string: Windows looks for a path of that name.
+        let (code, log) = run_cmd(
+            dir.path(),
+            ALL,
+            &["C:\\Windows\\System32\\ping.exe -n 1 ::1"],
+        );
+        assert_eq!(code, 127);
+        assert!(log.contains(hint), "{log}");
     }
 
     #[test]
