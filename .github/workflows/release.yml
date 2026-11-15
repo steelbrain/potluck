@@ -1,5 +1,5 @@
-# Builds the release binaries for a version tag (v0.2.0) and publishes them, with install.sh and
-# SHA256SUMS, as that tag's GitHub release. The release stays a draft until every asset is
+# Builds the release binaries for a version tag (v0.2.0) and publishes them, with install.sh,
+# install.ps1 and SHA256SUMS, as that tag's GitHub release. The release stays a draft until every asset is
 # uploaded, so releases/latest/download/... never points at a half-published release.
 #
 # Jobs: `draft` creates the draft release; `build` builds and checks the binaries on each runner
@@ -7,10 +7,11 @@
 # and publishes the release. Only draft and publish can write to the repository; build, which
 # compiles and runs code from dependencies, gets a read-only token.
 #
-# Assets: potluck-<target> for the four targets below; install.sh from the tagged commit (the
-# README installs with releases/latest/download/install.sh); and SHA256SUMS in `sha256sum` format,
-# listing all of them. install.sh and `potluck self-update` download the binaries and SHA256SUMS
-# by these names, and look up only the line for the binary they want.
+# Assets: potluck-<target> for the four Linux and macOS targets below, potluck-<target>.exe for the
+# two Windows ones; install.sh and install.ps1 from the tagged commit (the README installs with
+# releases/latest/download/install.sh, or install.ps1 on Windows); and SHA256SUMS in `sha256sum`
+# format, listing all of them. install.sh, install.ps1 and `potluck self-update` download the
+# binaries and SHA256SUMS by these names, and look up only the line for the binary they want.
 
 name: release
 
@@ -78,6 +79,12 @@ jobs:
           # Both macOS binaries on one Apple silicon runner; Xcode's clang builds the x86_64 C.
           - runner: macos-15
             targets: aarch64-apple-darwin x86_64-apple-darwin
+          # Windows binaries built natively with MSVC, so each runs on its own architecture
+          # before it is published (windows-11-arm is GitHub's Arm64 Windows runner).
+          - runner: windows-2025
+            targets: x86_64-pc-windows-msvc
+          - runner: windows-11-arm
+            targets: aarch64-pc-windows-msvc
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read # checkout only: build scripts of dependencies run in this job
@@ -85,7 +92,17 @@ jobs:
       TARGETS: ${{ matrix.targets }}
       CC_x86_64_unknown_linux_musl: musl-gcc
       CC_aarch64_unknown_linux_musl: musl-gcc
+      # The C runtime linked in, as the Linux binaries link musl: a fresh Windows has no Visual
+      # C++ runtime (VCRUNTIME140.dll). Only these targets read these (they replace
+      # .cargo/config.toml's rustflags, which only speed up the build).
+      CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: -C target-feature=+crt-static
+      CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_RUSTFLAGS: -C target-feature=+crt-static
     steps:
+      # Git for Windows converts line endings when it checks out; build the files as committed.
+      - name: Keep line endings as committed
+        if: runner.os == 'Windows'
+        run: git config --global core.autocrlf false
+
       # Pinned to the commit of v7.0.1: a tag can be moved to other code.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -118,6 +135,17 @@ jobs:
       - name: Build
         run: |
           for target in $TARGETS; do
+            if [ "$target" = aarch64-pc-windows-msvc ] && ! command -v clang >/dev/null; then
+              # ring builds its arm64 Windows assembly with clang: LLVM's, or Visual Studio's.
+              llvm="/c/Program Files/LLVM/bin"
+              if [ ! -x "$llvm/clang.exe" ]; then
+                vswhere="/c/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe"
+                found=$("$vswhere" -latest -products '*' -find 'VC\Tools\Llvm\ARM64\bin\clang.exe' | tr -d '\r' | head -n 1)
+                test -n "$found" || { echo "no clang for ring's arm64 assembly" >&2; exit 1; }
+                llvm=$(dirname "$(cygpath -u "$found")")
+              fi
+              export PATH="$llvm:$PATH"
+            fi
             cargo build --release --locked --target "$target"
           done
 
@@ -125,9 +153,20 @@ jobs:
         run: |
           mkdir dist
           for target in $TARGETS; do
-            bin=target/$target/release/potluck
-            info=$(file "$bin")
-            echo "$info"
+            exe=
+            if [[ $target == *-windows-msvc ]]; then exe=.exe; fi
+            bin=target/$target/release/potluck$exe
+            info=
+            if [ -z "$exe" ]; then
+              info=$(file "$bin")
+              echo "$info"
+            fi
+            # A Windows binary that imports the Visual C++ runtime doesn't start where it isn't
+            # installed.
+            if [ -n "$exe" ] && grep -qa 'VCRUNTIME140' "$bin"; then
+              echo "$bin imports VCRUNTIME140.dll; it must link the C runtime statically" >&2
+              exit 1
+            fi
             # Apple's linker signs arm64 binaries ad hoc but not x86_64 ones, and macOS's Local
             # Network privacy blocks an unsigned LaunchAgent's connections to members without
             # asking: both macOS binaries are signed ad hoc, as `potluck`, before they run below.
@@ -149,7 +188,7 @@ jobs:
               run=(arch -x86_64 "$bin")
             fi
             test "$("${run[@]}" --version)" = "potluck ${TAG#v}"
-            cp "$bin" "dist/potluck-$target"
+            cp "$bin" "dist/potluck-$target$exe"
           done
 
       # To the publish job, which uploads them to the release. Pinned to the commit of v7.0.2.
@@ -170,8 +209,8 @@ jobs:
     permissions:
       contents: write # uploads the assets and publishes the release
     steps:
-      # For install.sh and .github/is-latest.sh. Pinned to the commit of v7.0.1: a tag can be
-      # moved to other code.
+      # For install.sh, install.ps1 and .github/is-latest.sh. Pinned to the commit of v7.0.1: a tag
+      # can be moved to other code.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -190,13 +229,15 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           cd dist
-          for target in aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
-            test -s "potluck-$target" || { echo "missing potluck-$target" >&2; exit 1; }
+          for asset in potluck-aarch64-apple-darwin potluck-x86_64-apple-darwin \
+            potluck-x86_64-unknown-linux-musl potluck-aarch64-unknown-linux-musl \
+            potluck-x86_64-pc-windows-msvc.exe potluck-aarch64-pc-windows-msvc.exe; do
+            test -s "$asset" || { echo "missing $asset" >&2; exit 1; }
           done
-          cp ../install.sh .
-          sha256sum potluck-* install.sh > SHA256SUMS
+          cp ../install.sh ../install.ps1 .
+          sha256sum potluck-* install.sh install.ps1 > SHA256SUMS
           cat SHA256SUMS
-          gh release upload "$TAG" potluck-* install.sh SHA256SUMS --clobber
+          gh release upload "$TAG" potluck-* install.sh install.ps1 SHA256SUMS --clobber
           # Latest only if no published release has a higher version: a fix for an older version
           # line must not become latest, or machines updating to the latest would go down to it.
           published=$(gh api --paginate "repos/$GH_REPO/releases" \
