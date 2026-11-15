@@ -2502,28 +2502,26 @@ fn nested_dispatch_gives_the_whole_group_its_grace() {
     let cwd = tempfile::tempdir().unwrap();
     let marker = cwd.path().join("cleaned");
     // A child in the background takes the stop (TERM) and cleans up. On Windows the stop is
-    // CTRL_BREAK, and MSYS's sh, run outside a Cygwin terminal, takes no signal from it: Windows
-    // ends it at once, trap or not. There the group ends at the stop and nothing cleans up.
+    // CTRL_BREAK, which MSYS's sh doesn't trap (it ends at once, and a background child of its
+    // lives on to the end of the grace): there a console program that Windows ends at the stop
+    // stands for the group.
     let script = format!(
         "(trap 'sleep 1; touch \"{}\"; exit 0' TERM; while :; do sleep 0.1; done) & wait",
         sh_path(&marker)
     );
+    let cmd: &[&str] = if cfg!(windows) {
+        &["ping", "-n", "30", "127.0.0.1"]
+    } else {
+        &["sh", "-c", &script]
+    };
     let started = std::time::Instant::now();
-    let r = run(inside_job(&fake, cwd.path()).args([
-        "dispatch",
-        "--timeout",
-        "1s",
-        "--",
-        "sh",
-        "-c",
-        &script,
-    ]));
+    let r = run(inside_job(&fake, cwd.path())
+        .args(["dispatch", "--timeout", "1s", "--"])
+        .args(cmd));
     assert_eq!(r.code, 124, "{}", r.stderr);
-    assert_eq!(
-        marker.exists(),
-        cfg!(unix),
-        "the child's cleanup ran to its end"
-    );
+    if cfg!(unix) {
+        assert!(marker.exists(), "the child's cleanup ran to its end");
+    }
     let took = started.elapsed();
     assert!(
         took < std::time::Duration::from_secs(5),

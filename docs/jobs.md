@@ -112,8 +112,9 @@ day), and every dispatch while the cluster has no users.
 SIGKILL after `kill_grace_s` (10 seconds) of the machine being awake: time asleep gives the job no
 time to shut down. On Windows the command and the processes in its console process group get
 CTRL_BREAK in place of SIGTERM, and every process of the job is ended (`TerminateJobObject`) in
-place of SIGKILL. MSYS2 and Cygwin programs, such as Git for Windows' `sh`, end at CTRL_BREAK
-without running their traps. Processes that can't die don't keep the job's resources: those are released
+place of SIGKILL. Git for Windows' `sh` and MSYS2's `bash` end at CTRL_BREAK without running
+their traps; what they started in the background is ended with the job, after `kill_grace_s`.
+Processes that can't die don't keep the job's resources: those are released
 anyway, and `status` and `why` list the stuck pids.
 
 A job that uses under 1% of one CPU core and writes no output for `stall_minutes` (10) is marked
