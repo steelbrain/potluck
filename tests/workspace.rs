@@ -2824,9 +2824,12 @@ fn deleting_a_big_workspace_holds_up_no_sync() {
     }
     let (alpha, beta) = (repos[0].clone(), repos[1].clone());
     let wa = e.ws.create(&"t-a".to_string(), &alpha).unwrap();
-    // What a build leaves in its workspace: a big tree, slow to delete.
+    // What a build leaves in its workspace: a big tree, slow to delete. (Three times as big on
+    // Windows, where a sync's git processes cost more next to deleting a file: there 30,000 files
+    // go in about 2 s, and the two syncs take 0.7 s, more on a busy machine.)
+    let dirs = if cfg!(windows) { 300 } else { 100 };
     let out = wa.join("out");
-    for d in 0..100 {
+    for d in 0..dirs {
         let dir = out.join(format!("d{d:03}"));
         std::fs::create_dir_all(&dir).unwrap();
         for f in 0..300 {
@@ -2840,7 +2843,7 @@ fn deleting_a_big_workspace_holds_up_no_sync() {
     // waits for the rest of the deletion.
     let start = Instant::now();
     // The removal can take the tree away between any two looks at it: gone counts as going.
-    while std::fs::read_dir(&out).is_ok_and(|d| d.count() == 100) {
+    while std::fs::read_dir(&out).is_ok_and(|d| d.count() == dirs) {
         assert!(start.elapsed() < Duration::from_secs(60), "never started");
         std::thread::sleep(Duration::from_millis(1));
     }
@@ -2850,11 +2853,14 @@ fn deleting_a_big_workspace_holds_up_no_sync() {
             .unwrap();
     }
     let synced = deleting.elapsed();
+    // Had either waited for the deletion, the tree (moved aside, or deleted in place) would be gone.
+    let going = wa.with_file_name("t-a.removing").exists() || out.exists();
     removing.join().unwrap();
     let deleted = deleting.elapsed();
     assert!(
-        synced * 4 < deleted,
-        "the syncs took {synced:?}, the rest of the removal {deleted:?}"
+        going,
+        "the tree was gone when the syncs ended: they took {synced:?}, the rest of the removal \
+         {deleted:?}"
     );
     assert!(!wa.exists() && worktrees(&e.mirror(&alpha.id)).len() == 1);
     assert!(e.workspace_pins(&alpha.id).is_empty());
