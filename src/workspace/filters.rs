@@ -652,6 +652,11 @@ mod tests {
     /// without the attribute, which the next commit adds. Filter drivers and `core.autocrlf` are
     /// set in the repository's config, as the user's global config would set them. Returns a
     /// fresh checkout of it (a clone) after git has reread every file.
+    ///
+    /// `core.autocrlf` is set either way: the code under test runs git with the system config,
+    /// where Git for Windows sets `core.autocrlf=true` at install, and these tests' `git` runs
+    /// without it, so the checkout and the status and comparison would otherwise convert
+    /// differently there.
     fn fixture(root: &Path, autocrlf: bool) -> PathBuf {
         let src = root.join("src");
         std::fs::create_dir_all(&src).unwrap();
@@ -687,9 +692,7 @@ mod tests {
         git(&co, &["config", "filter.upper.smudge", "tr a-z A-Z"]);
         git(&co, &["config", "filter.upper.clean", "cat"]);
         git(&co, &["config", "filter.strip.clean", "sed -e 's/ *$//'"]);
-        if autocrlf {
-            git(&co, &["config", "core.autocrlf", "true"]);
-        }
+        git(&co, &["config", "core.autocrlf", &autocrlf.to_string()]);
         git(&co, &["checkout", "-q", "main"]);
         reread(&co);
         co
