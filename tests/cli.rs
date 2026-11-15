@@ -419,7 +419,7 @@ fn dispatch_carries_other_repositories_commits() {
     let first = git(&dep, &["rev-parse", "HEAD"]);
     git(&dep, &["commit", "-q", "--allow-empty", "-m", "two"]);
     let head = git(&dep, &["rev-parse", "HEAD"]);
-    let source = std::fs::canonicalize(dep.join(".git")).unwrap();
+    let source = potluck::sys::canonicalize(&dep.join(".git")).unwrap();
     let env = env_for(&fake, repo.path());
     let dispatches = || {
         fake.requests()
@@ -1693,6 +1693,8 @@ fn read_only(p: &Path) -> bool {
 
 /// A file that can't be written (here: past a file size limit) is named in the error, not
 /// left to a bare "File too large (os error 27)".
+// Unix: a write is made to fail with a file size limit (`ulimit -f`), which Windows has none of.
+#[cfg(unix)]
 #[test]
 fn cp_names_the_file_it_could_not_write() {
     let fake = FakeDaemon::start(vec![], |req, conn| {
@@ -1732,7 +1734,9 @@ fn cp_names_the_file_it_could_not_write() {
 }
 
 /// A command run from a directory that was removed says so, not a bare "No such file or
-/// directory (os error 2)".
+/// directory (os error 2)". (Unix: Windows doesn't remove a directory that is a process's working
+/// directory.)
+#[cfg(unix)]
 #[test]
 fn a_removed_working_directory_is_named() {
     let home = tempfile::tempdir().unwrap();
@@ -2050,8 +2054,12 @@ fn cp_names_where_the_copy_landed_without_dot_components() {
                 .args(["cp", "msi-w7:one.txt", to]));
         assert_eq!(r.code, 0, "{}", r.stderr);
         assert!(dest.path().join(want).is_file());
+        // The path as the system writes it (`\` between components on Windows).
+        let sep = std::path::MAIN_SEPARATOR;
+        let native = want.replace('/', &sep.to_string());
         assert!(
-            r.stdout.ends_with(&format!("/{want}\n")) && !r.stdout.contains("/./"),
+            r.stdout.ends_with(&format!("{sep}{native}\n"))
+                && !r.stdout.contains(&format!("{sep}.{sep}")),
             "{to}: {}",
             r.stdout
         );
@@ -2158,10 +2166,11 @@ fn nested_dispatch_runs_at_the_top_of_the_repository() {
     ok(&["init", "-q"]);
     let sub = repo.path().join("crates/x");
     std::fs::create_dir_all(&sub).unwrap();
-    let r = run(inside_job(&fake, &sub).args(["dispatch", "--timeout", "1m", "--", "pwd"]));
+    let r =
+        run(inside_job(&fake, &sub).args(["dispatch", "--timeout", "1m", "--", "sh", "-c", PWD]));
     assert_eq!(r.code, 0, "{}", r.stderr);
-    let top = std::fs::canonicalize(repo.path()).unwrap();
-    assert_eq!(r.stdout.trim(), top.display().to_string());
+    let top = potluck::sys::canonicalize(repo.path()).unwrap();
+    assert_eq!(r.stdout.trim(), sh_path(&top));
 }
 
 /// From inside a job, waiting for (or following) that same job would wait for itself until its run
@@ -2209,13 +2218,13 @@ fn nested_dispatch_runs_in_place_when_it_fits_the_lease() {
         "--",
         "sh",
         "-c",
-        "echo inside $X $(pwd); exit 5",
+        &format!("echo inside $X $({PWD}); exit 5"),
     ]));
     assert_eq!(r.code, 5, "{}", r.stderr);
-    let here = std::fs::canonicalize(cwd.path()).unwrap();
+    let here = potluck::sys::canonicalize(cwd.path()).unwrap();
     assert_eq!(
         r.stdout.trim(),
-        format!("inside from-flag {}", here.display())
+        format!("inside from-flag {}", sh_path(&here))
     );
     assert!(
         r.stderr.contains("inside job studio-9: running in place"),
@@ -2492,9 +2501,11 @@ fn nested_dispatch_gives_the_whole_group_its_grace() {
     std::fs::write(fake.home().join("node.toml"), "kill_grace_s = 5\n").unwrap();
     let cwd = tempfile::tempdir().unwrap();
     let marker = cwd.path().join("cleaned");
+    // TERM on Unix; on Windows the stop is CTRL_BREAK, which MSYS's sh takes as a signal of its
+    // own (INT or QUIT).
     let script = format!(
-        "(trap 'sleep 1; touch {}; exit 0' TERM; while :; do sleep 0.1; done) & wait",
-        marker.display()
+        "(trap 'sleep 1; touch \"{}\"; exit 0' TERM INT QUIT; while :; do sleep 0.1; done) & wait",
+        sh_path(&marker)
     );
     let started = std::time::Instant::now();
     let r = run(inside_job(&fake, cwd.path()).args([
@@ -2554,7 +2565,7 @@ fn nested_dispatch_refuses_options_it_cannot_honour() {
     let fake = lease_daemon(true, grant);
     let cwd = tempfile::tempdir().unwrap();
     let marker = cwd.path().join("ran");
-    let touch = format!("touch {}", marker.display());
+    let touch = format!("touch '{}'", sh_path(&marker));
     for (extra, want) in [
         (
             &["--keep", "out/*"][..],
@@ -2649,7 +2660,7 @@ fn nested_dispatch_fails_at_once_when_it_does_not_fit() {
     let fake = lease_daemon(true, grant);
     let cwd = tempfile::tempdir().unwrap();
     let marker = cwd.path().join("ran");
-    let touch = format!("touch {}", marker.display());
+    let touch = format!("touch '{}'", sh_path(&marker));
     for (extra, want) in [
         (
             &["--ram", "16G"][..],
@@ -3658,3 +3669,18 @@ fn every_command_answers_in_json_without_a_daemon() {
         assert_eq!(r.stderr, "", "{args:?}");
     }
 }
+
+/// `p` as a path in a `sh -c` script and as MSYS's `pwd -W` prints it: on Windows with `/`
+/// between components (sh reads `\` as an escape), elsewhere as it is.
+fn sh_path(p: &Path) -> String {
+    let s = p.display().to_string();
+    if cfg!(windows) {
+        s.replace('\\', "/")
+    } else {
+        s
+    }
+}
+
+/// The command that prints its working directory as [`sh_path`] writes it: `pwd`, or on Windows
+/// MSYS's `pwd -W` (plain `pwd` prints MSYS's own `/tmp/...`).
+const PWD: &str = if cfg!(windows) { "pwd -W" } else { "pwd" };
