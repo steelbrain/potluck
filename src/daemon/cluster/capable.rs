@@ -256,26 +256,17 @@ impl Machines {
 
 /// A time of day on this machine's clock, `HH:MM`, with the date when not today.
 pub(crate) fn clock(ms: Millis) -> String {
-    let secs = (ms / 1000) as libc::time_t;
-    let now = (super::peer::now() / 1000) as libc::time_t;
-    // SAFETY: localtime_r writes into the tm we own; a zeroed tm is a valid value for it.
-    let (t, today) = unsafe {
-        let mut t: libc::tm = std::mem::zeroed();
-        let mut n: libc::tm = std::mem::zeroed();
-        libc::localtime_r(&secs, &mut t);
-        libc::localtime_r(&now, &mut n);
-        (t, t.tm_year == n.tm_year && t.tm_yday == n.tm_yday)
+    let secs = (ms / 1000) as i64;
+    let now = (super::peer::now() / 1000) as i64;
+    let Some(t) = crate::sys::local_time(secs) else {
+        return ms.to_string();
     };
-    if today {
-        format!("{:02}:{:02}", t.tm_hour, t.tm_min)
+    if crate::sys::local_time(now).is_some_and(|n| t.same_day(&n)) {
+        format!("{:02}:{:02}", t.hour, t.minute)
     } else {
         format!(
             "{}-{:02}-{:02} {:02}:{:02}",
-            t.tm_year + 1900,
-            t.tm_mon + 1,
-            t.tm_mday,
-            t.tm_hour,
-            t.tm_min
+            t.year, t.month, t.day, t.hour, t.minute
         )
     }
 }

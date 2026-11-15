@@ -20,25 +20,44 @@
 //! - The shell's own bookkeeping (PWD, OLDPWD, SHLVL, `_`) is dropped.
 //! - A variable whose name or value isn't UTF-8 can't be in a job's environment (it holds text):
 //!   it is left out, and named in what [`login_env`] returns, for the daemon's log.
+//!
+//! On Windows there is no login shell: the login environment is the one Windows gives a new
+//! logon of the user, `CreateEnvironmentBlock` for this process's token without its own
+//! environment: the system variables, then the user's (with `Path` joined from both), and the
+//! profile's (`USERPROFILE`, `APPDATA`, `LOCALAPPDATA`, ...), as the registry holds them when the
+//! daemon starts. Nothing runs, so nothing can hang or print. A variable that isn't valid
+//! Unicode (an unpaired UTF-16 surrogate, which has no UTF-8 form) is left out and named, as on
+//! Unix.
 
 use std::collections::BTreeMap;
+#[cfg(unix)]
 use std::fs::File;
+#[cfg(unix)]
 use std::io::{Read, Seek, SeekFrom};
+#[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
+#[cfg(unix)]
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 
 /// How long a login shell may take to print its environment.
 pub const TIMEOUT: Duration = Duration::from_secs(20);
 
+#[cfg(unix)]
 /// Printed before the environment, so anything a profile prints before it is skipped.
 const MARKER: &str = "__POTLUCK_LOGIN_ENV__";
 
+#[cfg(unix)]
 /// Variables a shell sets for itself; they mean nothing to a job.
 const DROPPED: &[&str] = &["PWD", "OLDPWD", "SHLVL", "_"];
 
+#[cfg(unix)]
 /// Variables passed from the daemon's environment to the login shell: what a login session has
 /// before any profile runs.
 const SESSION: &[&str] = &[
@@ -50,8 +69,10 @@ const SESSION: &[&str] = &[
     "DBUS_SESSION_BUS_ADDRESS",
 ];
 
+#[cfg(unix)]
 const DEFAULT_PATH: &str = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
 
+#[cfg(unix)]
 /// The login environment, and the variables left out of it because they aren't UTF-8 (each said
 /// in words).
 pub fn login_env() -> anyhow::Result<(BTreeMap<String, String>, Vec<String>)> {
@@ -70,6 +91,7 @@ pub fn login_env() -> anyhow::Result<(BTreeMap<String, String>, Vec<String>)> {
     }
 }
 
+#[cfg(unix)]
 /// `$SHELL`, else the password database's shell for this user, else /bin/sh.
 pub fn user_shell() -> PathBuf {
     if let Some(s) = std::env::var_os("SHELL").filter(|s| !s.is_empty()) {
@@ -78,6 +100,7 @@ pub fn user_shell() -> PathBuf {
     passwd_shell().unwrap_or_else(|| PathBuf::from("/bin/sh"))
 }
 
+#[cfg(unix)]
 fn passwd_shell() -> Option<PathBuf> {
     let mut buf = vec![0u8; 16 * 1024];
     // SAFETY: getpwuid_r writes into `pwd` and `buf`, which outlive the call; `result` is set to
@@ -100,6 +123,7 @@ fn passwd_shell() -> Option<PathBuf> {
     }
 }
 
+#[cfg(unix)]
 /// Runs `shell -l -c` to print the environment, from a bare environment, killing it after
 /// `timeout`. Also returns the variables left out because they aren't UTF-8.
 pub fn capture(
@@ -184,11 +208,13 @@ pub fn capture(
     })
 }
 
+#[cfg(unix)]
 /// A new, empty file only this user can read, already unlinked (the environment may hold secrets).
 fn scratch_file() -> anyhow::Result<File> {
     scratch_file_in(&std::env::temp_dir())
 }
 
+#[cfg(unix)]
 /// [`scratch_file`] in `dir`, under a random name: on Linux the temp directory is usually /tmp,
 /// which every user shares, and a name another user can guess (the pid's) is one they can take
 /// first.
@@ -223,6 +249,7 @@ fn scratch_file_in(dir: &Path) -> anyhow::Result<File> {
     )
 }
 
+#[cfg(unix)]
 fn passwd_home() -> Option<PathBuf> {
     let mut buf = vec![0u8; 16 * 1024];
     // SAFETY: as in passwd_shell.
@@ -244,6 +271,7 @@ fn passwd_home() -> Option<PathBuf> {
     }
 }
 
+#[cfg(unix)]
 /// The variables after the marker line, without the shell's bookkeeping, and those left out
 /// because they aren't UTF-8. `None` if the marker is missing.
 fn parse(out: &[u8]) -> Option<(BTreeMap<String, String>, Vec<String>)> {
@@ -277,7 +305,174 @@ fn parse(out: &[u8]) -> Option<(BTreeMap<String, String>, Vec<String>)> {
     Some((env, dropped))
 }
 
+/// The login environment on Windows: what `CreateEnvironmentBlock` gives this process's user
+/// (see the module docs), and the variables left out of it because they aren't valid Unicode.
+#[cfg(windows)]
+pub fn login_env() -> anyhow::Result<(BTreeMap<String, String>, Vec<String>)> {
+    use crate::sys::win::Owned;
+    use windows_sys::Win32::Security::{TOKEN_DUPLICATE, TOKEN_QUERY};
+    use windows_sys::Win32::System::Environment::{
+        CreateEnvironmentBlock, DestroyEnvironmentBlock,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    let mut token = std::ptr::null_mut();
+    // SAFETY: the pseudo handle of this process; token receives a handle Owned closes.
+    if unsafe {
+        OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_QUERY | TOKEN_DUPLICATE,
+            &mut token,
+        )
+    } == 0
+    {
+        anyhow::bail!(
+            "could not capture the login environment: can't open this process's token: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    let token = Owned(token);
+    let mut block: *mut std::ffi::c_void = std::ptr::null_mut();
+    // SAFETY: a primary token with query and duplicate access; FALSE leaves this process's own
+    // environment out. block receives a block DestroyEnvironmentBlock frees below.
+    if unsafe { CreateEnvironmentBlock(&mut block, token.0, 0) } == 0 {
+        anyhow::bail!(
+            "could not capture the login environment: CreateEnvironmentBlock: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    let mut entries: Vec<Vec<u16>> = Vec::new();
+    // SAFETY: the block is UTF-16 `NAME=VALUE` strings, each NUL-terminated, ended by an empty
+    // one; nothing is read past that end. It is freed once copied.
+    unsafe {
+        let p = block as *const u16;
+        let mut i = 0;
+        loop {
+            let start = i;
+            while *p.add(i) != 0 {
+                i += 1;
+            }
+            if i == start {
+                break;
+            }
+            entries.push(std::slice::from_raw_parts(p.add(start), i - start).to_vec());
+            i += 1;
+        }
+        DestroyEnvironmentBlock(block);
+    }
+    Ok(parse_block(&entries))
+}
+
+/// The variables of an environment block's entries (UTF-16 `NAME=VALUE`), and those left out
+/// because their name or value isn't valid Unicode. Entries without a name (or with one starting
+/// with `=`, as a drive's current directory `=C:` does) are skipped.
+#[cfg(any(windows, test))]
+fn parse_block(entries: &[Vec<u16>]) -> (BTreeMap<String, String>, Vec<String>) {
+    let eq = u16::from(b'=');
+    let mut env = BTreeMap::new();
+    let mut dropped = Vec::new();
+    for entry in entries {
+        // A name never starts with `=`: one that seems to is a drive's directory, skipped.
+        let Some(at) = entry.iter().skip(1).position(|&c| c == eq).map(|i| i + 1) else {
+            continue;
+        };
+        let (name, value) = (&entry[..at], &entry[at + 1..]);
+        if name.first() == Some(&eq) {
+            continue;
+        }
+        let Ok(name) = String::from_utf16(name) else {
+            dropped.push(format!(
+                "{}: its name is not UTF-8",
+                String::from_utf16_lossy(name)
+            ));
+            continue;
+        };
+        match String::from_utf16(value) {
+            Ok(value) => {
+                env.insert(name, value);
+            }
+            Err(_) => dropped.push(format!("{name}: its value is not UTF-8")),
+        }
+    }
+    (env, dropped)
+}
+
+/// The Windows block's entries are read the same way on every OS.
 #[cfg(test)]
+mod block_tests {
+    use super::*;
+
+    fn entries(v: &[&[u16]]) -> Vec<Vec<u16>> {
+        v.iter().map(|e| e.to_vec()).collect()
+    }
+
+    fn w(s: &str) -> Vec<u16> {
+        s.encode_utf16().collect()
+    }
+
+    #[test]
+    fn variables_that_are_not_unicode_are_left_out_and_named() {
+        let mut bad_value = w("LATIN=caf");
+        bad_value.push(0xd800);
+        let mut bad_name = w("N");
+        bad_name.push(0xdc00);
+        bad_name.extend(w("X=1"));
+        let (env, dropped) = parse_block(&entries(&[
+            &w("Path=C:\\Windows;C:\\Users\\u\\bin"),
+            &w("=C:=C:\\Users\\u"),
+            &w("EMPTY="),
+            &w("A==b"),
+            &w("noequals"),
+            &bad_value,
+            &bad_name,
+        ]));
+        assert_eq!(
+            env.iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("A", "=b"),
+                ("EMPTY", ""),
+                ("Path", "C:\\Windows;C:\\Users\\u\\bin")
+            ]
+        );
+        assert_eq!(
+            dropped,
+            [
+                "LATIN: its value is not UTF-8",
+                "N\u{fffd}X: its name is not UTF-8"
+            ]
+        );
+    }
+}
+
+/// The real login environment on Windows.
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn the_login_environment_is_the_users_not_this_processs() {
+        // CARGO_* variables are set in every test process; a new logon has none.
+        assert!(std::env::vars().any(|(k, _)| k.starts_with("CARGO")));
+        let (env, dropped) = login_env().unwrap();
+        assert!(dropped.is_empty(), "{dropped:?}");
+        assert!(!env.keys().any(|k| k.starts_with("CARGO")), "{env:?}");
+        let get = |name: &str| {
+            env.iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v.clone())
+        };
+        let path = get("PATH").expect("a Path");
+        assert!(path.to_ascii_lowercase().contains("system32"), "{path}");
+        assert_eq!(
+            get("USERPROFILE").map(std::path::PathBuf::from),
+            std::env::var_os("USERPROFILE").map(std::path::PathBuf::from)
+        );
+        assert!(get("SystemRoot").is_some());
+    }
+}
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;

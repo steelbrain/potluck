@@ -16,6 +16,8 @@ mod host;
 mod path;
 mod perm;
 mod proc;
+#[cfg(windows)]
+pub(crate) mod registry;
 
 pub use host::{LocalTime, free_bytes, home_dir, home_var, hostname, local_time, user_name};
 pub use path::canonicalize;

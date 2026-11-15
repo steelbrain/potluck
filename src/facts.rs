@@ -19,11 +19,28 @@
 //!   Display`) is graphical (x11, wayland or mir; not a tty, such as an ssh login), or a Wayland
 //!   socket exists in the user's runtime directory.
 //! - macOS display: the user owns `/dev/console`, i.e. is logged in at the screen.
+//!
+//! On Windows nothing is run: the version, build and CPU model come from the registry, RAM from
+//! `GlobalMemoryStatusEx`, the architecture from `IsWow64Process2` (the machine's own, also for
+//! an x86_64 build emulated on ARM64), and the GPUs from the display adapters PnP lists
+//! (SetupAPI, which reads what the system recorded and wakes no GPU): each PCI one, its vendor
+//! and device from its hardware id (`PCI\VEN_10DE&DEV_2C02&...`), its slot from its PCI bus,
+//! device and function (`0000:01:00.0`, domain 0), so its id reads like Linux's
+//! (`10de:2c02@0000:01:00.0`), its name the device description and its driver the driver's
+//! service name (`nvlddmkm`, `amdkmdag`, `BasicDisplay`). Display: an active session (at the
+//! console or over Remote Desktop) of this user.
 
 use crate::config::{NodeConfig, Paths};
 use crate::types::{Facts, Gpu, gpu_matches};
 use std::collections::BTreeMap;
+#[cfg(unix)]
 use std::process::{Command, Stdio};
+
+/// The Windows build number (`26100`), from the registry.
+#[cfg(windows)]
+pub(crate) fn windows_build() -> Option<u32> {
+    platform::build()
+}
 
 pub fn detect(paths: &Paths, config: &NodeConfig) -> anyhow::Result<Facts> {
     let mut facts = platform::detect()?;
@@ -43,15 +60,7 @@ pub fn node_name(paths: &Paths, config: &NodeConfig) -> String {
     if let Some((had, _)) = crate::mesh::recorded_name(&paths.keys_dir()) {
         return had;
     }
-    let mut buf = [0u8; 256];
-    // SAFETY: gethostname writes at most buf.len() bytes into buf.
-    let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
-    let host = if rc == 0 {
-        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-        String::from_utf8_lossy(&buf[..end]).into_owned()
-    } else {
-        String::new()
-    };
+    let host = crate::sys::hostname();
     let short = host.split('.').next().unwrap_or("").trim();
     if short.is_empty() {
         "localhost".into()
@@ -112,6 +121,7 @@ pub fn gpu_config_problems(gpus: &[Gpu], config: &NodeConfig) -> Vec<String> {
 }
 
 /// Runs a command and returns its stdout when it succeeded; `None` when it is missing or failed.
+#[cfg(unix)]
 fn output(prog: &str, args: &[&str]) -> Option<String> {
     output_within(prog, args, TOOL_TIME_LIMIT)
 }
@@ -120,15 +130,18 @@ fn output(prog: &str, args: &[&str]) -> Option<String> {
 /// system_profiler a few more on a busy Mac, but one that hangs (a wedged GPU driver) would hold
 /// up the daemon's start, every later refresh and a nested dispatch: at the limit it is killed and
 /// detection goes on without it.
+#[cfg(unix)]
 const TOOL_TIME_LIMIT: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// Tools, each with its arguments, whose run [`output_within`] gave up on and that hasn't ended:
 /// its process unreaped (SIGKILL can't end a process in an uninterruptible wait, such as
 /// nvidia-smi on a wedged GPU) or its output still open. Such a tool isn't started again until
 /// that run ends, so it leaves one process and two threads behind, not more at every refresh.
+#[cfg(unix)]
 static GIVEN_UP: std::sync::Mutex<std::collections::BTreeSet<String>> =
     std::sync::Mutex::new(std::collections::BTreeSet::new());
 
+#[cfg(unix)]
 fn given_up() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<String>> {
     GIVEN_UP
         .lock()
@@ -138,6 +151,7 @@ fn given_up() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<Strin
 /// [`output`] with a time limit: past `limit` the tool is killed, reaped on a thread of its own,
 /// and `None` returned. Its stdout is read on another thread, so a full pipe can't stall it. A tool
 /// whose earlier run was given up on and hasn't ended yet isn't started: `None` at once.
+#[cfg(unix)]
 fn output_within(prog: &str, args: &[&str], limit: std::time::Duration) -> Option<String> {
     use std::io::Read;
     let key = std::iter::once(prog)
@@ -204,6 +218,7 @@ fn output_within(prog: &str, args: &[&str], limit: std::time::Duration) -> Optio
 }
 
 /// `uname`'s release and machine, the machine as `x86_64` or `aarch64`.
+#[cfg(unix)]
 fn uname() -> (String, String) {
     // SAFETY: utsname is plain old data; uname fills it with NUL-terminated strings.
     let mut u: libc::utsname = unsafe { std::mem::zeroed() };
@@ -410,6 +425,378 @@ pub fn parse_system_profiler(text: &str) -> Vec<Gpu> {
             }
         })
         .collect()
+}
+
+/// The Windows version as `os_version` gives it, from the registry's `ProductName`,
+/// `InstallationType`, build number and `DisplayVersion` (or `ReleaseId` before 20H2): `11 24H2`,
+/// `10 22H2`, `Server 2025 24H2`, `Server 2019 1809`. The marketing version comes from the build
+/// (22000 and later is Windows 11), since Windows 11's ProductName still says Windows 10; a
+/// server's year from its ProductName, else from its build.
+pub fn windows_version(product: &str, installation: &str, build: u32, release: &str) -> String {
+    let server = installation.to_ascii_lowercase().contains("server")
+        || product.to_ascii_lowercase().contains("server");
+    let name = if server {
+        let year = product
+            .split(|c: char| !c.is_ascii_digit())
+            .find(|w| w.len() == 4 && w.starts_with("20"))
+            .map(str::to_string)
+            .or_else(|| {
+                let year = match build {
+                    26100.. => "2025",
+                    20348.. => "2022",
+                    17763.. => "2019",
+                    14393.. => "2016",
+                    _ => return None,
+                };
+                Some(year.to_string())
+            });
+        match year {
+            Some(y) => format!("Server {y}"),
+            None => "Server".to_string(),
+        }
+    } else if build >= 22000 {
+        "11".to_string()
+    } else {
+        "10".to_string()
+    };
+    let release = release.trim();
+    if release.is_empty() {
+        name
+    } else {
+        format!("{name} {release}")
+    }
+}
+
+/// The vendor and device of a PCI hardware id (`PCI\VEN_10DE&DEV_2C02&SUBSYS_...`), lowercase hex:
+/// `("10de", "2c02")`. `None` for any other bus (a Remote Desktop or indirect display adapter).
+pub fn parse_pci_hardware_id(id: &str) -> Option<(String, String)> {
+    let rest = id
+        .get(..4)
+        .filter(|p| p.eq_ignore_ascii_case("pci\\"))
+        .map(|_| &id[4..])?;
+    let field = |key: &str| {
+        rest.split('&')
+            .find_map(|part| {
+                part.get(..key.len())
+                    .filter(|k| k.eq_ignore_ascii_case(key))
+                    .map(|_| &part[key.len()..])
+            })
+            .filter(|v| !v.is_empty() && v.chars().all(|c| c.is_ascii_hexdigit()))
+            .map(str::to_ascii_lowercase)
+    };
+    Some((field("VEN_")?, field("DEV_")?))
+}
+
+/// A PCI device's slot as Linux names it, `0000:01:00.0`, from its bus number and its address
+/// as PnP gives it (device number in the high word, function in the low). The domain is 0.
+pub fn pci_slot(bus: u32, address: u32) -> String {
+    format!(
+        "0000:{:02x}:{:02x}.{:x}",
+        bus,
+        address >> 16,
+        address & 0xffff
+    )
+}
+
+/// The slot from PnP's location text, `PCI bus 1, device 0, function 0`, when bus and address
+/// can't be read on their own.
+pub fn parse_pci_location(text: &str) -> Option<String> {
+    let mut nums = [None; 3];
+    for part in text.split(',') {
+        let mut words = part.split_whitespace().rev();
+        let (Some(n), Some(what)) = (words.next(), words.next()) else {
+            continue;
+        };
+        let i = match what.to_ascii_lowercase().as_str() {
+            "bus" => 0,
+            "device" => 1,
+            "function" => 2,
+            _ => continue,
+        };
+        nums[i] = n.parse::<u32>().ok();
+    }
+    let [Some(bus), Some(dev), Some(func)] = nums else {
+        return None;
+    };
+    Some(pci_slot(bus, (dev << 16) | func))
+}
+
+/// The GPU of a display adapter PnP lists: its hardware ids (the first PCI one counts), PCI slot,
+/// device description and driver service. `None` for one that isn't on PCI.
+pub fn windows_gpu(
+    hardware_ids: &[String],
+    slot: Option<String>,
+    description: Option<String>,
+    service: Option<String>,
+) -> Option<Gpu> {
+    let (vendor, device) = hardware_ids
+        .iter()
+        .find_map(|id| parse_pci_hardware_id(id))?;
+    let slot = slot?;
+    let name = description
+        .map(|d| d.trim().to_string())
+        .filter(|d| !d.is_empty())
+        .unwrap_or_else(|| format!("{vendor}:{device}"));
+    Some(Gpu {
+        id: format!("{vendor}:{device}@{slot}"),
+        vendor,
+        device,
+        name,
+        driver: service
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
+        alias: None,
+        render_node: None,
+    })
+}
+
+#[cfg(windows)]
+mod platform {
+    use super::*;
+    use crate::sys::registry::{hklm_dword, hklm_string};
+    use crate::sys::win::from_wide;
+
+    const CURRENT_VERSION: &str = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion";
+
+    /// The Windows build number (`26100`), from the registry.
+    pub fn build() -> Option<u32> {
+        hklm_string(CURRENT_VERSION, "CurrentBuildNumber")
+            .or_else(|| hklm_string(CURRENT_VERSION, "CurrentBuild"))?
+            .parse()
+            .ok()
+    }
+
+    pub fn detect() -> anyhow::Result<Facts> {
+        let build = build().unwrap_or(0);
+        let text = |name: &str| hklm_string(CURRENT_VERSION, name).unwrap_or_default();
+        let release = hklm_string(CURRENT_VERSION, "DisplayVersion")
+            .or_else(|| hklm_string(CURRENT_VERSION, "ReleaseId"))
+            .unwrap_or_default();
+        let os_version = windows_version(
+            &text("ProductName"),
+            &text("InstallationType"),
+            build,
+            &release,
+        );
+        let kernel = format!(
+            "{}.{}.{build}.{}",
+            hklm_dword(CURRENT_VERSION, "CurrentMajorVersionNumber").unwrap_or(10),
+            hklm_dword(CURRENT_VERSION, "CurrentMinorVersionNumber").unwrap_or(0),
+            hklm_dword(CURRENT_VERSION, "UBR").unwrap_or(0)
+        );
+        let cpu_model = hklm_string(
+            r"HARDWARE\DESCRIPTION\System\CentralProcessor\0",
+            "ProcessorNameString",
+        )
+        .unwrap_or_else(|| "unknown".into());
+        use windows_sys::Win32::System::Threading::{
+            ALL_PROCESSOR_GROUPS, GetActiveProcessorCount,
+        };
+        // SAFETY: plain call; it counts the processors of every group (more than 64 too).
+        let mut cpus = unsafe { GetActiveProcessorCount(ALL_PROCESSOR_GROUPS) };
+        if cpus == 0 {
+            cpus = std::thread::available_parallelism().map_or(1, |n| n.get() as u32);
+        }
+        Ok(Facts {
+            node: String::new(),
+            os: "windows".into(),
+            os_version,
+            arch: arch(),
+            kernel,
+            cpu_model,
+            cpus,
+            ram_mib: ram_mib()?,
+            gpus: gpus(),
+            display: display(),
+            version: String::new(),
+        })
+    }
+
+    /// The machine's architecture, also for a build emulated on another (x86_64 on ARM64).
+    fn arch() -> String {
+        use windows_sys::Win32::System::SystemInformation::{
+            IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_ARM64, IMAGE_FILE_MACHINE_I386,
+        };
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, IsWow64Process2};
+        let (mut process, mut native) = (0u16, 0u16);
+        // SAFETY: the pseudo handle of this process; both outputs are locals.
+        if unsafe { IsWow64Process2(GetCurrentProcess(), &mut process, &mut native) } != 0 {
+            match native {
+                IMAGE_FILE_MACHINE_AMD64 => return "x86_64".into(),
+                IMAGE_FILE_MACHINE_ARM64 => return "aarch64".into(),
+                IMAGE_FILE_MACHINE_I386 => return "x86".into(),
+                _ => {}
+            }
+        }
+        normalize_arch(std::env::consts::ARCH)
+    }
+
+    fn ram_mib() -> anyhow::Result<u64> {
+        use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+        let mut m = MEMORYSTATUSEX {
+            dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
+            ..Default::default()
+        };
+        // SAFETY: m is plain data with dwLength set, as the call requires.
+        if unsafe { GlobalMemoryStatusEx(&mut m) } == 0 {
+            anyhow::bail!(
+                "can't read the RAM size (GlobalMemoryStatusEx): {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        Ok(m.ullTotalPhys / (1024 * 1024))
+    }
+
+    /// The PCI display adapters PnP lists as present, by slot.
+    pub fn gpus() -> Vec<Gpu> {
+        use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
+            DIGCF_PRESENT, GUID_DEVCLASS_DISPLAY, SP_DEVINFO_DATA, SPDRP_ADDRESS, SPDRP_BUSNUMBER,
+            SPDRP_DEVICEDESC, SPDRP_HARDWAREID, SPDRP_LOCATION_INFORMATION, SPDRP_SERVICE,
+            SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInfo, SetupDiGetClassDevsW,
+        };
+        // SAFETY: lists the present devices of the display class; destroyed below.
+        let set = unsafe {
+            SetupDiGetClassDevsW(
+                &GUID_DEVCLASS_DISPLAY,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                DIGCF_PRESENT,
+            )
+        };
+        if set == -1 {
+            return Vec::new();
+        }
+        let mut gpus = Vec::new();
+        for i in 0.. {
+            let mut dev = SP_DEVINFO_DATA {
+                cbSize: std::mem::size_of::<SP_DEVINFO_DATA>() as u32,
+                ..Default::default()
+            };
+            // SAFETY: a valid set; dev is plain data with cbSize set.
+            if unsafe { SetupDiEnumDeviceInfo(set, i, &mut dev) } == 0 {
+                break;
+            }
+            let prop = |p| property(set, &dev, p);
+            let text = |p| prop(p).map(|b| from_wide(&b));
+            let dword = |p| {
+                prop(p)
+                    .filter(|b| b.len() >= 2)
+                    .map(|b| u32::from(b[0]) | (u32::from(b[1]) << 16))
+            };
+            let ids: Vec<String> = prop(SPDRP_HARDWAREID)
+                .map(|b| {
+                    b.split(|&c| c == 0)
+                        .filter(|s| !s.is_empty())
+                        .map(String::from_utf16_lossy)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let slot = match (dword(SPDRP_BUSNUMBER), dword(SPDRP_ADDRESS)) {
+                (Some(bus), Some(address)) => Some(pci_slot(bus, address)),
+                _ => text(SPDRP_LOCATION_INFORMATION).and_then(|t| parse_pci_location(&t)),
+            };
+            gpus.extend(windows_gpu(
+                &ids,
+                slot,
+                text(SPDRP_DEVICEDESC),
+                text(SPDRP_SERVICE),
+            ));
+        }
+        // SAFETY: the set made above, not used after this.
+        unsafe { SetupDiDestroyDeviceInfoList(set) };
+        gpus.sort_by(|a, b| a.id.split('@').nth(1).cmp(&b.id.split('@').nth(1)));
+        gpus
+    }
+
+    /// A device's registry property as UTF-16 units (DWORDs come as two), `None` if it has none.
+    fn property(
+        set: windows_sys::Win32::Devices::DeviceAndDriverInstallation::HDEVINFO,
+        dev: &windows_sys::Win32::Devices::DeviceAndDriverInstallation::SP_DEVINFO_DATA,
+        prop: u32,
+    ) -> Option<Vec<u16>> {
+        use windows_sys::Win32::Devices::DeviceAndDriverInstallation::SetupDiGetDeviceRegistryPropertyW;
+        let mut need = 0u32;
+        // SAFETY: a size query: no buffer, need receives the bytes the value takes.
+        unsafe {
+            SetupDiGetDeviceRegistryPropertyW(
+                set,
+                dev,
+                prop,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0,
+                &mut need,
+            )
+        };
+        if need == 0 {
+            return None;
+        }
+        // u16s, with room for a NUL the value may lack.
+        let mut buf = vec![0u16; (need as usize).div_ceil(2) + 1];
+        // SAFETY: buf has at least `need` bytes.
+        let ok = unsafe {
+            SetupDiGetDeviceRegistryPropertyW(
+                set,
+                dev,
+                prop,
+                std::ptr::null_mut(),
+                buf.as_mut_ptr().cast(),
+                need,
+                std::ptr::null_mut(),
+            )
+        };
+        (ok != 0).then_some(buf)
+    }
+
+    /// Whether this user has an active session: signed in at the console or over Remote Desktop,
+    /// connected (a disconnected one doesn't count; a locked one does, as on a Mac).
+    fn display() -> bool {
+        use windows_sys::Win32::System::RemoteDesktop::{
+            WTS_CURRENT_SERVER_HANDLE, WTS_SESSION_INFOW, WTSActive, WTSEnumerateSessionsW,
+            WTSFreeMemory, WTSQuerySessionInformationW, WTSUserName,
+        };
+        let Some(me) = crate::sys::user_name() else {
+            return false;
+        };
+        let mut info: *mut WTS_SESSION_INFOW = std::ptr::null_mut();
+        let mut count = 0u32;
+        // SAFETY: the local server; info receives an array of count entries, freed below.
+        if unsafe { WTSEnumerateSessionsW(WTS_CURRENT_SERVER_HANDLE, 0, 1, &mut info, &mut count) }
+            == 0
+        {
+            return false;
+        }
+        // SAFETY: WTSEnumerateSessionsW returned count entries at info.
+        let sessions = unsafe { std::slice::from_raw_parts(info, count as usize) };
+        let mine = sessions.iter().filter(|s| s.State == WTSActive).any(|s| {
+            let mut name: windows_sys::core::PWSTR = std::ptr::null_mut();
+            let mut bytes = 0u32;
+            // SAFETY: name receives a string the call allocates, freed below.
+            if unsafe {
+                WTSQuerySessionInformationW(
+                    WTS_CURRENT_SERVER_HANDLE,
+                    s.SessionId,
+                    WTSUserName,
+                    &mut name,
+                    &mut bytes,
+                )
+            } == 0
+            {
+                return false;
+            }
+            // SAFETY: name holds `bytes` bytes of a NUL-terminated string; freed after copying.
+            let user = unsafe {
+                let units = std::slice::from_raw_parts(name, bytes as usize / 2);
+                let user = from_wide(units);
+                WTSFreeMemory(name.cast());
+                user
+            };
+            user.eq_ignore_ascii_case(&me)
+        });
+        // SAFETY: the array WTSEnumerateSessionsW allocated, not used after this.
+        unsafe { WTSFreeMemory(info.cast()) };
+        mine
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -823,6 +1210,7 @@ mod tests {
 
     /// A tool that hangs (nvidia-smi on a wedged GPU) is given up on at the time limit, and
     /// killed: detection goes on without what it would have said.
+    #[cfg(unix)]
     #[test]
     fn a_hung_tool_is_given_up_on() {
         let tmp = tempfile::tempdir().unwrap();
@@ -871,6 +1259,7 @@ mod tests {
     /// wedged GPU sits in an uninterruptible wait, where SIGKILL can't end it, and each refresh
     /// (every minute) would leave one more such process and two more threads in the daemon. The
     /// stand-in: a tool whose output stays open in a process the kill doesn't reach.
+    #[cfg(unix)]
     #[test]
     fn a_tool_whose_run_does_not_end_is_not_started_again() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1079,6 +1468,8 @@ mod tests {
             f.os,
             if cfg!(target_os = "macos") {
                 "macos"
+            } else if cfg!(windows) {
+                "windows"
             } else {
                 "linux"
             }
@@ -1091,7 +1482,7 @@ mod tests {
                 !g.id.is_empty() && !g.vendor.is_empty() && !g.name.is_empty(),
                 "{g:?}"
             );
-            if f.os == "linux" {
+            if f.os == "linux" || f.os == "windows" {
                 assert_eq!(
                     g.id,
                     format!(
@@ -1103,7 +1494,7 @@ mod tests {
                 );
                 assert!(match g.render_node.as_deref() {
                     Some(r) => r.starts_with("/dev/dri/renderD"),
-                    None => g.vendor == "10de",
+                    None => g.vendor == "10de" || f.os == "windows",
                 });
             }
         }
@@ -1114,7 +1505,144 @@ mod tests {
                 ("mac0", "apple")
             );
         }
+        if f.os == "windows" {
+            // 10.0.BUILD.UBR, and a version naming Windows 10 or 11 or a server.
+            let parts: Vec<&str> = f.kernel.split('.').collect();
+            assert_eq!(parts.len(), 4, "{}", f.kernel);
+            assert!(parts[2].parse::<u32>().unwrap() >= 17763, "{}", f.kernel);
+            assert!(
+                ["10", "11", "Server"]
+                    .iter()
+                    .any(|v| f.os_version.split(' ').next() == Some(v)),
+                "{}",
+                f.os_version
+            );
+            #[cfg(windows)]
+            assert_eq!(windows_build(), Some(parts[2].parse().unwrap()));
+        }
         let ids: std::collections::BTreeSet<_> = f.gpus.iter().map(|g| &g.id).collect();
         assert_eq!(ids.len(), f.gpus.len(), "GPU ids are unique");
+    }
+
+    #[test]
+    fn windows_versions() {
+        let cases = [
+            // Windows 11's ProductName still says Windows 10.
+            ("Windows 10 Pro", "Client", 26100, "24H2", "11 24H2"),
+            ("Windows 10 Pro", "Client", 19045, "22H2", "10 22H2"),
+            ("Windows 10 Enterprise", "Client", 17763, "1809", "10 1809"),
+            ("Windows 11 Home", "Client", 22631, "", "11"),
+            (
+                "Windows Server 2025 Datacenter",
+                "Server",
+                26100,
+                "24H2",
+                "Server 2025 24H2",
+            ),
+            (
+                "Windows Server 2019 Standard",
+                "Server Core",
+                17763,
+                "1809",
+                "Server 2019 1809",
+            ),
+            (
+                "Windows Server Datacenter",
+                "Server",
+                20348,
+                "",
+                "Server 2022",
+            ),
+            ("Windows Server", "Server", 100, "", "Server"),
+        ];
+        for (product, installation, build, release, want) in cases {
+            assert_eq!(
+                windows_version(product, installation, build, release),
+                want,
+                "{product} {build}"
+            );
+        }
+        // How --on reads them.
+        let facts = |v: &str| Facts {
+            os: "windows".into(),
+            os_version: v.into(),
+            ..Default::default()
+        };
+        assert!(facts("11 24H2").matches("windows", "11-24h2"));
+        assert!(facts("Server 2025 24H2").matches("windows", "server-2025"));
+    }
+
+    #[test]
+    fn windows_gpus() {
+        assert_eq!(
+            parse_pci_hardware_id(r"PCI\VEN_10DE&DEV_2C02&SUBSYS_205E1458&REV_A1"),
+            Some(("10de".into(), "2c02".into()))
+        );
+        assert_eq!(
+            parse_pci_hardware_id(r"pci\ven_8086&dev_7D67"),
+            Some(("8086".into(), "7d67".into()))
+        );
+        for not_pci in [
+            r"SWD\RemoteDisplayEnum\RdpIdd_IndirectDisplay",
+            r"ROOT\BasicRender",
+            r"PCI\VEN_10DE",
+            r"PCI\VEN_XYZ&DEV_1",
+            "PC",
+            "",
+            "\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}",
+        ] {
+            assert_eq!(parse_pci_hardware_id(not_pci), None, "{not_pci}");
+        }
+        assert_eq!(pci_slot(1, 0), "0000:01:00.0");
+        assert_eq!(pci_slot(0x3a, (0x1f << 16) | 3), "0000:3a:1f.3");
+        assert_eq!(
+            parse_pci_location("PCI bus 1, device 0, function 0").as_deref(),
+            Some("0000:01:00.0")
+        );
+        assert_eq!(
+            parse_pci_location("PCI bus 0, device 2, function 1").as_deref(),
+            Some("0000:00:02.1")
+        );
+        assert_eq!(parse_pci_location("on Intel(R) Xe Graphics"), None);
+        let ids = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let g = windows_gpu(
+            &ids(&[
+                r"PCI\VEN_10DE&DEV_2C02&SUBSYS_205E1458&REV_A1",
+                r"PCI\VEN_10DE&DEV_2C02",
+            ]),
+            Some(pci_slot(1, 0)),
+            Some("NVIDIA GeForce RTX 5080".into()),
+            Some("nvlddmkm".into()),
+        )
+        .unwrap();
+        assert_eq!(g.id, "10de:2c02@0000:01:00.0");
+        assert_eq!(
+            (g.vendor.as_str(), g.device.as_str(), g.name.as_str()),
+            ("10de", "2c02", "NVIDIA GeForce RTX 5080")
+        );
+        assert_eq!(g.driver.as_deref(), Some("nvlddmkm"));
+        assert!(gpu_matches("nvidia", &g) && gpu_matches("10de:2c02", &g));
+        // Named by its ids when PnP has no description; not on PCI: no GPU.
+        let g = windows_gpu(
+            &ids(&[r"PCI\VEN_1234&DEV_1111"]),
+            Some(pci_slot(0, 1 << 16)),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!((g.name.as_str(), g.driver), ("1234:1111", None));
+        assert_eq!(
+            windows_gpu(
+                &ids(&[r"SWD\RemoteDisplayEnum\RdpIdd_IndirectDisplay"]),
+                Some(pci_slot(0, 0)),
+                Some("Microsoft Remote Display Adapter".into()),
+                Some("RdpIdd".into())
+            ),
+            None
+        );
+        assert_eq!(
+            windows_gpu(&ids(&[r"PCI\VEN_10DE&DEV_2C02"]), None, None, None),
+            None
+        );
     }
 }

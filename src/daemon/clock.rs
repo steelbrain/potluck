@@ -11,12 +11,17 @@
 //!
 //! The boot clock counts milliseconds since the machine booted, time asleep included, as the wall
 //! clock does (Linux `CLOCK_BOOTTIME`; macOS `CLOCK_MONOTONIC`, which counts while asleep as
-//! `mach_continuous_time` does). Its readings are stored with the boot's id (Linux's `boot_id`,
-//! macOS's `kern.bootsessionuuid`), so a daemon restarted in the same boot goes on from them. After
-//! a reboot they mean nothing, and nothing of the jobs they timed is left running. The awake clock
-//! (Linux `CLOCK_MONOTONIC`, macOS `CLOCK_UPTIME_RAW`, as Rust's `Instant`) is never stored: a
-//! restarted daemon measures stalls from the first samples it takes, and counts the time since a
-//! SIGTERM or SIGKILL sent before the restart on the boot clock.
+//! `mach_continuous_time` does; Windows' interrupt time, `QueryInterruptTimePrecise`, which counts
+//! sleep and hibernation). Its readings are stored with the boot's id (Linux's `boot_id`, macOS's
+//! `kern.bootsessionuuid`, Windows' `BootId` under the registry's
+//! `Session Manager\Memory Management\PrefetchParameters`, a count of boots), so a daemon
+//! restarted in the same boot goes on from them. After a reboot they mean nothing, and nothing of
+//! the jobs they timed is left running. The awake clock (Linux `CLOCK_MONOTONIC`, macOS
+//! `CLOCK_UPTIME_RAW`, as Rust's `Instant`; Windows' unbiased interrupt time,
+//! `QueryUnbiasedInterruptTimePrecise`, which leaves out sleep and hibernation, where Rust's
+//! `Instant`, `QueryPerformanceCounter`, promises neither) is never stored: a restarted daemon
+//! measures stalls from the first samples it takes, and counts the time since a SIGTERM or SIGKILL
+//! sent before the restart on the boot clock.
 //!
 //! Holds stay on wall time: a hold is a promise in wall-clock terms (`hold W 2h`, the time left in
 //! every reminder), it outlives a reboot, and its record travels to the owner's machine, where
@@ -69,6 +74,38 @@ impl Clock for SystemClock {
 }
 
 /// The machine's boot clock ([`Clock::boot_ms`]), for code with no clock injected.
+#[cfg(windows)]
+pub fn boot_ms() -> u64 {
+    use windows_sys::Win32::System::WindowsProgramming::QueryInterruptTimePrecise;
+    let mut t = 0u64;
+    // SAFETY: writes the interrupt time, in 100 ns units, into t.
+    unsafe { QueryInterruptTimePrecise(&mut t) };
+    t / 10_000
+}
+
+/// The machine's awake clock ([`Clock::awake_ms`]).
+#[cfg(windows)]
+pub fn awake_ms() -> u64 {
+    use windows_sys::Win32::System::WindowsProgramming::QueryUnbiasedInterruptTimePrecise;
+    let mut t = 0u64;
+    // SAFETY: writes the unbiased interrupt time, in 100 ns units, into t.
+    unsafe { QueryUnbiasedInterruptTimePrecise(&mut t) };
+    t / 10_000
+}
+
+/// This boot's id: Windows counts boots in the registry.
+#[cfg(windows)]
+fn read_boot_id() -> String {
+    crate::sys::registry::hklm_dword(
+        r"SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management\PrefetchParameters",
+        "BootId",
+    )
+    .map(|n| format!("boot-{n}"))
+    .unwrap_or_default()
+}
+
+/// The machine's boot clock ([`Clock::boot_ms`]), for code with no clock injected.
+#[cfg(unix)]
 pub fn boot_ms() -> u64 {
     #[cfg(target_os = "linux")]
     let id = libc::CLOCK_BOOTTIME;
@@ -79,6 +116,7 @@ pub fn boot_ms() -> u64 {
 }
 
 /// The machine's awake clock ([`Clock::awake_ms`]).
+#[cfg(unix)]
 pub fn awake_ms() -> u64 {
     // Neither counts while asleep.
     #[cfg(target_os = "linux")]
@@ -89,6 +127,7 @@ pub fn awake_ms() -> u64 {
 }
 
 /// Clock `id`'s reading in milliseconds; 0 if it can't be read.
+#[cfg(unix)]
 fn clock_ms(id: libc::clockid_t) -> u64 {
     let mut ts = libc::timespec {
         tv_sec: 0,
@@ -110,7 +149,7 @@ fn read_boot_id() -> String {
         .unwrap_or_default()
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
 fn read_boot_id() -> String {
     let mut buf = [0u8; 64];
     let mut len = buf.len();
@@ -186,7 +225,12 @@ mod tests {
         // Since boot: well under the Unix time.
         assert!(b < c.wall_ms() / 2, "{b}");
         let id = c.boot_id();
-        assert!(id.len() >= 32, "{id:?}");
+        // A UUID on Linux and macOS; Windows counts boots.
+        if cfg!(windows) {
+            assert!(id.starts_with("boot-") && id.len() > 5, "{id:?}");
+        } else {
+            assert!(id.len() >= 32, "{id:?}");
+        }
         assert_eq!(id, c.boot_id());
         // The awake clock runs too. It may be ahead of the boot clock: on macOS the two drift
         // apart (7 s after 13 hours awake on the M3).
@@ -194,6 +238,13 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(30));
         let a2 = c.awake_ms();
         assert!(a > 0 && a2 >= a + 25 && a2 < a + 5_000, "{a} {a2}");
+        // On Windows both come from the interrupt time: the awake one leaves out the time asleep,
+        // so it is never ahead.
+        #[cfg(windows)]
+        {
+            let (awake, boot) = (c.awake_ms(), c.boot_ms());
+            assert!(awake <= boot, "{awake} {boot}");
+        }
     }
 
     #[test]
