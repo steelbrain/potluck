@@ -605,6 +605,9 @@ mod tests {
     use super::*;
 
     fn run_cmd(dir: &Path, limit: Limit, cmd: &[&str]) -> (i32, String) {
+        // As `run` does: else CMD, and a process it leaves running, would hold this test's own
+        // stdout and stderr too.
+        keep_std_handles();
         let status = dir.join("status.json");
         let out = std::fs::OpenOptions::new()
             .create(true)
