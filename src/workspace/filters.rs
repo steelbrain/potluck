@@ -707,9 +707,10 @@ mod tests {
             let mut names: Vec<&str> = dirty.iter().map(|l| &l[3..]).collect();
             names.sort();
             // Git itself calls these modified in a checkout it has just written. (With autocrlf
-            // the file the strip filter cleans ends its line with "\r\n", so "*$" finds no spaces.)
+            // the file the strip filter cleans ends its line with "\r\n", so "*$" finds no spaces;
+            // but Git for Windows' sed reads "\r\n" as the line's end, and strips them.)
             let mut want = vec!["crlf.txt", "id.c", "lf.md", "mixed.bat", "up.up"];
-            if !autocrlf {
+            if !autocrlf || cfg!(windows) {
                 want.insert(4, "trail.ws");
             }
             assert_eq!(names, want, "autocrlf {autocrlf}: {dirty:?}");
