@@ -227,7 +227,7 @@ impl Group {
 
 /// Resumes every thread of process `pid` (a process created suspended has one).
 #[cfg(windows)]
-fn resume_threads(pid: u32) -> io::Result<()> {
+pub(crate) fn resume_threads(pid: u32) -> io::Result<()> {
     use super::win::Owned;
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,

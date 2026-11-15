@@ -11,19 +11,29 @@
 //! - **Process groups.** A [`Group`] is a child and everything it starts: on Unix the child leads
 //!   a process group of its own, on Windows it runs in a job object of its own from its first
 //!   instruction (it starts suspended until it is in the job).
+//! - **Which file.** [`FileId`]: device and inode on Unix, volume and file id on Windows.
+//! - **The local socket.** [`local`]: the daemon's Unix domain socket, std's on Unix and AF_UNIX
+//!   through Winsock on Windows.
 
+mod fileid;
 mod host;
+pub mod local;
 mod path;
 mod perm;
+mod private;
 mod proc;
 #[cfg(windows)]
 pub(crate) mod registry;
 
+pub use fileid::{FileId, canonical, same_file};
 pub use host::{LocalTime, free_bytes, home_dir, home_var, hostname, local_time, user_name};
 pub use path::canonicalize;
 #[cfg(windows)]
 pub use perm::user_sid;
 pub use perm::{create_dir, create_dir_all, file_mode, set_mode};
+pub use private::is_private;
+#[cfg(windows)]
+pub(crate) use proc::resume_threads;
 pub use proc::{Group, kill_pid, pid_alive};
 
 /// `path` as UTF-8 text, or an error naming it. Paths potluck keeps are UTF-8 (the state
