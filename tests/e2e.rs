@@ -1656,19 +1656,36 @@ fn nested_dispatch_runs_in_place_within_the_lease() {
 #[test]
 fn a_restarted_daemon_adopts_running_jobs() {
     let mut n = Node::new();
+    // Each job runs until the test makes its file: a job that ends by the clock may end before
+    // it is seen running on a busy machine (starting one can take seconds).
+    let dir = n.dir.path().to_path_buf();
+    let go = |job: &str| dir.join(format!("go-{job}"));
+    // In sh's words (forward slashes on Windows, which sh takes as they are).
+    let until = |path: PathBuf| {
+        let path = path.display().to_string().replace('\\', "/");
+        format!("while [ ! -e '{path}' ]; do sleep 0.1; done")
+    };
     let slow = n.dispatch(&[
         "--timeout",
         "1m",
         "--",
         "sh",
         "-c",
-        "sleep 4; echo survived; exit 4",
+        &format!("{}; echo survived; exit 4", until(go("slow"))),
     ]);
-    let quick = n.dispatch(&["--timeout", "1m", "--", "sh", "-c", "sleep 1; exit 5"]);
+    let quick = n.dispatch(&[
+        "--timeout",
+        "1m",
+        "--",
+        "sh",
+        "-c",
+        &format!("{}; exit 5", until(go("quick"))),
+    ]);
     n.running(&slow);
     n.running(&quick);
     n.stop_daemon();
     // `quick` ends while no daemon runs: its supervisor writes its exit status.
+    std::fs::write(go("quick"), "").unwrap();
     let status = n.paths.job_dir(&quick).join("status.json");
     let start = Instant::now();
     while !status.exists() {
@@ -1681,6 +1698,7 @@ fn a_restarted_daemon_adopts_running_jobs() {
     n.start_daemon();
     let (code, _, _) = n.wait(&quick);
     assert_eq!(code, 5);
+    std::fs::write(go("slow"), "").unwrap();
     let (code, j, out) = n.wait(&slow);
     assert_eq!(code, 4, "{j} {}", n.daemon_log());
     assert!(out.contains("survived") || n.output(&slow).contains("survived"));
