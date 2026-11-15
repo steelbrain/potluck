@@ -302,7 +302,8 @@ and is not passed over. Running jobs are never stopped for priority.
   dispatching machine when the job ends, into `jobs/<job>/keep/` in its state directory (not into
   the directory you dispatched from). A trailing `**` keeps everything below: `results/**` keeps
   every file under `results/`, and `**` the whole workspace. A glob that
-  is absolute, holds `..` or doesn't parse is refused at dispatch. Symlinks and file names follow
+  is absolute (on Windows also one that starts with `\` or `/` or names a drive, such as `C:x`),
+  holds `..` or doesn't parse is refused at dispatch. Symlinks and file names follow
   the rules of `potluck cp` (see [Workspaces](workspaces.md)). The output log is always kept there
   too, as `jobs/<job>/output.log`. Both are deleted after `retention_days`.
 - `--label K=V`, repeatable: stored with the job.

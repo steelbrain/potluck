@@ -112,10 +112,15 @@ fn without_process_lists(job: &mut crate::types::JobRecord) {
 }
 
 /// Checks a path relative to a workspace root without touching the disk: no absolute paths, no
-/// `..`.
+/// `..`. On Windows a path that starts at a root or names a drive is absolute too (`\dir`, `/dir`
+/// and `C:dir` aren't, to the system: the current drive's root, and drive C's current
+/// directory).
 fn check_relative(rel: &str) -> Result<&Path, String> {
     let p = Path::new(rel);
-    if p.is_absolute() {
+    if p.is_absolute()
+        || p.has_root()
+        || matches!(p.components().next(), Some(Component::Prefix(_)))
+    {
         return Err(format!("{rel}: give a path relative to the workspace root"));
     }
     if p.components().any(|c| matches!(c, Component::ParentDir)) {
@@ -633,6 +638,36 @@ mod tests {
         let mut buf = Vec::new();
         send_copy(&mut buf, &[], &root, "a/loop/two.txt").unwrap();
         assert_eq!(entries(&buf)[0].2, b"two");
+    }
+
+    /// A glob or path that is absolute or holds `..` is refused before anything is read. On
+    /// Windows so is one that starts at a root (`\x`, `/x`: the current drive's) or names a
+    /// drive (`C:x`: drive C's current directory), which the system doesn't call absolute.
+    #[test]
+    fn globs_and_paths_outside_the_workspace_are_refused() {
+        let absolute = "give a path relative to the workspace root";
+        let mut cases = vec![
+            ("/etc/passwd", absolute),
+            ("a/../../x", "paths with .. are refused"),
+        ];
+        if cfg!(windows) {
+            cases.extend([
+                ("\\etc\\passwd", absolute),
+                ("C:x", absolute),
+                ("C:\\x", absolute),
+                ("\\\\server\\share\\x", absolute),
+                ("a\\..\\..\\x", "paths with .. are refused"),
+            ]);
+        }
+        for (g, why) in cases {
+            let e = check_keep(g).unwrap_err();
+            assert!(e.contains(why), "{g}: {e}");
+            let e = resolve(Path::new("."), g).unwrap_err();
+            assert!(e.contains(why), "{g}: {e}");
+        }
+        for g in ["a/*.txt", "a/b", "**"] {
+            assert_eq!(check_keep(g), Ok(()), "{g}");
+        }
     }
 
     #[cfg(unix)]
