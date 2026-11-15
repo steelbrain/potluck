@@ -275,7 +275,7 @@ mod win {
                     && {
                         let ace = &*(ace as *const ACCESS_ALLOWED_ACE);
                         u32::from(ace.Header.AceType)
-                            == windows_sys::Win32::Security::ACCESS_ALLOWED_ACE_TYPE
+                            == windows_sys::Win32::System::SystemServices::ACCESS_ALLOWED_ACE_TYPE
                             && u32::from(ace.Header.AceFlags)
                                 == OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE
                             && ace.Mask == FILE_ALL_ACCESS

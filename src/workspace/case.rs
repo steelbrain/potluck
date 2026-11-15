@@ -16,7 +16,9 @@
 //! or control characters, names ending in a dot or a space, device names (`CON`, `aux.c`, `LPT1`),
 //! and names over 255 UTF-16 units; git for Windows refuses to check them out.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+#[cfg(unix)]
+use std::collections::BTreeSet;
 use std::path::Path;
 
 /// Whether `dir` looks names up without regard to case: probes with a file of its own.
