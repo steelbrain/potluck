@@ -5,8 +5,8 @@
 //! when that machine's report of its end arrived, whatever the runner's clock says.
 //!
 //! - One file, `potluck.db`, in WAL mode, so readers never wait on the writer; opened by the
-//!   daemon's process alone (SQLite's `unix-excl`), so the WAL index is in memory, not in a
-//!   memory-mapped file that a full disk turns into SIGBUS.
+//!   daemon's process alone (SQLite's `unix-excl`; on Windows, exclusive locking mode), so the
+//!   WAL index is in memory, not in a memory-mapped file that a full disk turns into SIGBUS.
 //! - Records are stored whole as JSON; the columns beside them exist only to find them.
 //! - The schema version is SQLite's `user_version`. A database from a newer potluck is refused
 //!   rather than guessed at.
@@ -71,12 +71,23 @@ impl Store {
         // with SIGBUS (in walTryBeginRead); an ordinary write just fails and is made again
         // later. Other processes can't open the database meanwhile; only the daemon does (one
         // daemon per home).
+        #[cfg(unix)]
         let conn = rusqlite::Connection::open_with_flags_and_vfs(
             path,
             rusqlite::OpenFlags::default(),
             c"unix-excl",
         )
         .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+        // Windows has no "unix-excl"; its default VFS in exclusive locking mode, set before the
+        // database is first read, does the same: no `-shm` file, the WAL index in memory, and
+        // no other process can open the database while the daemon has it.
+        #[cfg(windows)]
+        let conn = {
+            let conn = rusqlite::Connection::open(path)
+                .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+            conn.pragma_update(None, "locking_mode", "EXCLUSIVE")?;
+            conn
+        };
         conn.busy_timeout(std::time::Duration::from_secs(10))?;
         // WAL: readers don't block the writer. NORMAL is durable across a process crash, which is
         // what matters here (a power loss may lose the last few changes, never corrupt).
