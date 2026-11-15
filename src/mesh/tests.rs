@@ -705,14 +705,17 @@ fn heartbeats_tell_down_and_up() {
     );
     assert!(t.elapsed() >= DOWN_AFTER, "{:?}", t.elapsed());
     // It says how the last heartbeat failed: b's port refuses connections now, or a ping in
-    // flight as b stopped broke or ran out of time.
-    let Event::Down { why: Some(why), .. } = &down else {
-        panic!("no reason: {down:?}")
-    };
-    assert!(
-        why.starts_with("can't reach b: ") || why == "b did not answer in time",
-        "{why}"
-    );
+    // flight as b stopped broke or ran out of time. (Windows refuses a connection to a closed
+    // port on 127.0.0.1 only after retrying for about 2 s, past this test's down time, so no
+    // heartbeat may have failed yet.)
+    match &down {
+        Event::Down { why: Some(why), .. } => assert!(
+            why.starts_with("can't reach b: ") || why == "b did not answer in time",
+            "{why}"
+        ),
+        _ if cfg!(windows) => {}
+        _ => panic!("no reason: {down:?}"),
+    }
     wait_until("a sees b down", || !a.member("b").unwrap().alive);
 
     let b = start_version("b", &dir, "0.1.0");

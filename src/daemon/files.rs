@@ -685,7 +685,7 @@ mod tests {
         }
         std::fs::create_dir_all(root.join(&rel)).unwrap();
         std::fs::write(root.join(&rel).join("f"), b"deep").unwrap();
-        let deepest = format!("{}/f", rel.display());
+        let deepest = format!("{}/f", slashed(&rel));
         // Dropped before `d`, also when an assertion fails.
         let chains = Chains {
             tops: vec![root.clone(), dest.clone()],
@@ -803,7 +803,8 @@ mod tests {
     #[test]
     fn keep_globs_match_as_glob_does() {
         let d = tempfile::tempdir().unwrap();
-        let root = d.path().canonicalize().unwrap().join("ws");
+        // Without Windows' `\\?\` prefix, which the glob crate doesn't read.
+        let root = crate::sys::canonicalize(d.path()).unwrap().join("ws");
         for dir in ["a/b/c", "a/bb", "x/b", ".h/b"] {
             std::fs::create_dir_all(root.join(dir)).unwrap();
         }

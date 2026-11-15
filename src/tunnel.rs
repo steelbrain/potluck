@@ -1004,10 +1004,14 @@ mod tests {
             )
         );
         assert!(read(&view, "config").contains("repositoryformatversion = 0"));
-        let objects = git_dir.join("objects").canonicalize().unwrap();
+        let objects = crate::sys::canonicalize(&git_dir.join("objects")).unwrap();
+        let objects = objects.display().to_string();
+        // With `/` on Windows, as Git for Windows reads paths.
+        #[cfg(windows)]
+        let objects = objects.replace('\\', "/");
         assert_eq!(
             read(&view, "objects/info/alternates"),
-            format!("{}\n", objects.display())
+            format!("{objects}\n")
         );
         assert_eq!(read(&view, "HEAD"), "ref: refs/heads/y\n");
         // What a fetch may want: the objects its refs name, the tag's own included.

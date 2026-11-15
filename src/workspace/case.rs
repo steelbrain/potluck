@@ -282,6 +282,8 @@ mod tests {
             vec![s(&["Docs", "docs"]), s(&["README", "readme"])]
         );
         assert!(collisions(&s(&["a/b", "a/c", "A1"])).is_empty());
+        // Normalisation counts on APFS; NTFS and ReFS keep the two forms apart.
+        #[cfg(not(windows))]
         assert_eq!(
             collisions(&s(&["caf\u{e9}", "Cafe\u{301}/x", "cafe"]))
                 .into_values()
