@@ -192,7 +192,8 @@ fn supervise(
         }
     };
     let mut command = Command::new(prog);
-    command.args(args).stdin(Stdio::null());
+    add_args(&mut command, prog, args);
+    command.stdin(Stdio::null());
     match writer.try_clone() {
         Ok(w) => {
             command.stdout(w).stderr(writer);
@@ -554,6 +555,51 @@ fn duplicate(h: HANDLE) -> Option<Owned> {
     if ok == 0 { None } else { Owned::new(dup) }
 }
 
+/// Gives CMD's arguments to `command`: quoted as the C runtime reads them (`\"` for a quote,
+/// as `Command::args` writes them), except for cmd.exe, which doesn't read that quoting. For
+/// `cmd [SWITCH]... /c ARG...` (or `/k`) cmd gets the line after the switch as one typed after
+/// it, in the form it reads literally (`/s /c "LINE"`): one ARG as it is, or several joined by
+/// spaces, with quotes around each that holds a space or tab and no quote.
+fn add_args(command: &mut Command, prog: &str, args: &[String]) {
+    use std::os::windows::process::CommandExt;
+    let program = Path::new(prog);
+    let is_cmd = program
+        .file_stem()
+        .is_some_and(|s| s.eq_ignore_ascii_case("cmd"))
+        && program
+            .extension()
+            .is_none_or(|e| e.eq_ignore_ascii_case("exe"));
+    let at = args.iter().position(|a| {
+        a.eq_ignore_ascii_case("/c") || a.eq_ignore_ascii_case("/k") || !a.starts_with('/')
+    });
+    let Some(at) = at.filter(|&i| is_cmd && args[i].starts_with('/')) else {
+        command.args(args);
+        return;
+    };
+    let rest = &args[at + 1..];
+    let line = match rest {
+        [one] => one.clone(),
+        _ => rest
+            .iter()
+            .map(|a| {
+                if a.contains([' ', '\t']) && !a.contains('"') {
+                    format!("\"{a}\"")
+                } else {
+                    a.clone()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+    };
+    for switch in &args[..at] {
+        command.raw_arg(switch);
+    }
+    if !args[..at].iter().any(|a| a.eq_ignore_ascii_case("/s")) {
+        command.raw_arg("/s");
+    }
+    command.raw_arg(format!("{} \"{line}\"", args[at]));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -643,5 +689,27 @@ mod tests {
         assert_eq!(code, 3);
         assert!(log.contains("done"), "{log}");
         assert!(started.elapsed() < Duration::from_secs(15));
+    }
+
+    /// cmd gets the line after /c as typed: quotes stay quotes, and of several arguments one
+    /// with a space is quoted.
+    #[test]
+    fn cmd_reads_its_line_as_typed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (code, log) = run_cmd(
+            dir.path(),
+            ALL,
+            &[
+                "cmd",
+                "/d",
+                "/c",
+                "set \"X=a b\"& echo \"q u\"& call echo [%X%]",
+            ],
+        );
+        assert_eq!(code, 0, "{log}");
+        assert_eq!(log, "\"q u\"\r\n[a b]\r\n");
+        let (code, log) = run_cmd(dir.path(), ALL, &["CMD.EXE", "/C", "echo", "a b", "c\"d"]);
+        assert_eq!(code, 0, "{log}");
+        assert!(log.ends_with("\"a b\" c\"d\r\n"), "{log}");
     }
 }

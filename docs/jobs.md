@@ -4,7 +4,10 @@
 
 A job runs a command, given after `--` or by a [recipe](#recipes), at the commit HEAD points to.
 The command runs in the workspace's root as an argument list, not through a shell; use
-`-- sh -c '...'` for shell syntax. Only committed work runs:
+`-- sh -c '...'` for shell syntax. On Windows a program gets its arguments quoted as the C
+runtime reads them, except cmd: in `-- cmd /c LINE` (or `/k`, after any other switches) cmd gets
+LINE as if typed after `/c`, quotes included. Several arguments after `/c` are joined by spaces,
+each holding a space and no quote put in quotes. Only committed work runs:
 
 ```console
 $ potluck dispatch --timeout 10m -- cargo test
