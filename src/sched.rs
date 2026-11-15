@@ -8,8 +8,9 @@
 //!   grant is the RAM it asked for. While it runs nothing else starts there.
 //! - **All at once.** A job gets every resource it asks for in one grant, or none. Each GPU selector
 //!   gets its own GPU; when several assignments work, the first in the machine's GPU order wins.
-//! - **Feasibility.** The machine must be in one of the job's pools, facts (`on`) must match, the
-//!   RAM must fit the capacity, the selectors must fit the machine's GPUs, and a job pinned to a
+//! - **Feasibility.** The machine must be in one of the job's pools, facts (`on`) must match (a
+//!   Windows machine runs only jobs that ask for Windows by name, [`Facts::declines`]), the RAM
+//!   must fit the capacity, the selectors must fit the machine's GPUs, and a job pinned to a
 //!   workspace runs only on that workspace's machine. A job this machine can never run is skipped:
 //!   it is neither blocked here nor passed over, and holds nothing.
 //! - **Workspaces.** One invocation at a time runs in a workspace, and invocations dispatched into
@@ -169,8 +170,8 @@ pub struct Reservation {
     pub at: Millis,
 }
 
-/// Whether this machine could ever run the job (pool, facts, RAM capacity, GPUs that exist,
-/// pinning). `Err` says why not, in plain words.
+/// Whether this machine could ever run the job (pool, facts and the OS it asks for, RAM capacity,
+/// GPUs that exist, pinning). `Err` says why not, in plain words.
 pub fn feasible(machine: &MachineView, job: &Queued) -> Result<(), String> {
     if let Some((ws, node, _)) = &job.workspace
         && *node != machine.facts.node
@@ -183,6 +184,9 @@ pub fn feasible(machine: &MachineView, job: &Queued) -> Result<(), String> {
             machine.pool,
             crate::types::fmt_pools(&job.pools)
         ));
+    }
+    if let Some(declined) = machine.facts.declines(&job.on) {
+        return Err(declined);
     }
     if let Some(unmet) = machine.facts.unmet(&job.on) {
         return Err(unmet);

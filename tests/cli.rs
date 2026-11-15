@@ -894,7 +894,7 @@ fn dispatch_refuses_bad_options_before_sending_anything() {
         ),
         (
             &["dispatch", "--timeout", "5m", "--on", "gpu", "--", "true"][..],
-            "--on: gpu needs a value, gpu=VALUE (only macos and linux stand alone)",
+            "--on: gpu needs a value, gpu=VALUE (only macos, linux and windows stand alone)",
         ),
         (
             &["dispatch", "--timeout", "5m", "--env", "NOEQ", "--", "true"][..],

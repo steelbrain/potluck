@@ -22,8 +22,9 @@
 //! pools = ["gpu"]
 //! ```
 //!
-//! `on` is a table, or a list in `--on`'s syntax, where `macos` and `linux` can stand alone (any
-//! version): `on = ["macos", "gpu=apple"]`.
+//! `on` is a table, or a list in `--on`'s syntax, where `macos`, `linux` and `windows` can stand
+//! alone (any version): `on = ["macos", "gpu=apple"]`. A Windows machine runs only jobs whose `on`
+//! asks for Windows (`windows`, `windows=V` or `os = "windows"`).
 
 use crate::cli::DispatchArgs;
 use crate::gitinfo::short;
@@ -43,6 +44,7 @@ pub const FILE_NAME: &str = "potluck.toml";
 pub const FACT_KEYS: &[&str] = &[
     "macos",
     "linux",
+    "windows",
     "gpu",
     "gpu_driver",
     "ram_gib",
@@ -144,7 +146,7 @@ fn table_or_list<'de, D: serde::Deserializer<'de>>(
 }
 
 /// Splits one `--on` argument: `KEY=VALUE`, or a bare `KEY` with an empty value (which only
-/// `macos` and `linux` accept, see [`check_facts`]).
+/// `macos`, `linux` and `windows` accept, see [`check_facts`]).
 fn split_on(s: &str) -> (String, String) {
     match s.split_once('=') {
         Some((k, v)) => (k.trim().to_string(), v.to_string()),
@@ -153,7 +155,7 @@ fn split_on(s: &str) -> (String, String) {
 }
 
 /// Refuses requirements `--on` and a recipe's `on` can't express: unknown facts, a bare key or
-/// an empty value other than `macos` and `linux` (any version), and requirements that
+/// an empty value other than `macos`, `linux` and `windows` (any version), and requirements that
 /// contradict each other ([`check_on`]).
 fn check_facts(on: &BTreeMap<String, String>) -> Result<(), String> {
     for (key, value) in on {
@@ -165,7 +167,7 @@ fn check_facts(on: &BTreeMap<String, String>) -> Result<(), String> {
         }
         if value.is_empty() && !is_os_shorthand(key) {
             return Err(format!(
-                "{key} needs a value, {key}=VALUE (only macos and linux stand alone)"
+                "{key} needs a value, {key}=VALUE (only macos, linux and windows stand alone)"
             ));
         }
     }
@@ -460,7 +462,7 @@ fn resolve_env(
 }
 
 /// The facts a dispatch requires: the recipe's `on`, then each `--on`, key by key. The OS keys
-/// (`macos`, `linux`, `os`) count as one: an `--on` naming the OS replaces the recipe's, so
+/// (`macos`, `linux`, `windows`, `os`) count as one: an `--on` naming the OS replaces the recipe's, so
 /// `--on linux` runs a recipe that says `macos = "27"` on Linux. Each side is checked on its
 /// own, then the two together.
 fn resolve_on(
@@ -475,7 +477,7 @@ fn resolve_on(
     for kv in flags {
         let (k, v) = split_on(kv);
         if k.is_empty() {
-            anyhow::bail!("--on {kv:?}: expected KEY=VALUE, or macos or linux alone");
+            anyhow::bail!("--on {kv:?}: expected KEY=VALUE, or macos, linux or windows alone");
         }
         // All must hold, and one key keeps one value: the second would replace the first.
         if let Some(had) = given.get(&k).filter(|had| **had != v) {
@@ -911,6 +913,15 @@ unset_env = ["A"]
         )
         .unwrap();
         assert_eq!(on(&r), [("gpu", "nvidia")]);
+        // windows stands alone or takes the Windows version, like macos.
+        let r = resolve(&file, &args(&with(&["--on", "windows"]))).unwrap();
+        assert_eq!(on(&r), [("windows", "")]);
+        let r = resolve(
+            &file,
+            &args(&with(&["--on", "windows=11", "--on", "os=Windows"])),
+        )
+        .unwrap();
+        assert_eq!(on(&r), [("os", "Windows"), ("windows", "11")]);
 
         for (extra, want) in [
             (
@@ -927,11 +938,11 @@ unset_env = ["A"]
             ),
             (
                 &["--on", "gpu"],
-                "--on: gpu needs a value, gpu=VALUE (only macos and linux stand alone)",
+                "--on: gpu needs a value, gpu=VALUE (only macos, linux and windows stand alone)",
             ),
             (
                 &["--on", "kernel="],
-                "--on: kernel needs a value, kernel=VALUE (only macos and linux stand alone)",
+                "--on: kernel needs a value, kernel=VALUE (only macos, linux and windows stand alone)",
             ),
             (
                 &["--on", "macos=."],
@@ -939,11 +950,19 @@ unset_env = ["A"]
             ),
             (
                 &["--on", "=27"],
-                "--on \"=27\": expected KEY=VALUE, or macos or linux alone",
+                "--on \"=27\": expected KEY=VALUE, or macos, linux or windows alone",
             ),
             (
-                &["--on", "windows"],
-                "--on: unknown fact \"windows\": use one of macos, linux, gpu,",
+                &["--on", "plan9"],
+                "--on: unknown fact \"plan9\": use one of macos, linux, windows, gpu,",
+            ),
+            (
+                &["--on", "windows", "--on", "macos"],
+                "--on: macos and windows contradict each other: a machine runs one OS",
+            ),
+            (
+                &["--on", "windows=11", "--on", "os=linux"],
+                "--on: windows=11 and os=linux contradict each other: a machine runs one OS",
             ),
             (
                 &["--on", "gpu=nvidia", "--on", "gpu=amd"],
@@ -988,6 +1007,16 @@ on = ["macos", "linux"]
 cmd = ["true"]
 timeout = "1m"
 on = ["gpu"]
+
+[recipe.win]
+cmd = ["cmd", "/c", "build.bat"]
+timeout = "1m"
+on = ["windows=11", "gpu=nvidia"]
+
+[recipe.win-os]
+cmd = ["cmd", "/c", "build.bat"]
+timeout = "1m"
+on = { os = "windows" }
 "#,
         )
         .unwrap();
@@ -1007,6 +1036,17 @@ on = ["gpu"]
         assert_eq!(on(&r), [("os", "linux"), ("os_version", "cachyos")]);
         let r = resolve(&file, &args(&["mac", "--on", "gpu=any"])).unwrap();
         assert_eq!(on(&r), [("gpu", "any"), ("macos", "27")]);
+        // windows counts as one key with the other OS keys.
+        let r = resolve(&file, &args(&["win"])).unwrap();
+        assert_eq!(on(&r), [("gpu", "nvidia"), ("windows", "11")]);
+        let r = resolve(&file, &args(&["win", "--on", "windows"])).unwrap();
+        assert_eq!(on(&r), [("gpu", "nvidia"), ("windows", "")]);
+        let r = resolve(&file, &args(&["win", "--on", "linux"])).unwrap();
+        assert_eq!(on(&r), [("gpu", "nvidia"), ("linux", "")]);
+        let r = resolve(&file, &args(&["mac", "--on", "os=windows"])).unwrap();
+        assert_eq!(on(&r), [("gpu", "apple"), ("os", "windows")]);
+        let r = resolve(&file, &args(&["win-os", "--on", "windows=10"])).unwrap();
+        assert_eq!(on(&r), [("windows", "10")]);
 
         assert_eq!(
             err(&file, &["old", "--on", "macos=27"]),
@@ -1018,7 +1058,7 @@ on = ["gpu"]
         );
         assert_eq!(
             err(&file, &["bare-gpu"]),
-            "recipe bare-gpu: on: gpu needs a value, gpu=VALUE (only macos and linux stand alone)"
+            "recipe bare-gpu: on: gpu needs a value, gpu=VALUE (only macos, linux and windows stand alone)"
         );
         // A recipe that isn't dispatched doesn't stop others.
         assert!(resolve(&file, &args(&["--timeout", "1m", "--", "true"])).is_ok());

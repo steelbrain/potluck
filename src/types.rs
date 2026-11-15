@@ -705,8 +705,8 @@ pub struct Reminder {
 /// One GPU of a machine.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Gpu {
-    /// Linux: `vendor:device@pci-slot`, lowercase hex, e.g. `1002:744c@0000:03:00.0`.
-    /// macOS: `mac0`, `mac1`, ...
+    /// Linux and Windows: `vendor:device@pci-slot`, lowercase hex, e.g.
+    /// `1002:744c@0000:03:00.0`. macOS: `mac0`, `mac1`, ...
     pub id: String,
     /// PCI vendor id in lowercase hex without 0x (`1002`, `10de`, `8086`), or `apple`.
     pub vendor: String,
@@ -714,7 +714,8 @@ pub struct Gpu {
     pub device: String,
     /// e.g. "NVIDIA GeForce RTX 5080 Laptop GPU" or "Apple M3 Max".
     pub name: String,
-    /// Kernel driver (amdgpu, i915, xe, nvidia), if known.
+    /// Kernel driver (amdgpu, i915, xe, nvidia), if known. On Windows the display driver's
+    /// service name (nvlddmkm, amdkmdag, BasicDisplay).
     pub driver: Option<String>,
     /// Short name from the node config.
     pub alias: Option<String>,
@@ -763,9 +764,10 @@ pub fn gpu_matches(sel: &str, gpu: &Gpu) -> bool {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Facts {
     pub node: NodeName,
-    /// `linux` or `macos`.
+    /// `linux`, `macos` or `windows`.
     pub os: String,
-    /// Distribution and version, or the macOS version.
+    /// Distribution and version, the macOS version, or the Windows version (`11 24H2`,
+    /// `Server 2025 24H2`).
     pub os_version: String,
     /// `x86_64` or `aarch64`.
     pub arch: String,
@@ -798,9 +800,19 @@ pub fn version_matches(want: &str, have: &str) -> bool {
 }
 
 /// Whether `key` is an OS shorthand: `macos` (any macOS) or `macos=V` (V matched against the
-/// macOS version, `os_version`), `linux` or `linux=V` (V matched against the kernel).
+/// macOS version, `os_version`), `linux` or `linux=V` (V matched against the kernel), `windows`
+/// or `windows=V` (V matched against the Windows version, `os_version`).
 pub fn is_os_shorthand(key: &str) -> bool {
-    matches!(key, "macos" | "linux")
+    matches!(key, "macos" | "linux" | "windows")
+}
+
+/// Whether `on` asks for OS `os` by name: `--on windows`, `--on windows=V` or `--on os=windows`
+/// (case ignored in the value).
+pub fn asks_for_os(on: &BTreeMap<String, String>, os: &str) -> bool {
+    on.contains_key(os)
+        || on
+            .get("os")
+            .is_some_and(|v| v.trim().eq_ignore_ascii_case(os))
 }
 
 /// A requirement as `--on` writes it: `macos` for any macOS (an OS shorthand with no version),
@@ -834,9 +846,10 @@ pub fn same_arch(have: &str, want: &str) -> bool {
 
 /// The keys that name an OS. A machine runs one OS, so these must agree, and a dispatch's
 /// `--on` for any of them replaces its recipe's for all of them.
-pub const OS_KEYS: [&str; 3] = ["macos", "linux", "os"];
+pub const OS_KEYS: [&str; 4] = ["macos", "linux", "windows", "os"];
 
-/// The requirements: those naming the OS first (`macos`, `linux`, `os`), then the rest by key.
+/// The requirements: those naming the OS first (`macos`, `linux`, `windows`, `os`), then the rest
+/// by key.
 fn on_in_order(on: &BTreeMap<String, String>) -> impl Iterator<Item = (&str, &str)> {
     let os = OS_KEYS.iter().filter_map(|k| on.get_key_value(*k));
     let rest = on.iter().filter(|(k, _)| !OS_KEYS.contains(&k.as_str()));
@@ -894,7 +907,11 @@ pub fn check_on(on: &BTreeMap<String, String>) -> Result<(), String> {
             "{a} and {b} contradict each other: a machine runs one OS"
         ));
     }
-    for (short, fact) in [("macos", "os_version"), ("linux", "kernel")] {
+    for (short, fact) in [
+        ("macos", "os_version"),
+        ("linux", "kernel"),
+        ("windows", "os_version"),
+    ] {
         let (Some(s), Some(f)) = (on.get(short), on.get(fact)) else {
             continue;
         };
@@ -915,8 +932,9 @@ impl Facts {
     /// selector, and `gpu_driver` when any GPU's kernel driver has that name (case ignored);
     /// `ram_gib` when the machine has at least that much (`32`, `15.5`); `os_version` and `kernel`
     /// when `want`'s parts are the leading parts of the machine's ([`version_matches`]);
-    /// `macos` and `linux` when the machine runs that OS and, unless `want` is empty, its macOS
-    /// version (`os_version`) or its kernel matches `want` that way; `os` and `arch` ignoring
+    /// `macos`, `linux` and `windows` when the machine runs that OS and, unless `want` is empty,
+    /// its macOS or Windows version (`os_version`) or its kernel matches `want` that way; `os` and
+    /// `arch` ignoring
     /// case, with `arm64` the same arch as `aarch64` and `amd64` as `x86_64` ([`same_arch`]).
     /// Others compare as text.
     pub fn matches(&self, key: &str, want: &str) -> bool {
@@ -935,7 +953,7 @@ impl Facts {
                 .is_some_and(|g| self.ram_mib as f64 >= g * 1024.0),
             "node" => self.node == want,
             "os" => self.os.eq_ignore_ascii_case(want.trim()),
-            "macos" | "linux" => {
+            "macos" | "linux" | "windows" => {
                 self.os == key
                     && (want.is_empty() || version_matches(want, self.shorthand_version()))
             }
@@ -949,8 +967,8 @@ impl Facts {
         }
     }
 
-    /// The version `macos=` and `linux=` compare against on this machine: the macOS version
-    /// on a Mac, the kernel on Linux.
+    /// The version `macos=`, `linux=` and `windows=` compare against on this machine: the macOS
+    /// version on a Mac, the kernel on Linux, the Windows version on Windows.
     fn shorthand_version(&self) -> &str {
         match self.os.as_str() {
             "linux" => &self.kernel,
@@ -958,10 +976,12 @@ impl Facts {
         }
     }
 
-    /// This machine's OS as the shorthands name it: `macOS 27.0.1`, `linux 7.2.8-2-cachyos`.
+    /// This machine's OS as the shorthands name it: `macOS 27.0.1`, `linux 7.2.8-2-cachyos`,
+    /// `Windows 11 24H2`.
     fn os_label(&self) -> String {
         let name = match self.os.as_str() {
             "macos" => "macOS",
+            "windows" => "Windows",
             "" => "an unknown OS",
             other => other,
         };
@@ -983,7 +1003,7 @@ impl Facts {
             }
         };
         match key {
-            "os" | "macos" | "linux" => self.os_label(),
+            "os" | "macos" | "linux" | "windows" => self.os_label(),
             "gpu" if self.gpus.is_empty() => "no GPU".into(),
             "gpu" => self
                 .gpus
@@ -1003,7 +1023,8 @@ impl Facts {
                     "no GPU".into()
                 } else if self.os == "macos" {
                     // Its GPUs have no driver fact: nothing there can ever match.
-                    "macOS, which names no GPU driver; gpu_driver matches on Linux only".into()
+                    "macOS, which names no GPU driver; gpu_driver matches on Linux and Windows"
+                        .into()
                 } else {
                     let ids: Vec<&str> = self.gpus.iter().map(|g| g.id.as_str()).collect();
                     format!("no driver bound to {}", ids.join(", "))
@@ -1019,6 +1040,15 @@ impl Facts {
             "display" => format!("display={}", self.display),
             other => format!("no fact {other}"),
         }
+    }
+
+    /// Why this machine doesn't take a job with requirements `on` whatever else it has, if it
+    /// doesn't: a Windows machine runs only jobs that ask for Windows by name (`--on windows`,
+    /// `--on windows=V`, `--on os=windows`; [`asks_for_os`]), since a job that names no OS is a
+    /// Unix command. "runs only jobs that ask for --on windows".
+    pub fn declines(&self, on: &BTreeMap<String, String>) -> Option<String> {
+        (self.os == "windows" && !asks_for_os(on, "windows"))
+            .then(|| "runs only jobs that ask for --on windows".to_string())
     }
 
     /// The first requirement this machine does not meet, in plain words with what the machine
@@ -1439,6 +1469,106 @@ mod tests {
             .collect()
     }
 
+    fn win() -> Facts {
+        Facts {
+            node: "win1".into(),
+            os: "windows".into(),
+            os_version: "11 24H2".into(),
+            kernel: "10.0.26100.4652".into(),
+            arch: "x86_64".into(),
+            gpus: vec![Gpu {
+                id: "10de:2c02@0000:01:00.0".into(),
+                vendor: "10de".into(),
+                device: "2c02".into(),
+                name: "NVIDIA GeForce RTX 5080".into(),
+                driver: Some("nvlddmkm".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// `windows` stands alone or takes the Windows version by leading parts, like `macos`; `os`
+    /// says `windows` too, and `gpu_driver` is the display driver's service name.
+    #[test]
+    fn windows_facts() {
+        let (win, mac, msi) = (win(), mac(), msi());
+        for want in ["", "11", "11-24h2", "11 24H2"] {
+            assert!(win.matches("windows", want), "{want:?}");
+            assert!(!mac.matches("windows", want) && !msi.matches("windows", want));
+        }
+        for want in ["10", "24h2", "11-23h2", "server"] {
+            assert!(!win.matches("windows", want), "{want:?}");
+        }
+        assert!(!win.matches("macos", "") && !win.matches("linux", ""));
+        assert!(win.matches("os", "Windows") && win.matches("os", "windows"));
+        assert!(win.matches("kernel", "10.0.26100") && win.matches("os_version", "11"));
+        assert!(win.matches("gpu_driver", "nvlddmkm") && win.matches("gpu", "nvidia"));
+        let server = Facts {
+            os_version: "Server 2025 24H2".into(),
+            ..win.clone()
+        };
+        assert!(server.matches("windows", "server-2025") && !server.matches("windows", "11"));
+        assert_eq!(
+            win.unmet(&on(&[("windows", "10")])).as_deref(),
+            Some("needs windows=10 (this machine: Windows 11 24H2)")
+        );
+        assert_eq!(
+            win.unmet(&on(&[("linux", "")])).as_deref(),
+            Some("needs linux (this machine: Windows 11 24H2)")
+        );
+        assert_eq!(
+            mac.unmet(&on(&[("windows", "")])).as_deref(),
+            Some("needs windows (this machine: macOS 27.0.1)")
+        );
+        assert_eq!(
+            msi.unmet(&on(&[("os", "windows")])).as_deref(),
+            Some("needs os=windows (this machine: linux 7.2.8-2-cachyos)")
+        );
+        assert_eq!(
+            win.unmet(&on(&[("windows", "11"), ("os", "windows")])),
+            None
+        );
+        assert_eq!(fmt_on("windows", ""), "windows");
+        assert_eq!(
+            fmt_on_all(&on(&[("gpu", "nvidia"), ("windows", "11")])),
+            "windows=11, gpu=nvidia"
+        );
+    }
+
+    /// A Windows machine runs only jobs that ask for Windows by name; other machines don't care.
+    #[test]
+    fn a_windows_machine_runs_only_jobs_that_ask_for_it() {
+        let (win, mac, msi) = (win(), mac(), msi());
+        let declined = Some("runs only jobs that ask for --on windows".to_string());
+        for not_asking in [
+            on(&[]),
+            on(&[("gpu", "nvidia")]),
+            on(&[("node", "win1")]),
+            on(&[("os_version", "11")]),
+            on(&[("kernel", "10.0")]),
+            on(&[("os", "linux")]),
+            on(&[("macos", "")]),
+        ] {
+            assert_eq!(win.declines(&not_asking), declined, "{not_asking:?}");
+            assert_eq!(mac.declines(&not_asking), None, "{not_asking:?}");
+            assert_eq!(msi.declines(&not_asking), None, "{not_asking:?}");
+        }
+        for asking in [
+            on(&[("windows", "")]),
+            on(&[("windows", "11")]),
+            on(&[("windows", "10")]),
+            on(&[("os", "windows")]),
+            on(&[("os", " Windows ")]),
+            on(&[("os", "WINDOWS"), ("gpu", "nvidia")]),
+        ] {
+            assert_eq!(win.declines(&asking), None, "{asking:?}");
+            assert_eq!(mac.declines(&asking), None, "{asking:?}");
+        }
+        assert!(asks_for_os(&on(&[("windows", "")]), "windows"));
+        assert!(!asks_for_os(&on(&[("os", "win")]), "windows"));
+    }
+
     #[test]
     fn versions_match_by_leading_parts() {
         assert_eq!(
@@ -1597,7 +1727,7 @@ mod tests {
             mac_gpu.unmet(&on(&[("gpu_driver", "nvidia")])).as_deref(),
             Some(
                 "needs gpu_driver=nvidia (this machine: macOS, which names no GPU driver; \
-                 gpu_driver matches on Linux only)"
+                 gpu_driver matches on Linux and Windows)"
             )
         );
         let mut unbound = msi.clone();
@@ -1671,6 +1801,10 @@ mod tests {
             on(&[("linux", "7"), ("os_version", "ubuntu")]),
             on(&[("linux", ""), ("kernel", "6")]),
             on(&[("os", "plan9")]),
+            on(&[("windows", "")]),
+            on(&[("windows", "11"), ("os", "Windows")]),
+            on(&[("windows", "11"), ("os_version", "11-24h2")]),
+            on(&[("windows", ""), ("kernel", "10.0.26100")]),
         ];
         for on in ok {
             assert_eq!(check_on(&on), Ok(()), "{on:?}");
@@ -1699,6 +1833,22 @@ mod tests {
             (
                 on(&[("linux", "7.2"), ("kernel", "7.20")]),
                 "linux=7.2 and kernel=7.20 contradict each other: no kernel starts with both",
+            ),
+            (
+                on(&[("windows", ""), ("macos", "")]),
+                "macos and windows contradict each other: a machine runs one OS",
+            ),
+            (
+                on(&[("windows", "11"), ("os", "linux")]),
+                "windows=11 and os=linux contradict each other: a machine runs one OS",
+            ),
+            (
+                on(&[("windows", "11"), ("os_version", "10")]),
+                "windows=11 and os_version=10 contradict each other: no os_version starts with both",
+            ),
+            (
+                on(&[("windows", ".")]),
+                "windows=. gives no version: versions are compared by their parts, such as 27 or 7.2",
             ),
             (
                 on(&[("kernel", ".")]),

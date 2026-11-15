@@ -568,6 +568,9 @@ fn verify_grant(
         ));
     }
     let facts = sh.lock().local().facts.clone();
+    if let Some(declined) = facts.declines(&signed.on) {
+        return Err(format!("this machine {declined}"));
+    }
     if let Some(unmet) = facts.unmet(&signed.on) {
         return Err(format!("it {unmet}"));
     }

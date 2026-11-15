@@ -246,6 +246,9 @@ fn unmet_on(j: &JobRecord, from: &str, facts: Option<&crate::types::Facts>) -> O
         node: from.to_string(),
         ..facts?.clone()
     };
+    if let Some(declined) = facts.declines(&j.spec.on) {
+        return Some(format!("{from} {declined}"));
+    }
     facts
         .unmet(&j.spec.on)
         .map(|u| u.replacen("(this machine: ", &format!("({from}: "), 1))
@@ -1496,5 +1499,17 @@ mod tests {
         assert_eq!(unmet_on(&j, "b", Some(&facts)), None);
         let j = queued(&[], true, &[("node", "liar")]);
         assert!(unmet_on(&j, "b", Some(&facts)).is_some());
+        // A Windows machine claims only jobs that ask for Windows.
+        let win = Facts {
+            os: "windows".into(),
+            ..facts
+        };
+        let j = queued(&[], true, &[("node", "b")]);
+        assert_eq!(
+            unmet_on(&j, "b", Some(&win)).as_deref(),
+            Some("b runs only jobs that ask for --on windows")
+        );
+        let j = queued(&[], true, &[("os", "windows")]);
+        assert_eq!(unmet_on(&j, "b", Some(&win)), None);
     }
 }

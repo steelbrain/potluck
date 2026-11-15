@@ -271,9 +271,10 @@ pub struct DispatchArgs {
     /// it lacks, or anything while it is --exclusive).
     #[arg(long)]
     pub hold_line: bool,
-    /// A fact the machine must have, KEY=VALUE: gpu=nvidia, gpu_driver=amdgpu (Linux only),
-    /// ram_gib=32, kernel=6.12. macos and linux stand alone for any version, or take one:
-    /// macos=27 (macOS 27.x), linux=7.2 (kernel 7.2.x). Keys: os, os_version, kernel, arch, gpu,
+    /// A fact the machine must have, KEY=VALUE: gpu=nvidia, gpu_driver=amdgpu (Linux and
+    /// Windows), ram_gib=32, kernel=6.12. macos, linux and windows stand alone for any version, or
+    /// take one: macos=27 (macOS 27.x), linux=7.2 (kernel 7.2.x), windows=11. A Windows machine
+    /// runs only jobs that ask for windows (or os=windows). Keys: os, os_version, kernel, arch, gpu,
     /// gpu_driver, ram_gib, cpus, cpu_model, node, display (`potluck nodes` shows each
     /// machine's). os_version and kernel match by leading parts. os and arch ignore case, and
     /// arch=arm64 is aarch64, arch=amd64 is x86_64. Repeatable; all must hold.

@@ -485,6 +485,44 @@ fn facts() {
     assert!(!why.lines.iter().any(|l| l.starts_with("no machine")));
 }
 
+/// A Windows machine runs only jobs that ask for Windows: why says so for every other job.
+#[test]
+fn a_windows_machine_runs_only_jobs_that_ask_for_it() {
+    let w = |job: Queued| {
+        let msi = Machine::new("msi", 56, vec![nv()]);
+        let mut win = Machine::new("win1", 56, vec![nv()]);
+        win.facts.os = "windows".into();
+        win.facts.os_version = "11 24H2".into();
+        let mut w = World::new(vec![msi, win]);
+        w.queue(job);
+        w.why("q")
+    };
+    let why = w(job("q").gpu("nvidia"));
+    has(
+        &why,
+        "can start now on msi; the scheduler takes it on its next pass",
+    );
+    has(
+        &why,
+        "win1 can't run it: runs only jobs that ask for --on windows",
+    );
+    let why = w(job("q").on("windows", "11"));
+    has(
+        &why,
+        "can start now on win1; the scheduler takes it on its next pass",
+    );
+    has(
+        &why,
+        "msi can't run it: needs windows=11 (this machine: linux)",
+    );
+    let why = w(job("q").on("os", "windows").on("gpu", "amd"));
+    has(&why, "no machine has gpu=amd");
+    has(
+        &why,
+        "win1 can't run it: needs gpu=amd (this machine: NVIDIA GeForce RTX 5080 Laptop GPU)",
+    );
+}
+
 #[test]
 fn os_shorthands() {
     let w = |job: Queued| {

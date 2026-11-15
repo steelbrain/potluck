@@ -146,6 +146,13 @@ pub(crate) fn run_excl(id: &str, gib: u64, gpus: &[&str], until: i64) -> Running
     r
 }
 
+/// A Windows machine: it runs only jobs that ask for Windows by name.
+pub(crate) fn windows_machine(mut m: Machine) -> Machine {
+    m.facts.os = "windows".into();
+    m.facts.os_version = "11 24H2".into();
+    m
+}
+
 /// A machine fixture that lends out a [`MachineView`].
 pub(crate) struct Machine {
     pub facts: Facts,
@@ -182,6 +189,7 @@ fn feasibility() {
         pool: "cloud".into(),
         ..Machine::new("rented", 56, vec![])
     };
+    let win = windows_machine(Machine::new("win1", 56, vec![nv()]));
     let cases: Vec<(&str, &Machine, Queued, Result<(), &str>)> = vec![
         ("plain job", &msi, job("a"), Ok(())),
         ("facts met", &msi, job("a").on("os", "linux"), Ok(())),
@@ -277,6 +285,55 @@ fn feasibility() {
             &cloud,
             job("a").pools(&["default", "gpu"]),
             Err("in pool cloud, not the job's pools default, gpu"),
+        ),
+        (
+            "a Windows machine, a job that names no OS",
+            &win,
+            job("a"),
+            Err("runs only jobs that ask for --on windows"),
+        ),
+        (
+            "a Windows machine, a job that names it by node",
+            &win,
+            job("a").on("node", "win1").on("gpu", "nvidia"),
+            Err("runs only jobs that ask for --on windows"),
+        ),
+        (
+            "a Windows machine, a job for Linux",
+            &win,
+            job("a").on("os", "linux"),
+            Err("runs only jobs that ask for --on windows"),
+        ),
+        ("--on windows", &win, job("a").on("windows", ""), Ok(())),
+        (
+            "--on windows=11",
+            &win,
+            job("a").on("windows", "11"),
+            Ok(()),
+        ),
+        (
+            "--on os=windows",
+            &win,
+            job("a").on("os", "Windows"),
+            Ok(()),
+        ),
+        (
+            "--on windows=10 on Windows 11",
+            &win,
+            job("a").on("windows", "10"),
+            Err("needs windows=10 (this machine: Windows 11 24H2)"),
+        ),
+        (
+            "--on windows, and a GPU it lacks",
+            &win,
+            job("a").on("windows", "").gpu("amd"),
+            Err("no GPU there matches amd"),
+        ),
+        (
+            "--on windows on Linux",
+            &msi,
+            job("a").on("windows", ""),
+            Err("needs windows (this machine: linux)"),
         ),
     ];
     for (name, machine, q, want) in cases {
@@ -564,6 +621,19 @@ fn infeasible_and_pinned() {
                 job("a"),
             ],
             start: &["a"],
+            passed: &[],
+            reserved: None,
+        },
+        Case {
+            name: "a Windows machine skips jobs that don't ask for Windows",
+            machine: windows_machine(Machine::new("win1", 32, vec![nv()])),
+            queue: vec![
+                job("unix").prio(5).at(-10),
+                job("linux").on("linux", "").prio(5).at(-10),
+                job("w").on("windows", ""),
+                job("w11").on("os", "windows").gpu("nvidia"),
+            ],
+            start: &["w", "w11"],
             passed: &[],
             reserved: None,
         },
