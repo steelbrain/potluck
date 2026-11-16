@@ -1275,7 +1275,10 @@ fn uninstall_task(spec: &ServiceSpec) -> anyhow::Result<ServiceDone> {
 /// session; a `potluck _service-daemon` typed in a terminal keeps its terminal), lets go of that
 /// console and sends stdout and stderr to the daemon log, as launchd does on macOS: an error
 /// before the daemon's log opens is said there, and the daemon the keeper starts inherits them
-/// (the console's handles end with the console). Call it before any other thread starts.
+/// (the console's handles end with the console). The daemon proper runs these same arguments
+/// ([`crate::daemon::keeper`]) and keeps the console without a window its keeper gave it: a
+/// console program started by a process without a console gets a console window of its own, and
+/// the daemon starts git and other programs throughout. Call it before any other thread starts.
 #[cfg(windows)]
 pub fn start_service_daemon(env: &[String]) -> anyhow::Result<()> {
     use windows_sys::Win32::System::Console::{FreeConsole, GetConsoleProcessList};
@@ -1289,6 +1292,9 @@ pub fn start_service_daemon(env: &[String]) -> anyhow::Result<()> {
         // SAFETY: the caller runs this before any other thread starts, so nothing else reads or
         // writes the environment meanwhile.
         unsafe { std::env::set_var(k, v) };
+    }
+    if std::env::var_os(crate::daemon::keeper::MARKER).is_some() {
+        return Ok(());
     }
     let mut pids = [0u32; 2];
     // SAFETY: pids has room for the 2 entries given.

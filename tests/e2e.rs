@@ -404,6 +404,11 @@ impl Node {
             .spawn()
             .unwrap();
         self.daemon = Some(child);
+        self.answering();
+    }
+
+    /// Waits (a minute at most) until the daemon started as `self.daemon` answers.
+    fn answering(&mut self) {
         let start = Instant::now();
         loop {
             if let Ok(mut c) = Client::connect(&self.paths, ClientContext::default())
@@ -4103,4 +4108,122 @@ fn a_killed_keeper_ends_the_daemon_and_its_jobs_run_on() {
     std::fs::write(&until, "").unwrap();
     let (code, j, _) = n.wait(&job);
     assert_eq!(code, 4, "{j}\n{}", n.daemon_log());
+}
+
+/// Run by [`the_service_daemon_keeps_a_console_without_a_window`] without a console: attaches to
+/// the console of process `E2E_ATTACH` and exits with 0 when it has one without a window, 3 when
+/// it has none and 4 when it has a window.
+#[cfg(windows)]
+#[test]
+fn helper_attach_console() {
+    use windows_sys::Win32::System::Console::{AttachConsole, GetConsoleWindow};
+    let Ok(pid) = std::env::var("E2E_ATTACH") else {
+        return;
+    };
+    if unsafe { AttachConsole(pid.parse().unwrap()) } == 0 {
+        eprintln!("no console: {}", std::io::Error::last_os_error());
+        std::process::exit(3);
+    }
+    let window = unsafe { GetConsoleWindow() };
+    if !window.is_null() {
+        eprintln!("its console has a window ({window:?})");
+        std::process::exit(4);
+    }
+    std::process::exit(0);
+}
+
+/// The processes whose parent is `pid`, with their image names.
+#[cfg(windows)]
+fn children(pid: u32) -> Vec<(u32, String)> {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
+    let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    assert_ne!(
+        snap,
+        INVALID_HANDLE_VALUE,
+        "{}",
+        std::io::Error::last_os_error()
+    );
+    let mut entry = PROCESSENTRY32W {
+        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+        ..Default::default()
+    };
+    let mut found = Vec::new();
+    let mut more = unsafe { Process32FirstW(snap, &mut entry) } != 0;
+    while more {
+        if entry.th32ParentProcessID == pid {
+            let len = entry.szExeFile.iter().position(|&c| c == 0).unwrap_or(0);
+            let image = String::from_utf16_lossy(&entry.szExeFile[..len]);
+            found.push((entry.th32ProcessID, image));
+        }
+        more = unsafe { Process32NextW(snap, &mut entry) } != 0;
+    }
+    unsafe { CloseHandle(snap) };
+    found
+}
+
+/// The service's task runs `potluck _service-daemon` in a console of its own, which its keeper
+/// lets go of. The daemon proper the keeper starts keeps the console without a window it was
+/// given, so the programs it starts (git, for one) share it rather than each opening a console
+/// window of its own on the user's desktop.
+#[cfg(windows)]
+#[test]
+fn the_service_daemon_keeps_a_console_without_a_window() {
+    use std::os::windows::process::CommandExt;
+    use windows_sys::Win32::System::Threading::{CREATE_NO_WINDOW, DETACHED_PROCESS};
+    let mut n = Node::new();
+    n.stop_daemon();
+    let keeper = Command::new(&n.bin)
+        .arg("_service-daemon")
+        .arg("--env")
+        .arg(format!("POTLUCK_HOME={}", n.paths.home.display()))
+        .arg("--env")
+        .arg(format!("POTLUCK_CONFIG={}", n.paths.config.display()))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+        .unwrap();
+    let keeper_pid = keeper.id();
+    n.daemon = Some(keeper);
+    n.answering();
+    let log = || std::fs::read_to_string(n.paths.daemon_log()).unwrap_or_default();
+    // Its children but the console host it had until it let go of the console.
+    let image = n.bin.file_name().unwrap().to_string_lossy().into_owned();
+    let all = children(keeper_pid);
+    let daemons: Vec<u32> = all
+        .iter()
+        .filter(|(_, i)| i.eq_ignore_ascii_case(&image))
+        .map(|(p, _)| *p)
+        .collect();
+    assert_eq!(
+        daemons.len(),
+        1,
+        "the keeper's children: {all:?}\n{}",
+        log()
+    );
+    let o = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "helper_attach_console",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("E2E_ATTACH", daemons[0].to_string())
+        .stdin(Stdio::null())
+        .creation_flags(DETACHED_PROCESS)
+        .output()
+        .unwrap();
+    assert_eq!(
+        o.status.code(),
+        Some(0),
+        "the daemon {}: {}\n{}",
+        daemons[0],
+        String::from_utf8_lossy(&o.stderr),
+        log()
+    );
 }

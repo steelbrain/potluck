@@ -23,8 +23,8 @@
 //! - A console's Ctrl+C or Ctrl+Break reaches the daemon too, which shares the keeper's console
 //!   and ends; the keeper lets them pass and exits with the daemon's code. A keeper without a
 //!   console (the service's task, which lets go of the window Windows opens for it) starts the
-//!   daemon with `CREATE_NO_WINDOW`: a console program started without a console gets a new
-//!   window otherwise.
+//!   daemon with `CREATE_NO_WINDOW`, and the daemon keeps that console, which the programs it
+//!   starts share: a console program started without a console gets a new window otherwise.
 //!
 //! The keeper itself runs the code it started with until it is started again (its service
 //! restarted); it does only this.

@@ -7,6 +7,9 @@
 - On Windows, a key file or directory potluck made private counts as private when the user is the
   built-in Administrator account (as on GitHub's Windows runners): its access list names that user
   `LA`, not by number, so potluck set the list again at every start.
+- On Windows, the daemon the `potluck` task runs no longer opens a console window for each program
+  it starts (git, when it syncs a mirror or makes a workspace). Each window stayed open on the
+  desktop after the program exited.
 
 ## 0.1.3 (2026-11-15)
 
