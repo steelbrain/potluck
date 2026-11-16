@@ -3505,11 +3505,27 @@ fn a_removed_workspace_is_remembered_until_its_files_are_gone() {
             .unwrap()
             .contains(&format!("workspace {ws}: removing what is left of it"))
     });
-    // The next upkeep, with removals working again, removes it.
+    // The retry runs on a worker, and an upkeep passes over a workspace whose removal is still
+    // under way: wait for the retry to fail, then let upkeeps come until one, with removals
+    // working again, removes it (on a slow machine the worker can still be busy at the first).
+    wait_until("the retry failed", || {
+        std::fs::read_to_string(f.paths.daemon_log())
+            .unwrap()
+            .matches(&format!("could not remove workspace {ws}:"))
+            .count()
+            >= 2
+    });
     f.ws.fail_remove.store(false, Ordering::SeqCst);
-    f.clock.pass(10 * 60_000);
+    let mut upkeep: Option<Instant> = None;
     wait_until("the workspace is removed", || {
-        f.ws.removed.lock().unwrap().contains(&ws)
+        if f.ws.removed.lock().unwrap().contains(&ws) {
+            return true;
+        }
+        if upkeep.is_none_or(|t| t.elapsed() >= Duration::from_secs(1)) {
+            f.clock.pass(10 * 60_000);
+            upkeep = Some(Instant::now());
+        }
+        false
     });
     assert!(!root.exists(), "{} is still there", root.display());
     // And then its record goes.
