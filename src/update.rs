@@ -296,12 +296,17 @@ fn rosetta_translated() -> bool {
 }
 
 /// Whether this process runs translated on an arm64 machine: under Rosetta on macOS, under x64
-/// emulation on Windows on Arm (whose native machine `IsWow64Process2` reports as arm64).
+/// emulation on Windows on Arm: an x86_64 build on a machine whose native machine
+/// `IsWow64Process2` reports as arm64. (That x64 emulation isn't WOW64, so the call's process
+/// machine says nothing about it; an arm64 build there runs natively.)
 fn translated() -> bool {
     #[cfg(windows)]
     {
         use windows_sys::Win32::System::SystemInformation::IMAGE_FILE_MACHINE_ARM64;
         use windows_sys::Win32::System::Threading::{GetCurrentProcess, IsWow64Process2};
+        if !cfg!(target_arch = "x86_64") {
+            return false;
+        }
         let (mut process, mut native) = (0u16, 0u16);
         // SAFETY: the pseudo handle of this process, and two u16s the call fills.
         let ok = unsafe { IsWow64Process2(GetCurrentProcess(), &mut process, &mut native) } != 0;
