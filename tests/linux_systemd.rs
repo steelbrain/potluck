@@ -539,10 +539,23 @@ fn going_over_the_memory_limit_is_reported_as_over_memory() {
     if keeps_memory_peak() {
         assert!(sample.peak_mem_bytes >= 62 << 20, "{sample:?}");
     }
-    // The kernel killed the allocating process; the supervisor survived to record it.
-    let status = job.wait_status();
-    assert_eq!(status.signal, Some(libc::SIGKILL), "{status:?}");
-    assert_eq!(unit_prop(&job.unit(), "Result"), "oom-kill");
+    // The kernel killed the allocating process. The supervisor survives the stop's SIGTERM and
+    // records that, unless systemd saw another OOM kill in the unit before the stop was over and
+    // SIGKILLed every process of it, the supervisor too (src/exec/linux.rs). Every process is
+    // gone by now, so the status file is there or never will be.
+    let unit = job.unit();
+    match job.status() {
+        Some(status) => assert_eq!(status.signal, Some(libc::SIGKILL), "{status:?}"),
+        None => assert_eq!(
+            [
+                unit_prop(&unit, "ExecMainCode"),
+                unit_prop(&unit, "ExecMainStatus")
+            ],
+            ["2", "9"],
+            "no status file, and the supervisor didn't end by SIGKILL"
+        ),
+    }
+    assert_eq!(unit_prop(&unit, "Result"), "oom-kill");
     // Still reported from a fresh look at the unit, after its cgroup is gone.
     let mut handle = job.handle().clone();
     if let Handle::Systemd { cgroup, .. } = &mut handle {
@@ -556,6 +569,60 @@ fn going_over_the_memory_limit_is_reported_as_over_memory() {
     if keeps_memory_peak() {
         assert!(again.peak_mem_bytes >= 62 << 20, "{again:?}");
     }
+    job.finish();
+}
+
+/// A second OOM kill while systemd stops the unit for the first (here a process that goes over
+/// on the stop's SIGTERM, in a command that ignores SIGTERM): systemd SIGKILLs every process of
+/// the unit, the supervisor too, so no status file is written. The job is still over its
+/// memory, and still is after its cgroup is gone.
+#[test]
+fn a_second_oom_kill_during_the_stop_is_over_memory_without_a_status() {
+    if !user_manager() {
+        return;
+    }
+    let (hog, hog_on_term) = if Path::new("/usr/bin/python3").exists() {
+        (
+            r#"python3 -c 'import time; b = b"x" * (300 << 20); time.sleep(60)'"#,
+            r#"python3 -c 'import signal, time; signal.signal(signal.SIGTERM, lambda *_: b"x" * (300 << 20)); time.sleep(60)'"#,
+        )
+    } else {
+        (
+            r#"perl -e 'my $x = "x" x (300 << 20); sleep 60'"#,
+            r#"perl -e '$SIG{TERM} = sub { my $x = "x" x (300 << 20) }; sleep 60'"#,
+        )
+    };
+    let script = format!("trap '' TERM; {hog} & {hog_on_term} & sleep 30 & wait");
+    let mut job = Job::start(
+        "oom2",
+        &["sh", "-c", &script],
+        &[PATH],
+        Limits {
+            mem_max_bytes: 64 << 20,
+            ..limits()
+        },
+    );
+    let sample = job.wait_end();
+    assert!(sample.over_memory && !sample.oom_killed, "{sample:?}");
+    let unit = job.unit();
+    assert_eq!(job.status(), None);
+    assert_eq!(
+        [
+            unit_prop(&unit, "Result"),
+            unit_prop(&unit, "ExecMainCode"),
+            unit_prop(&unit, "ExecMainStatus")
+        ],
+        ["oom-kill", "2", "9"]
+    );
+    let mut handle = job.handle().clone();
+    if let Handle::Systemd { cgroup, .. } = &mut handle {
+        *cgroup = None;
+    }
+    let again = potluck::exec::platform().sample(&mut handle, 0).unwrap();
+    assert!(
+        again.over_memory && !again.oom_killed && again.pids.is_empty(),
+        "{again:?}"
+    );
     job.finish();
 }
 
