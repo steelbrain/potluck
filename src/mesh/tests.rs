@@ -2137,7 +2137,12 @@ fn members_whose_records_differ_for_good_dont_exchange_them_at_every_heartbeat()
     thread::sleep(HEARTBEAT * 30);
     let n = a.exchanges() + c.exchanges() - before;
     assert!(n <= 2, "{n} record exchanges in 30 heartbeats");
-    assert!(a.caught_up_for("c") && c.caught_up_for("a"));
+    // Still dealing with each other. Waited for, not read at one instant: caught up also means
+    // heard from within DOWN_AFTER (800 ms), which a heartbeat late on a busy machine can miss
+    // (Windows CI).
+    wait_until("a and c still deal with each other", || {
+        a.caught_up_for("c") && c.caught_up_for("a")
+    });
     // A record that counts still goes round.
     let d = start("d", tmp.path());
     pair(&a, &d);
