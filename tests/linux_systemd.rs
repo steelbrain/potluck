@@ -145,9 +145,10 @@ impl Job {
         let bytes = std::fs::read(self.dir.path().join("status.json")).ok()?;
         Some(serde_json::from_slice(&bytes).unwrap())
     }
-    /// The status file, waited for. Without one after PATIENCE, the panic says what the unit,
-    /// the job's log, the unit's journal and the kernel show: a supervisor that ended without
-    /// writing it.
+    /// The status file, waited for. Without one after PATIENCE, the panic says what the unit
+    /// and the job's log show, and every journal line naming the unit (the user manager's, the
+    /// kernel's OOM kills with the victim's pid, systemd-oomd's): what ended the supervisor
+    /// before it wrote the file.
     fn wait_status(&self) -> ExitStatus {
         let started = Instant::now();
         while started.elapsed() < PATIENCE {
@@ -158,34 +159,36 @@ impl Job {
         }
         let unit = self.unit();
         let props = [
-            "ActiveState",
-            "SubState",
             "Result",
+            "ExecMainPID",
             "ExecMainCode",
             "ExecMainStatus",
+            "ManagedOOMKills",
         ]
         .map(|p| format!("{p}={}", unit_prop(&unit, p)))
         .join(" ");
-        let tail = |args: &[&str]| {
-            Command::new("journalctl")
+        let run = |cmd: &str, args: &[&str]| {
+            Command::new(cmd)
                 .args(args)
                 .output()
-                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim_end().to_string())
                 .unwrap_or_default()
         };
-        let journal = tail(&["--user", "--no-pager", "-o", "short-monotonic", "-u", &unit]);
-        let kernel = tail(&[
-            "-k",
-            "--no-pager",
-            "-o",
-            "short-monotonic",
-            "-n",
-            "30",
-            "-g",
-            "oom|Killed process",
-        ]);
+        let oomd = run("systemctl", &["is-active", "systemd-oomd"]);
+        let named = run(
+            "journalctl",
+            &[
+                "--no-pager",
+                "-o",
+                "short-monotonic",
+                "-n",
+                "20",
+                "-g",
+                &unit,
+            ],
+        );
         panic!(
-            "timed out waiting for the status file\nunit {unit}: {props}\nlog:\n{}\njournal:\n{journal}\nkernel:\n{kernel}",
+            "timed out waiting for the status file\n{props} systemd-oomd={oomd}\nlog: {:?}\n{named}",
             self.log()
         );
     }
