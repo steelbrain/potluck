@@ -96,7 +96,7 @@ This installs the latest release, or a given version:
 
 ```sh
 curl -fsSL https://github.com/steelbrain/potluck/releases/latest/download/install.sh | sh
-curl -fsSL https://github.com/steelbrain/potluck/releases/latest/download/install.sh | sh -s -- 0.1.3
+curl -fsSL https://github.com/steelbrain/potluck/releases/latest/download/install.sh | sh -s -- 0.1.4
 ```
 
 `install.sh` picks the binary for the OS and architecture: macOS arm64 or x86_64, or Linux x86_64
@@ -128,7 +128,7 @@ latest release, or a given version:
 
 ```powershell
 irm https://github.com/steelbrain/potluck/releases/latest/download/install.ps1 | iex
-& ([scriptblock]::Create((irm https://github.com/steelbrain/potluck/releases/latest/download/install.ps1))) 0.1.3
+& ([scriptblock]::Create((irm https://github.com/steelbrain/potluck/releases/latest/download/install.ps1))) 0.1.4
 ```
 
 Setting `$env:POTLUCK_VERSION` before the first line also gives the version. `install.ps1` picks the
