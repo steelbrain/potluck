@@ -290,8 +290,14 @@ fn a_stop_is_ctrl_break_and_the_supervisor_records_the_end() {
     let script = "i=1000; while [ $i -lt 1100 ]; do echo line $i; i=$((i+1)); done; \
                   echo started > started; exec sleep 60";
     let mut inv = Inv::start_full(&exec, &["sh", "-c", script], base_env(), l);
-    wait_for(PATIENCE, || inv.path("work/started").exists().then_some(()))
-        .expect("the command to start");
+    // Stopped once sleep runs: MSYS's exec starts sleep as a new process, and a CTRL_BREAK
+    // while that one starts up can end it with errors of its own in the log.
+    wait_for(PATIENCE, || {
+        (inv.path("work/started").exists()
+            && images(&inv.sample(&exec).pids).contains(&"sleep.exe".to_string()))
+        .then_some(())
+    })
+    .expect("the command to start");
     let stopped = Instant::now();
     exec.signal(&inv.handle, SIGTERM).unwrap();
     let st = inv
