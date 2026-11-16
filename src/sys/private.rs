@@ -103,7 +103,45 @@ mod win {
             return false;
         };
         let passed_on = inherit.contains("OI") && inherit.contains("CI");
-        kind == "A" && rights == "FA" && who == sid && (!dir || (flags.contains('P') && passed_on))
+        kind == "A"
+            && rights == "FA"
+            && (who == sid || canonical_sid(who).as_deref() == Some(sid))
+            && (!dir || (flags.contains('P') && passed_on))
+    }
+
+    /// `sid` as `S-1-...` text. SDDL writes some SIDs as a two-letter alias: `LA` for the local
+    /// Administrator account (RID 500, the user a GitHub Actions runner runs as), so a list for
+    /// that user alone reads `(A;OICI;FA;;;LA)`, not its number. `None` for text that names no
+    /// SID.
+    pub fn canonical_sid(sid: &str) -> Option<String> {
+        use super::super::win::wide;
+        use windows_sys::Win32::Foundation::LocalFree;
+        use windows_sys::Win32::Security::Authorization::{
+            ConvertSidToStringSidW, ConvertStringSidToSidW,
+        };
+        use windows_sys::Win32::Security::PSID;
+        let text = wide(sid);
+        let mut psid: PSID = std::ptr::null_mut();
+        // SAFETY: text is NUL-terminated; psid receives a LocalAlloc'd SID, freed below.
+        if unsafe { ConvertStringSidToSidW(text.as_ptr(), &mut psid) } == 0 {
+            return None;
+        }
+        let mut out: windows_sys::core::PWSTR = std::ptr::null_mut();
+        // SAFETY: psid is a valid SID; out receives a LocalAlloc'd string, freed below.
+        let ok = unsafe { ConvertSidToStringSidW(psid, &mut out) } != 0;
+        // SAFETY: psid was allocated by ConvertStringSidToSidW and isn't used after.
+        unsafe { LocalFree(psid) };
+        if !ok {
+            return None;
+        }
+        // SAFETY: out is a NUL-terminated string, freed after it is copied.
+        let s = unsafe {
+            let len = (0..).take_while(|&i| *out.add(i) != 0).count();
+            let s = String::from_utf16_lossy(std::slice::from_raw_parts(out, len));
+            LocalFree(out.cast());
+            s
+        };
+        Some(s)
     }
 
     #[cfg(test)]
@@ -130,6 +168,27 @@ mod win {
             assert!(!private("D:P(A;OICI;FA;;;S-1-5-21-9)", true));
             assert!(!private("D:P(D;OICI;FA;;;S-1-5-21-1-2-3-1001)", true));
             assert!(!private("D:P", true));
+        }
+
+        /// SDDL names the local Administrator account `LA`: a list for that user alone is
+        /// private when the user is that account, and a group's alias never stands for a user.
+        #[test]
+        fn an_aliased_sid_is_the_sid_it_stands_for() {
+            let admin = super::canonical_sid("LA").expect("the local Administrator's SID");
+            assert!(
+                admin.starts_with("S-1-5-21-") && admin.ends_with("-500"),
+                "{admin}"
+            );
+            assert!(super::private_sddl("D:PAI(A;OICI;FA;;;LA)", &admin, true));
+            assert!(super::private_sddl("D:AI(A;ID;FA;;;LA)", &admin, false));
+            assert!(!super::private_sddl(
+                "D:P(A;OICI;FA;;;LA)",
+                "S-1-5-21-1-2-3-1001",
+                true
+            ));
+            assert!(!super::private_sddl("D:P(A;OICI;FA;;;BA)", &admin, true));
+            assert_eq!(super::canonical_sid("BA").as_deref(), Some("S-1-5-32-544"));
+            assert_eq!(super::canonical_sid("not a sid"), None);
         }
     }
 }
