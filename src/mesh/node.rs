@@ -682,6 +682,66 @@ impl Mesh {
         self.inner.my_name()
     }
 
+    /// What this machine holds and sees, for a test that timed out waiting on it: its records'
+    /// removals, the members they make, each peer's state and the pings still under way. Takes
+    /// one lock at a time.
+    #[cfg(test)]
+    pub(super) fn debug_state(&self) -> String {
+        let inner = &self.inner;
+        let me = self.name();
+        let (records, digest, members, removed) = {
+            let t = lock(&inner.trust);
+            let members: Vec<String> = t.view.members.values().map(|a| a.node.clone()).collect();
+            let removed: Vec<String> = t
+                .view
+                .removed
+                .values()
+                .map(|r| format!("{} by {}", r.node, r.by))
+                .collect();
+            (t.records().to_vec(), t.digest(), members, removed)
+        };
+        let name = |k: &PublicKey| {
+            records
+                .iter()
+                .find_map(|r| match r {
+                    Record::Admission(a) if a.key == *k => Some(a.node.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| "?".into())
+        };
+        let removals: Vec<String> = records
+            .iter()
+            .filter_map(|r| match r {
+                Record::Removal(x) => {
+                    Some(format!("{} removed {} (clock {})", x.by, x.node, x.clock))
+                }
+                _ => None,
+            })
+            .collect();
+        let peers: Vec<String> = lock(&inner.peers)
+            .iter()
+            .map(|(k, p)| {
+                format!(
+                    "{}: up {:?}, seen {:?} ago, reached us {:?} ago, error {:?}",
+                    name(k),
+                    p.up,
+                    p.last_seen.map(|s| s.elapsed()),
+                    p.reached_us.map(|s| s.elapsed()),
+                    p.last_error
+                )
+            })
+            .collect();
+        let pinging: Vec<String> = lock(&inner.pinging).iter().map(name).collect();
+        let in_vain: Vec<String> = lock(&inner.in_vain).keys().map(name).collect();
+        format!(
+            "{me}: {} records, digest {}; members {members:?}; removed {removed:?}; removals \
+             held {removals:?}; pinging {pinging:?}; exchanged in vain with {in_vain:?}; peers \
+             {peers:#?}",
+            records.len(),
+            &digest[..12.min(digest.len())],
+        )
+    }
+
     pub fn key(&self) -> PublicKey {
         self.inner.key()
     }

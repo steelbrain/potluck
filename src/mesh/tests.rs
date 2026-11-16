@@ -141,6 +141,18 @@ fn wait_until(what: &str, mut f: impl FnMut() -> bool) {
     }
 }
 
+/// [`wait_until`], saying what `nodes` hold and see if it times out.
+fn wait_until_seen(what: &str, nodes: &[&Node], mut f: impl FnMut() -> bool) {
+    let start = Instant::now();
+    while !f() {
+        if start.elapsed() >= WAIT {
+            let states: Vec<String> = nodes.iter().map(|n| n.mesh.debug_state()).collect();
+            panic!("timed out waiting until {what}\n{}", states.join("\n"));
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
 fn wait_event(node: &Node, what: &str, pred: impl Fn(&Event) -> bool) -> Event {
     wait_on(&node.events, what, pred)
 }
@@ -1309,13 +1321,15 @@ fn removals_that_cross_go_to_the_member_admitted_first_on_every_member() {
     let c = again("c", &places[2].0, places[2].1);
     let d = again("d", &places[3].0, places[3].1);
     c.remove("b").unwrap();
-    wait_until("d takes c's removal of b", || names(&d) == ["a", "c", "d"]);
+    wait_until_seen("d takes c's removal of b", &[&c, &d], || {
+        names(&d) == ["a", "c", "d"]
+    });
     drop(c);
 
     let a = again("a", &places[0].0, places[0].1);
     let b = again("b", &places[1].0, places[1].1);
     for m in [&a, &b, &d] {
-        wait_until("every member settles on b's removal", || {
+        wait_until_seen("every member settles on b's removal", &[&a, &b, &d], || {
             names(m) == ["a", "b", "d"]
         });
     }
