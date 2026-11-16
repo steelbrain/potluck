@@ -644,7 +644,9 @@ fn adoption_by_a_fresh_executor() {
 
 /// cpu_ms grows under a busy loop and does not drop when the busy processes exit: one is reaped by
 /// the command (its time moves into the command's), one is an orphan reaped by launchd. Each loop
-/// runs for one second of its own CPU time, however busy the machine is.
+/// runs for one second of its own CPU time, however busy the machine is. The orphan then waits
+/// until the test has sampled it: what an orphan uses after the last sample before it exits is
+/// not counted (src/exec/macos), and a sample can take hundreds of milliseconds on a busy machine.
 #[test]
 fn cpu_time_accumulates() {
     let script = r#"
@@ -653,7 +655,12 @@ fn cpu_time_accumulates() {
         wait;
         my $pid = fork;
         if ($pid == 0) {
-            if (fork == 0) { busy(1.0); open(F, ">done"); close F; exit 0 }
+            if (fork == 0) {
+                busy(1.0);
+                open(F, ">done.tmp"); print F $$; close F; rename "done.tmp", "done";
+                select(undef, undef, undef, 0.05) until -e "go";
+                exit 0;
+            }
             exit 0;
         }
         waitpid($pid, 0);
@@ -668,15 +675,25 @@ fn cpu_time_accumulates() {
         inv.work().join("done").exists().then_some(())
     });
     assert!(done.is_some(), "{values:?}");
-    // Let the orphan exit and launchd reap it.
-    std::thread::sleep(Duration::from_millis(300));
-    let last = inv.sample(&exec).cpu_ms;
-    values.push(last);
+    // Both loops are over and the orphan still runs: a sample sees both.
+    let both = inv.sample(&exec).cpu_ms;
+    values.push(both);
+    // Either loop alone is about 1000 ms: more means the first was kept when it exited.
+    assert!((1900..4000).contains(&both), "{both} ms: {values:?}");
+    // The orphan exits and launchd reaps it; its time stays in the total.
+    let orphan: i32 = std::fs::read_to_string(inv.work().join("done"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    std::fs::write(inv.work().join("go"), "").unwrap();
+    let reaped = wait_for(Duration::from_secs(10), || {
+        (unsafe { libc::kill(orphan, 0) } != 0).then_some(())
+    });
+    assert!(reaped.is_some(), "the orphan {orphan} is still there");
+    values.push(inv.sample(&exec).cpu_ms);
     println!("cpu_ms over time: {values:?}");
     assert!(values.windows(2).all(|w| w[0] <= w[1]), "{values:?}");
-    // Either loop alone is about 1000 ms: more means the first was kept when it exited. The
-    // orphan's last ~100 ms may fall between two samples.
-    assert!((1700..4000).contains(&last), "{last} ms: {values:?}");
 }
 
 #[test]
