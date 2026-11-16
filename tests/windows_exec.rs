@@ -287,11 +287,12 @@ fn a_stop_is_ctrl_break_and_the_supervisor_records_the_end() {
     let exec = JobExecutor::default();
     let mut l = limits();
     l.log_max_bytes = 100;
+    // sleep's own stderr goes nowhere: MSYS's exec starts it as a new process, and a CTRL_BREAK
+    // while that one starts up can end it with errors of its own (couldn't create signal pipe).
     let script = "i=1000; while [ $i -lt 1100 ]; do echo line $i; i=$((i+1)); done; \
-                  echo started > started; exec sleep 60";
+                  echo started > started; exec sleep 60 2>/dev/null";
     let mut inv = Inv::start_full(&exec, &["sh", "-c", script], base_env(), l);
-    // Stopped once sleep runs: MSYS's exec starts sleep as a new process, and a CTRL_BREAK
-    // while that one starts up can end it with errors of its own in the log.
+    // Stopped once sleep runs.
     wait_for(PATIENCE, || {
         (inv.path("work/started").exists()
             && images(&inv.sample(&exec).pids).contains(&"sleep.exe".to_string()))
