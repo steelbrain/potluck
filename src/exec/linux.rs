@@ -21,10 +21,13 @@
 //!   hard limit, so the job gets no swap and the OOM killer acts at MemoryMax.
 //! - **OOMPolicy=stop.** When the OOM killer ends a process of the job, systemd stops the whole
 //!   unit and records Result=oom-kill. The supervisor survives the SIGTERM of that stop and
-//!   records how its command ended, unless systemd sees another OOM kill in the unit before the
-//!   stop is over: it then SIGKILLs every process of the unit, the supervisor too, which leaves
-//!   no status file (systemd 255 and 262 alike). `sample` reports the job over its memory either
-//!   way, and the daemon then SIGKILLs the unit itself.
+//!   records how its command ended, unless it is SIGKILLed first, which leaves no status file.
+//!   The OOM killer can take it as its next victim when the first one's memory isn't freed yet
+//!   (seen on Linux 7.0, within milliseconds of the first kill), and systemd SIGKILLs every
+//!   process of the unit when it sees another OOM kill before the stop is over (systemd 255 and
+//!   262 alike). Neither can be prevented from inside the unit: exempting the supervisor from the
+//!   OOM killer takes privileges. `sample` reports the job over its memory either way, and the
+//!   daemon then SIGKILLs the unit itself.
 //! - **Whose shortage.** The OOM killer also acts when the machine, or a slice above the unit,
 //!   runs short of memory, and systemd-oomd kills units under memory pressure; systemd records
 //!   Result=oom-kill for all of these. `sample` reports `over_memory` only when the unit reached

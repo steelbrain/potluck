@@ -540,9 +540,10 @@ fn going_over_the_memory_limit_is_reported_as_over_memory() {
         assert!(sample.peak_mem_bytes >= 62 << 20, "{sample:?}");
     }
     // The kernel killed the allocating process. The supervisor survives the stop's SIGTERM and
-    // records that, unless systemd saw another OOM kill in the unit before the stop was over and
-    // SIGKILLed every process of it, the supervisor too (src/exec/linux.rs). Every process is
-    // gone by now, so the status file is there or never will be.
+    // records that, unless it was SIGKILLed first: by the OOM killer as its next victim, or by
+    // systemd for a second OOM kill during the stop (src/exec/linux.rs; on CI's Linux 7.0
+    // runners the kernel took it in 7 of 40 runs). Every process is gone by now, so the status
+    // file is there or never will be.
     let unit = job.unit();
     match job.status() {
         Some(status) => assert_eq!(status.signal, Some(libc::SIGKILL), "{status:?}"),
