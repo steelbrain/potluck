@@ -2221,10 +2221,17 @@ fn nested_dispatch_runs_in_place_when_it_fits_the_lease() {
         &format!("echo inside $X $({PWD}); exit 5"),
     ]));
     assert_eq!(r.code, 5, "{}", r.stderr);
-    let here = potluck::sys::canonicalize(cwd.path()).unwrap();
+    let out = r.stdout.trim();
+    let printed = out
+        .strip_prefix("inside from-flag ")
+        .unwrap_or_else(|| panic!("{out}"));
+    // Compared as directories: the job prints its directory as it was given, which on Windows
+    // may hold an 8.3 short name (a GitHub runner's TEMP is C:\Users\RUNNER~1\...) that
+    // canonicalize expands.
     assert_eq!(
-        r.stdout.trim(),
-        format!("inside from-flag {}", sh_path(&here))
+        potluck::sys::canonicalize(Path::new(printed)).unwrap(),
+        potluck::sys::canonicalize(cwd.path()).unwrap(),
+        "{out}"
     );
     assert!(
         r.stderr.contains("inside job studio-9: running in place"),
