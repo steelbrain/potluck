@@ -145,6 +145,51 @@ impl Job {
         let bytes = std::fs::read(self.dir.path().join("status.json")).ok()?;
         Some(serde_json::from_slice(&bytes).unwrap())
     }
+    /// The status file, waited for. Without one after PATIENCE, the panic says what the unit,
+    /// the job's log, the unit's journal and the kernel show: a supervisor that ended without
+    /// writing it.
+    fn wait_status(&self) -> ExitStatus {
+        let started = Instant::now();
+        while started.elapsed() < PATIENCE {
+            if let Some(s) = self.status() {
+                return s;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let unit = self.unit();
+        let props = [
+            "ActiveState",
+            "SubState",
+            "Result",
+            "ExecMainCode",
+            "ExecMainStatus",
+        ]
+        .map(|p| format!("{p}={}", unit_prop(&unit, p)))
+        .join(" ");
+        let tail = |args: &[&str]| {
+            Command::new("journalctl")
+                .args(args)
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+                .unwrap_or_default()
+        };
+        let journal = tail(&["--user", "--no-pager", "-o", "short-monotonic", "-u", &unit]);
+        let kernel = tail(&[
+            "-k",
+            "--no-pager",
+            "-o",
+            "short-monotonic",
+            "-n",
+            "30",
+            "-g",
+            "oom|Killed process",
+        ]);
+        panic!(
+            "timed out waiting for the status file\nunit {unit}: {props}\nlog:\n{}\njournal:\n{journal}\nkernel:\n{kernel}",
+            self.log()
+        );
+    }
+
     fn handle(&mut self) -> &mut Handle {
         self.handle.as_mut().unwrap()
     }
@@ -289,7 +334,7 @@ fn exit_codes_reach_the_status_file() {
     for (job, code) in [(&mut failing, 7), (&mut passing, 0)] {
         let sample = job.wait_end();
         assert!(!sample.over_memory);
-        let status = wait_for("the status file", || job.status());
+        let status = job.wait_status();
         assert_eq!((status.code, status.signal), (Some(code), None));
     }
     // A failed unit stays loaded, so the daemon can still read how it ended, until finish.
@@ -454,7 +499,7 @@ fn a_stopped_supervisor_is_continued() {
     std::thread::sleep(Duration::from_secs(3));
     assert!(job.status().is_none());
     job.sample();
-    let status = wait_for("the status file", || job.status());
+    let status = job.wait_status();
     assert_eq!(status.code, Some(5));
     job.wait_end();
     job.finish();
@@ -492,7 +537,7 @@ fn going_over_the_memory_limit_is_reported_as_over_memory() {
         assert!(sample.peak_mem_bytes >= 62 << 20, "{sample:?}");
     }
     // The kernel killed the allocating process; the supervisor survived to record it.
-    let status = wait_for("the status file", || job.status());
+    let status = job.wait_status();
     assert_eq!(status.signal, Some(libc::SIGKILL), "{status:?}");
     assert_eq!(unit_prop(&job.unit(), "Result"), "oom-kill");
     // Still reported from a fresh look at the unit, after its cgroup is gone.
@@ -789,7 +834,7 @@ fn sigterm_ends_a_plain_command_and_is_recorded() {
     });
     job.signal(libc::SIGTERM);
     job.wait_end();
-    let status = wait_for("the status file", || job.status());
+    let status = job.wait_status();
     assert_eq!((status.code, status.signal), (None, Some(libc::SIGTERM)));
     job.finish();
 }
@@ -852,7 +897,7 @@ fn a_fresh_executor_adopts_a_running_unit() {
             .is_empty()
             .then_some(())
     });
-    let status = wait_for("the status file", || job.status());
+    let status = job.wait_status();
     assert_eq!(status.signal, Some(libc::SIGTERM));
     let crash_dir = job.crash_dir();
     exec.finish(&handle, &crash_dir, job.started).unwrap();
@@ -883,7 +928,7 @@ fn find_returns_what_a_cut_short_start_left() {
 
     let mut quick = Job::start("findquick", &["true"], &[PATH], limits());
     let status = quick.dir.path().join("status.json");
-    wait_for("the status file", || quick.status());
+    quick.wait_status();
     wait_for("the unit to unload", || {
         (unit_prop(&quick.unit(), "LoadState") == "not-found").then_some(())
     });
@@ -1041,7 +1086,7 @@ fn leftovers_get_the_kill_grace() {
     let pid: u32 = wait_for("the leftover's pid", || {
         std::fs::read_to_string(&pidfile).ok()?.trim().parse().ok()
     });
-    wait_for("the status file", || job.status());
+    job.wait_status();
     let ended = Instant::now();
     wait_for("the leftover to be killed", || gone(pid).then_some(()));
     let lived = ended.elapsed();
@@ -1098,7 +1143,7 @@ fn core_dumps_go_to_the_crash_dir() {
     }
     let mut job = Job::start("core", &["sh", "-c", "kill -SEGV $$"], &[PATH], limits());
     job.wait_end();
-    let status = wait_for("the status file", || job.status());
+    let status = job.wait_status();
     assert_eq!(status.signal, Some(libc::SIGSEGV));
     job.finish();
     let text = std::fs::read_to_string(job.crash_dir().join("coredumps.txt")).unwrap();
