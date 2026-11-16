@@ -127,8 +127,14 @@ jobs:
 
       # The whole suite. `cargo test` leaves out the #[ignore] tests, which are opt-in: they
       # install real services (a user service, a systemd unit, a LaunchAgent), leave a core file,
-      # time a large seeding, or are a manual smoke test between two machines.
+      # time a large seeding, or are a manual smoke test between two machines. Every test binary
+      # runs (--no-fail-fast), and each failed test becomes an annotation, which can be read
+      # without signing in to GitHub.
       - name: cargo test
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         timeout-minutes: 30
-        run: cargo test --locked
+        run: |
+          rc=0
+          cargo test --locked --no-fail-fast 2>&1 | tee "$RUNNER_TEMP/test-output.txt" || rc=$?
+          [ "$rc" -eq 0 ] || sh .github/test-failures.sh "$RUNNER_TEMP/test-output.txt"
+          exit "$rc"
